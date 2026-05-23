@@ -1,0 +1,26 @@
+[Unit]
+Description=Monitoring-LP Bot — DLMM Position Monitor & Auto-Close
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/monitoring-lp
+ExecStart=/usr/bin/node /opt/monitoring-lp/node_modules/.bin/tsx /opt/monitoring-lp/src/index.ts
+Restart=always
+RestartSec=5
+Environment=NODE_ENV=production
+
+# Security hardening
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=full
+PrivateDevices=true
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
