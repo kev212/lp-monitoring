@@ -25,7 +25,7 @@ import {
 import { estimateExitValue, clearPnlCache } from './meteora/valuation.js'
 import { fetchLpAgentPositions } from './lpagent.js'
 import { executeExit } from './meteora/exit.js'
-import { executePrecisionCurveRebalance } from './meteora/precisionCurve.js'
+import { executeDirectionalPrecisionCurve } from './meteora/precisionCurve.js'
 import { evaluateTrigger, type BinData } from './risk/rules.js'
 import {
   sendNotification,
@@ -731,6 +731,9 @@ async function maybeRunPrecisionCurve(
     }
   }
 
+  const direction = isInitialReshape ? 0 : poolActiveBinId - pos.precisionCurveLastActiveBin!
+  const dirLabel = direction === 0 ? 'initial' : direction > 0 ? 'right/up' : 'left/down'
+
   if (isInitialReshape) {
     console.log(`[precision] ${tokenLabel} | initial reshape at activeBin=${poolActiveBinId}`)
     sendNotification(
@@ -743,24 +746,27 @@ async function maybeRunPrecisionCurve(
   } else {
     const lastBin = pos.precisionCurveLastActiveBin!
     const movedBins = Math.abs(poolActiveBinId - lastBin)
-    console.log(`[precision] ${tokenLabel} | moved ${movedBins} bins (${lastBin} -> ${poolActiveBinId}) — rebalance`)
+    console.log(`[precision] ${tokenLabel} | moved ${movedBins} bins (${lastBin} -> ${poolActiveBinId}) — directional reshape ${dirLabel}`)
     sendNotification(
-      `🔁 <b>Precision Curve Reshape Started</b>\n\n` +
+      `🔁 <b>Precision Directional Reshape — Starting</b>\n\n` +
       `<b>${tokenLabel}</b>\n` +
       `Moved: <b>${movedBins} bins</b>\n` +
-      `Active: <b>${pos.precisionCurveLastActiveBin} → ${poolActiveBinId}</b>\n` +
-      `Range: <b>${lowerBinId}-${upperBinId}</b>\n` +
-      `Auto-compound: <b>off</b>`
+      `Active: <b>${lastBin} → ${poolActiveBinId}</b>\n` +
+      `Direction: <b>${dirLabel}</b>\n` +
+      `Range: <b>${lowerBinId}-${upperBinId}</b>`
     )
   }
 
   updatePrecisionCurveBusy(pos.positionPubkey, true)
   try {
-    const result = await executePrecisionCurveRebalance(
+    const result = await executeDirectionalPrecisionCurve(
       getConnection(),
       getWallet(),
       pos.positionPubkey,
       pos.poolPubkey,
+      pos.tokenXMint,
+      pos.tokenYMint,
+      pos.precisionCurveLastActiveBin,
     )
 
     if (!result.success) {
@@ -769,6 +775,7 @@ async function maybeRunPrecisionCurve(
       sendNotification(
         `❌ <b>Precision Curve Failed</b>\n\n` +
         `<b>${tokenLabel}</b>\n` +
+        `Direction: <b>${dirLabel}</b>\n` +
         `Reason: <code>${result.error || 'unknown'}</code>\n` +
         `Position remains monitored.`
       )
@@ -776,19 +783,23 @@ async function maybeRunPrecisionCurve(
     }
 
     updatePrecisionCurveState(pos.positionPubkey, poolActiveBinId, Date.now())
-    console.log(`[precision] ${tokenLabel} | rebalance tx: ${result.signature || 'n/a'}`)
+    const staleRange = result.staleFrom !== null && result.staleTo !== null
+      ? `${result.staleFrom} → ${result.staleTo}`
+      : '-'
+    console.log(`[precision] ${tokenLabel} | reshape complete: remove=${result.removeSignature || 'n/a'} add=${result.addSignature || 'n/a'}`)
     sendNotification(
-      `✅ <b>Precision Curve Reshape Complete</b>\n\n` +
+      `✅ <b>Precision Directional Reshape Complete</b>\n\n` +
       `<b>${tokenLabel}</b>\n` +
+      `Direction: <b>${dirLabel}</b>\n` +
       `Active baseline: <b>${poolActiveBinId}</b>\n` +
       `Range: <b>${lowerBinId}-${upperBinId}</b>\n` +
+      `Stale range: <b>${staleRange}</b>\n` +
       `X withdrawn/deposited: <code>${result.xWithdrawn}</code> / <code>${result.xDeposited}</code>\n` +
       `Y withdrawn/deposited: <code>${result.yWithdrawn}</code> / <code>${result.yDeposited}</code>\n` +
-      `X top-up: <code>${result.xTopup}</code> (${result.xTopupPct.toFixed(2)}%)\n` +
-      `Y top-up: <code>${result.yTopup}</code> (${result.yTopupPct.toFixed(2)}%)\n` +
-      `X leftover: <code>${result.xLeftover}</code> (${result.xLeftoverPct.toFixed(2)}%)\n` +
-      `Y leftover: <code>${result.yLeftover}</code> (${result.yLeftoverPct.toFixed(2)}%)\n` +
-      `Tx: ${result.signature ? `<a href="https://solscan.io/tx/${result.signature}">${result.signature.slice(0, 6)}..${result.signature.slice(-4)}</a>` : '-'}`
+      `X leftover: <code>${result.xLeftover}</code>\n` +
+      `Y leftover: <code>${result.yLeftover}</code>\n` +
+      `Remove: ${result.removeSignature ? `<a href="https://solscan.io/tx/${result.removeSignature}">${result.removeSignature.slice(0, 6)}..${result.removeSignature.slice(-4)}</a>` : '-'}\n` +
+      `Add: ${result.addSignature ? `<a href="https://solscan.io/tx/${result.addSignature}">${result.addSignature.slice(0, 6)}..${result.addSignature.slice(-4)}</a>` : '-'}`
     )
     return true
   } catch (err) {

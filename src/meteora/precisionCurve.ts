@@ -1,81 +1,76 @@
 import { Connection, Keypair, PublicKey, Transaction } from '@solana/web3.js'
 import { BN } from '@coral-xyz/anchor'
-import { StrategyType, getLiquidityStrategyParameterBuilder, buildLiquidityStrategyParameters } from '@meteora-ag/dlmm'
+import { StrategyType } from '@meteora-ag/dlmm'
 import { getPool } from './positions.js'
 
 const BASIS_POINTS = new BN(10000)
-const DEFAULT_MAX_ACTIVE_BIN_SLIPPAGE = new BN(3)
+const STALE_BUFFER_BINS = 2
+const REMOVE_DELAY_MS = 1500
 
 export interface PrecisionCurveResult {
   success: boolean
-  signature: string | null
+  removeSignature: string | null
+  addSignature: string | null
   activeBinId: number | null
   lowerBinId: number | null
   upperBinId: number | null
+  direction: number | null
+  staleFrom: number | null
+  staleTo: number | null
+  isInitial: boolean
   xWithdrawn: string
   yWithdrawn: string
   xDeposited: string
   yDeposited: string
-  xTopup: string
-  yTopup: string
-  xTopupPct: number
-  yTopupPct: number
   xLeftover: string
   yLeftover: string
-  xLeftoverPct: number
-  yLeftoverPct: number
   error?: string
-}
-
-function pctBasis(amount: BN, basis: BN): number {
-  if (basis.isZero()) return amount.isZero() ? 0 : 100
-  return amount.mul(new BN(10000)).div(basis).toNumber() / 100
 }
 
 function emptyResult(): PrecisionCurveResult {
   return {
     success: false,
-    signature: null,
+    removeSignature: null,
+    addSignature: null,
     activeBinId: null,
     lowerBinId: null,
     upperBinId: null,
+    direction: null,
+    staleFrom: null,
+    staleTo: null,
+    isInitial: false,
     xWithdrawn: '0',
     yWithdrawn: '0',
     xDeposited: '0',
     yDeposited: '0',
-    xTopup: '0',
-    yTopup: '0',
-    xTopupPct: 0,
-    yTopupPct: 0,
     xLeftover: '0',
     yLeftover: '0',
-    xLeftoverPct: 0,
-    yLeftoverPct: 0,
   }
 }
 
-async function sendInstructionTx(
-  connection: Connection,
-  wallet: Keypair,
-  instructions: any[],
-): Promise<string | null> {
-  if (instructions.length === 0) return null
-  const tx = new Transaction()
-  tx.add(...instructions)
-  tx.feePayer = wallet.publicKey
-  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed')
-  tx.recentBlockhash = blockhash
-  tx.sign(wallet)
-  const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false, maxRetries: 3 })
-  await connection.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, 'confirmed')
-  return sig
+async function getTokenBalance(connection: Connection, wallet: Keypair, mint: string): Promise<bigint> {
+  try {
+    const accounts = await connection.getTokenAccountsByOwner(
+      wallet.publicKey,
+      { mint: new PublicKey(mint) }
+    )
+    let total = 0n
+    for (const acc of accounts.value) {
+      const view = new DataView(acc.account.data.buffer, acc.account.data.byteOffset + 64, 8)
+      total += view.getBigUint64(0, true)
+    }
+    return total
+  } catch { return 0n }
 }
 
-export async function executePrecisionCurveRebalance(
+export async function executeDirectionalPrecisionCurve(
   connection: Connection,
   wallet: Keypair,
   positionPubkey: string,
   poolPubkey: string,
+  tokenXMint: string,
+  tokenYMint: string,
+  lastActiveBin: number | null,
 ): Promise<PrecisionCurveResult> {
   const result = emptyResult()
   try {
@@ -99,65 +94,95 @@ export async function executePrecisionCurveRebalance(
     const amountY = new BN(pd.totalYAmount)
     if (amountX.isZero() && amountY.isZero()) throw new Error('position has no active liquidity')
 
-    const minDeltaId = new BN(lowerBinId - activeBinId)
-    const maxDeltaId = new BN(upperBinId - activeBinId)
-    const builder = getLiquidityStrategyParameterBuilder(StrategyType.Curve)
-    const curveParams = buildLiquidityStrategyParameters(
-      amountX,
-      amountY,
-      minDeltaId,
-      maxDeltaId,
-      new BN(pool.lbPair.binStep),
-      false,
-      new BN(activeBinId),
-      builder,
-    )
+    const isInitial = lastActiveBin === null
+    result.isInitial = isInitial
 
-    const deposits = [{
-      minDeltaId,
-      maxDeltaId,
-      x0: curveParams.x0,
-      y0: curveParams.y0,
-      deltaX: curveParams.deltaX,
-      deltaY: curveParams.deltaY,
-      favorXInActiveBin: false,
-    }]
-    const withdraws = [{
-      minBinId: new BN(lowerBinId),
-      maxBinId: new BN(upperBinId),
-      bps: BASIS_POINTS,
-    }]
+    let staleFrom: number
+    let staleTo: number
+    let direction: number
 
-    const simulation = await pool.simulateRebalancePosition(
-      new PublicKey(positionPubkey),
-      pd,
-      false,
-      false,
-      deposits,
-      withdraws,
-    )
+    if (isInitial) {
+      staleFrom = lowerBinId
+      staleTo = upperBinId
+      direction = 0
+    } else {
+      direction = activeBinId - lastActiveBin
+      if (direction > 0) {
+        staleFrom = lowerBinId
+        staleTo = Math.min(upperBinId, activeBinId - STALE_BUFFER_BINS)
+      } else if (direction < 0) {
+        staleFrom = Math.max(lowerBinId, activeBinId + STALE_BUFFER_BINS)
+        staleTo = upperBinId
+      } else {
+        staleFrom = lowerBinId
+        staleTo = upperBinId
+      }
+    }
 
-    const sim = simulation.simulationResult
+    result.direction = direction
+    result.staleFrom = staleFrom
+    result.staleTo = staleTo
+
+    if (staleFrom > staleTo) {
+      throw new Error(`invalid stale range: ${staleFrom}-${staleTo}`)
+    }
+
     result.xWithdrawn = amountX.toString()
     result.yWithdrawn = amountY.toString()
-    result.xDeposited = sim.amountXDeposited.toString()
-    result.yDeposited = sim.amountYDeposited.toString()
-    result.xTopup = sim.actualAmountXDeposited.toString()
-    result.yTopup = sim.actualAmountYDeposited.toString()
-    result.xLeftover = sim.actualAmountXWithdrawn.toString()
-    result.yLeftover = sim.actualAmountYWithdrawn.toString()
-    result.xTopupPct = pctBasis(sim.actualAmountXDeposited, amountX)
-    result.yTopupPct = pctBasis(sim.actualAmountYDeposited, amountY)
-    result.xLeftoverPct = pctBasis(sim.actualAmountXWithdrawn, amountX)
-    result.yLeftoverPct = pctBasis(sim.actualAmountYWithdrawn, amountY)
 
-    const built = await pool.rebalancePosition(simulation, DEFAULT_MAX_ACTIVE_BIN_SLIPPAGE, wallet.publicKey, 0.01)
-    for (const ix of built.initBinArrayInstructions) {
-      const sig = await sendInstructionTx(connection, wallet, [ix])
-      if (sig) result.signature = sig
+    const removeTxs = await pool.removeLiquidity({
+      user: wallet.publicKey,
+      position: new PublicKey(positionPubkey),
+      fromBinId: staleFrom,
+      toBinId: staleTo,
+      bps: new BN(10000) as any,
+      shouldClaimAndClose: false,
+    })
+
+    const txs = Array.isArray(removeTxs) ? removeTxs : [removeTxs]
+    for (const tx of txs) {
+      tx.sign(wallet)
+      const sig = await connection.sendTransaction(tx, [wallet])
+      await connection.confirmTransaction(sig, 'confirmed')
+      result.removeSignature = sig
+      console.log(`[precision] remove liq tx: ${sig}`)
     }
-    const sig = await sendInstructionTx(connection, wallet, built.rebalancePositionInstruction)
-    if (sig) result.signature = sig
+
+    await new Promise<void>(resolve => { setTimeout(resolve, REMOVE_DELAY_MS) })
+
+    const walletX = await getTokenBalance(connection, wallet, tokenXMint)
+    const walletY = await getTokenBalance(connection, wallet, tokenYMint)
+
+    if (walletX === 0n && walletY === 0n) {
+      throw new Error('no tokens in wallet after remove — cannot re-add')
+    }
+
+    result.xDeposited = walletX.toString()
+    result.yDeposited = walletY.toString()
+
+    const addTx = await pool.addLiquidityByStrategy({
+      positionPubKey: new PublicKey(positionPubkey),
+      user: wallet.publicKey,
+      totalXAmount: new BN(walletX.toString()),
+      totalYAmount: new BN(walletY.toString()),
+      strategy: {
+        maxBinId: upperBinId,
+        minBinId: lowerBinId,
+        strategyType: StrategyType.Curve,
+      },
+    })
+
+    addTx.sign(wallet)
+    const addSig = await connection.sendTransaction(addTx, [wallet])
+    await connection.confirmTransaction(addSig, 'confirmed')
+    result.addSignature = addSig
+    console.log(`[precision] add liq tx: ${addSig}`)
+
+    const finalX = await getTokenBalance(connection, wallet, tokenXMint)
+    const finalY = await getTokenBalance(connection, wallet, tokenYMint)
+    result.xLeftover = finalX.toString()
+    result.yLeftover = finalY.toString()
+
     result.success = true
     return result
   } catch (err) {
