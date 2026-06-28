@@ -833,16 +833,31 @@ async function maybeRunPrecisionCurve(
       return true
     }
 
-    updatePrecisionCurveState(pos.positionPubkey, poolActiveBinId, Date.now())
+    const newBaseline = result.activeBinId ?? poolActiveBinId
+    updatePrecisionCurveState(pos.positionPubkey, newBaseline, Date.now())
     const staleRange = result.staleFrom !== null && result.staleTo !== null
       ? `${result.staleFrom} → ${result.staleTo}`
       : '-'
+
+    if (result.noop) {
+      console.log(`[precision] ${tokenLabel} | no-op: stale range empty — baseline ${newBaseline}`)
+      sendNotification(
+        `ℹ️ <b>Precision Curve — No-op</b>\n\n` +
+        `<b>${tokenLabel}</b>\n` +
+        `Stale range: <b>${staleRange}</b>\n` +
+        `No liquidity to remove.\n` +
+        `Active baseline: <b>${newBaseline}</b>\n` +
+        `Baseline updated.`
+      )
+      return true
+    }
+
     console.log(`[precision] ${tokenLabel} | reshape complete: remove=${result.removeSignature || 'n/a'} add=${result.addSignature || 'n/a'}`)
     sendNotification(
       `✅ <b>Precision Directional Reshape Complete</b>\n\n` +
       `<b>${tokenLabel}</b>\n` +
       `Direction: <b>${dirLabel}</b>\n` +
-      `Active baseline: <b>${poolActiveBinId}</b>\n` +
+      `Active baseline: <b>${newBaseline}</b>\n` +
       `Range: <b>${lowerBinId}-${upperBinId}</b>\n` +
       `Stale range: <b>${staleRange}</b>\n` +
       `X withdrawn/deposited: <code>${result.xWithdrawn}</code> / <code>${result.xDeposited}</code>\n` +

@@ -7,7 +7,7 @@ const BASIS_POINTS = new BN(10000)
 const STALE_BUFFER_BINS = 2
 const REMOVE_DELAY_MS = 1500
 const SOL_MINT = 'So11111111111111111111111111111111111111112'
-const SOL_FEE_BUFFER_LAMPORTS = BigInt(0.02 * 1e9)
+const SOL_FEE_BUFFER_LAMPORTS = BigInt(0.001 * 1e9)
 const SLIPPAGE_LEVELS = [1, 3, 5]
 
 export interface PrecisionCurveResult {
@@ -29,6 +29,7 @@ export interface PrecisionCurveResult {
   yDeposited: string
   xLeftover: string
   yLeftover: string
+  noop: boolean
   error?: string
 }
 
@@ -52,6 +53,7 @@ function emptyResult(): PrecisionCurveResult {
     yDeposited: '0',
     xLeftover: '0',
     yLeftover: '0',
+    noop: false,
   }
 }
 
@@ -223,7 +225,11 @@ export async function executeDirectionalPrecisionCurve(
     console.log(`[precision] add amounts: deltaX=${deltaX} deltaY=${deltaY}`)
 
     if (deltaX === 0n && deltaY === 0n) {
-      throw new Error('no tokens gained from remove — cannot re-add')
+      console.log(`[precision] no-op: stale range ${staleFrom}-${staleTo} has no liquidity — updating baseline to ${activeBinId}`)
+      result.activeBinId = activeBinId
+      result.success = true
+      result.noop = true
+      return result
     }
 
     clearPoolCache()
