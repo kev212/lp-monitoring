@@ -50,6 +50,8 @@ const pendingTriggers = new Map<string, { triggerType: TriggerType; timestamp: n
 const DISCOVERY_INTERVAL_MS = 3 * 60 * 1000 // 3 menit
 const MAX_MONITOR_RETRIES = 5
 const PRECISION_CURVE_COOLDOWN_MS = 5_000
+const LP_AGENT_GUARD_MIN_INTERVAL_MS = 12_500
+let lastLpAgentGuardAt = 0
 
 export async function startBot(): Promise<void> {
   console.log('[app] starting monitoring-lp...')
@@ -417,19 +419,53 @@ async function monitorCycle(connection: Connection, walletPubkey: PublicKey, own
         ` | ${triggerInfo}`
       )
 
+      // --- LP Agent Spike Guard: prevent fake positive spikes from corrupting peak/trailing ---
+      let canTrustPeak = true
+      if (pnlPercent > 0) {
+        const spikeFromPeak = pnlPercent > pos.peakPnlPercent + 5
+        const spikeFromLast = pos.lastPnlPercent !== null && (pnlPercent - pos.lastPnlPercent) > 5
+        const suspiciousSpike = spikeFromPeak || spikeFromLast
+
+        if (suspiciousSpike && config.lpAgentApiKey) {
+          const now = Date.now()
+          if (now - lastLpAgentGuardAt >= LP_AGENT_GUARD_MIN_INTERVAL_MS) {
+            lastLpAgentGuardAt = now
+            try {
+              const lpAgentPositions = await fetchLpAgentPositions(ownerStr)
+              if (lpAgentPositions) {
+                const lpPos = lpAgentPositions.get(pos.positionPubkey)
+                if (lpPos) {
+                  const lpPnl = lpPos.pnlPercentNative
+                  const delta = Math.abs(pnlPercent - lpPnl)
+                  if (delta > 3 && lpPnl < config.trailingActivationPct) {
+                    console.log(`[peak-guard] ${tokenLabel} | blocked spike: meteora=${pnlPercent.toFixed(2)}% vs lpagent=${lpPnl.toFixed(2)}% (delta=${delta.toFixed(1)}%)`)
+                    canTrustPeak = false
+                  }
+                }
+              }
+            } catch {
+              // LP Agent unavailable — proceed with caution
+            }
+          } else {
+            console.log(`[peak-guard] ${tokenLabel} | suspicious spike ${pnlPercent.toFixed(2)}% — LP Agent budget exhausted, peak frozen`)
+            canTrustPeak = false
+          }
+        }
+      }
+
       // --- Trailing stop: track peak PnL ---
       let updatedPeak = pos.peakPnlPercent
       let trailingActive = pos.trailingActivated
       let peakOrTrailingChanged = false
 
       // Activate trailing tiap kali PnL >= threshold, terlepas dari peak update
-      if (!trailingActive && pnlPercent >= config.trailingActivationPct) {
+      if (canTrustPeak && !trailingActive && pnlPercent >= config.trailingActivationPct) {
         trailingActive = true
         peakOrTrailingChanged = true
         console.log(`[trailing] activated for ${pos.positionPubkey.slice(0, 8)} at ${pnlPercent.toFixed(2)}%`)
       }
 
-      if (pnlPercent > updatedPeak) {
+      if (canTrustPeak && pnlPercent > updatedPeak) {
         updatedPeak = pnlPercent
         peakOrTrailingChanged = true
       }
