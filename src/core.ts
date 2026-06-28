@@ -142,8 +142,11 @@ async function discoverInitialPositions(connection: Connection, walletPubkey: Pu
         ])
         if (val && val.estimatedExitSol > 0) {
           currentValue = val.estimatedExitSol
-          // Prefer allTimeDepositSol (accurate per-position from Meteora), fallback to depositEstimateSol
-          finalBasis = val.allTimeDepositSol > 0 ? val.allTimeDepositSol : val.depositEstimateSol
+          if (val.allTimeWithdrawalSol > 0) {
+            finalBasis = val.allTimeDepositSol - val.allTimeWithdrawalSol
+          } else {
+            finalBasis = val.allTimeDepositSol > 0 ? val.allTimeDepositSol : val.depositEstimateSol
+          }
           if (finalBasis > 0) pnlPct = ((currentValue - finalBasis) / finalBasis) * 100
         }
       } catch {
@@ -359,8 +362,15 @@ async function monitorCycle(connection: Connection, walletPubkey: PublicKey, own
       let pnlSource = 'basis'
       const rawPnlSol = valuation.meteoraPnlSolPct
       const rawPnlUsd = valuation.meteoraPnlPct
+      const hasReshape = valuation.allTimeWithdrawalSol > 0
+      const netDepositSol = hasReshape
+        ? valuation.allTimeDepositSol - valuation.allTimeWithdrawalSol
+        : 0
 
-      if (quoteIsUsdc) {
+      if (hasReshape && netDepositSol > 0 && typeof valuation.meteoraPnlSol === 'number') {
+        pnlPercent = (valuation.meteoraPnlSol / netDepositSol) * 100
+        pnlSource = 'meteora(net)'
+      } else if (quoteIsUsdc) {
         // USDC-quoted pair — prefer USD PnL (includes SOL price movement vs USDC)
         if (rawPnlUsd !== undefined && rawPnlUsd !== null && Number.isFinite(rawPnlUsd) && !Number.isNaN(rawPnlUsd)) {
           pnlPercent = rawPnlUsd
@@ -572,8 +582,14 @@ async function monitorCycle(connection: Connection, walletPubkey: PublicKey, own
             let freshPnlPct = 0
             const freshRawSol = freshValuation.meteoraPnlSolPct
             const freshRawUsd = freshValuation.meteoraPnlPct
+            const freshHasReshape = freshValuation.allTimeWithdrawalSol > 0
+            const freshNetDepositSol = freshHasReshape
+              ? freshValuation.allTimeDepositSol - freshValuation.allTimeWithdrawalSol
+              : 0
 
-            if (quoteIsUsdc) {
+            if (freshHasReshape && freshNetDepositSol > 0 && typeof freshValuation.meteoraPnlSol === 'number') {
+              freshPnlPct = (freshValuation.meteoraPnlSol / freshNetDepositSol) * 100
+            } else if (quoteIsUsdc) {
               if (freshRawUsd !== undefined && freshRawUsd !== null && Number.isFinite(freshRawUsd) && !Number.isNaN(freshRawUsd)) {
                 freshPnlPct = freshRawUsd
               } else if (freshRawSol !== undefined && freshRawSol !== null && Number.isFinite(freshRawSol) && !Number.isNaN(freshRawSol)) {

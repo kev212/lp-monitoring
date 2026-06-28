@@ -20,6 +20,7 @@ interface PnlPositionData {
     unclaimedFeeTokenY?: { amountSol?: string | number; usd?: string | number }
   }
   allTimeDeposits?: { total?: { sol?: string | number; usd?: string | number } }
+  allTimeWithdrawals?: { total?: { sol?: string | number; usd?: string | number } }
   allTimeFees?: { total?: { sol?: string | number; usd?: string | number } }
   feePerTvl24h?: string | number
   isOutOfRange?: boolean
@@ -37,6 +38,7 @@ export interface ValuationResult {
   tokenYValueSol: number
   depositEstimateSol: number
   allTimeDepositSol: number
+  allTimeWithdrawalSol: number
   tokenXAmount: number
   tokenYAmount: number
   tokenXFees: number
@@ -98,6 +100,7 @@ async function fetchPositionPnl(
       pnlUsd: p.pnlUsd,
       unrealizedPnl: p.unrealizedPnl,
       allTimeDeposits: p.allTimeDeposits,
+      allTimeWithdrawals: p.allTimeWithdrawals,
       allTimeFees: p.allTimeFees,
       feePerTvl24h: p.feePerTvl24h,
       isOutOfRange: p.isOutOfRange,
@@ -140,6 +143,7 @@ export async function estimateExitValue(
           tokenYValueSol: 0,
           depositEstimateSol: Math.max(0, balancesSol - pnlSol),
           allTimeDepositSol: Number(pnlData.allTimeDeposits?.total?.sol || 0),
+          allTimeWithdrawalSol: Number(pnlData.allTimeWithdrawals?.total?.sol || 0),
           tokenXAmount: 0,
           tokenYAmount: 0,
           tokenXFees: 0,
