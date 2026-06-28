@@ -1,6 +1,6 @@
 import TelegramBot from 'node-telegram-bot-api'
 import { config } from './config.js'
-import { loadActivePositions, updatePrecisionCurveEnabled } from './meteora/discovery.js'
+import { loadActivePositions, updatePrecisionCurveEnabled, updatePrecisionCurveThreshold } from './meteora/discovery.js'
 
 let _bot: TelegramBot | null = null
 
@@ -51,9 +51,9 @@ function setupCommandHandlers(bot: TelegramBot): void {
     }
 
     if (action === 'on') {
-      const activeBin = pos.precisionCurveLastActiveBin ?? null
-      updatePrecisionCurveEnabled(pos.positionPubkey, true, activeBin)
-      await bot.answerCallbackQuery(query.id, { text: 'Precision Curve enabled' }).catch(() => undefined)
+      updatePrecisionCurveEnabled(pos.positionPubkey, true, null)
+      updatePrecisionCurveThreshold(pos.positionPubkey, 3)
+      await bot.answerCallbackQuery(query.id, { text: 'Precision Curve enabled — initial reshape pending' }).catch(() => undefined)
     } else if (action === 'off') {
       updatePrecisionCurveEnabled(pos.positionPubkey, false)
       await bot.answerCallbackQuery(query.id, { text: 'Precision Curve disabled' }).catch(() => undefined)
@@ -76,7 +76,7 @@ function sendPrecisionMenu(bot: TelegramBot, chatId: number | string): void {
   const lines = [
     `<b>Precision Curve</b>`,
     sep(),
-    `Default: <b>off</b> | Auto-compound: <b>off</b> | Cooldown: <b>60s</b>`,
+    `Default: <b>off</b> | Threshold: <b>3 bins</b> | Auto-compound: <b>off</b> | Cooldown: <b>60s</b>`,
     sep(),
     ...positions.map((p, idx) => {
       const label = `${p.tokenXSymbol || p.tokenXMint.slice(0, 4)}/${p.tokenYSymbol || p.tokenYMint.slice(0, 4)}`

@@ -36,7 +36,7 @@ function rowToPosition(row: any): PositionRow {
     precisionCurveLastActiveBin: row.precision_curve_last_active_bin ?? null,
     precisionCurveLastReshapeAt: row.precision_curve_last_reshape_at ?? null,
     precisionCurveBusy: row.precision_curve_busy === 1,
-    precisionCurveThresholdBins: row.precision_curve_threshold_bins ?? 5,
+    precisionCurveThresholdBins: row.precision_curve_threshold_bins ?? 3,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   }

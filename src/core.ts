@@ -716,32 +716,43 @@ async function maybeRunPrecisionCurve(
     return false
   }
 
-  if (pos.precisionCurveLastActiveBin === null) {
-    updatePrecisionCurveState(pos.positionPubkey, poolActiveBinId, pos.precisionCurveLastReshapeAt || 0)
-    console.log(`[precision] ${tokenLabel} | baseline activeBin=${poolActiveBinId}`)
-    return false
+  const isInitialReshape = pos.precisionCurveLastActiveBin === null
+  if (!isInitialReshape) {
+    const lastBin = pos.precisionCurveLastActiveBin!
+    const movedBins = Math.abs(poolActiveBinId - lastBin)
+    const threshold = pos.precisionCurveThresholdBins || 3
+    if (movedBins < threshold) return false
+
+    const lastReshapeAt = pos.precisionCurveLastReshapeAt || 0
+    const cooldownLeft = PRECISION_CURVE_COOLDOWN_MS - (Date.now() - lastReshapeAt)
+    if (lastReshapeAt > 0 && cooldownLeft > 0) {
+      console.log(`[precision] ${tokenLabel} | moved ${movedBins} bins but cooldown ${Math.ceil(cooldownLeft / 1000)}s left`)
+      return false
+    }
   }
 
-  const movedBins = Math.abs(poolActiveBinId - pos.precisionCurveLastActiveBin)
-  const threshold = pos.precisionCurveThresholdBins || 5
-  if (movedBins < threshold) return false
-
-  const lastReshapeAt = pos.precisionCurveLastReshapeAt || 0
-  const cooldownLeft = PRECISION_CURVE_COOLDOWN_MS - (Date.now() - lastReshapeAt)
-  if (lastReshapeAt > 0 && cooldownLeft > 0) {
-    console.log(`[precision] ${tokenLabel} | moved ${movedBins} bins but cooldown ${Math.ceil(cooldownLeft / 1000)}s left`)
-    return false
+  if (isInitialReshape) {
+    console.log(`[precision] ${tokenLabel} | initial reshape at activeBin=${poolActiveBinId}`)
+    sendNotification(
+      `🔁 <b>Precision Curve Initial Reshape — Starting</b>\n\n` +
+      `<b>${tokenLabel}</b>\n` +
+      `Active bin: <b>${poolActiveBinId}</b>\n` +
+      `Range: <b>${lowerBinId}-${upperBinId}</b>\n` +
+      `Threshold: <b>${pos.precisionCurveThresholdBins || 3} bins</b> | Cooldown: <b>60s</b>`
+    )
+  } else {
+    const lastBin = pos.precisionCurveLastActiveBin!
+    const movedBins = Math.abs(poolActiveBinId - lastBin)
+    console.log(`[precision] ${tokenLabel} | moved ${movedBins} bins (${lastBin} -> ${poolActiveBinId}) — rebalance`)
+    sendNotification(
+      `🔁 <b>Precision Curve Reshape Started</b>\n\n` +
+      `<b>${tokenLabel}</b>\n` +
+      `Moved: <b>${movedBins} bins</b>\n` +
+      `Active: <b>${pos.precisionCurveLastActiveBin} → ${poolActiveBinId}</b>\n` +
+      `Range: <b>${lowerBinId}-${upperBinId}</b>\n` +
+      `Auto-compound: <b>off</b>`
+    )
   }
-
-  console.log(`[precision] ${tokenLabel} | moved ${movedBins} bins (${pos.precisionCurveLastActiveBin} -> ${poolActiveBinId}) — rebalance`)
-  sendNotification(
-    `🔁 <b>Precision Curve Reshape Started</b>\n\n` +
-    `<b>${tokenLabel}</b>\n` +
-    `Moved: <b>${movedBins} bins</b>\n` +
-    `Active: <b>${pos.precisionCurveLastActiveBin} → ${poolActiveBinId}</b>\n` +
-    `Range: <b>${lowerBinId}-${upperBinId}</b>\n` +
-    `Auto-compound: <b>off</b>`
-  )
 
   updatePrecisionCurveBusy(pos.positionPubkey, true)
   try {
