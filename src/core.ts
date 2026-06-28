@@ -760,13 +760,6 @@ async function maybeRunPrecisionCurve(
 
   if (poolActiveBinId < lowerBinId || poolActiveBinId > upperBinId) {
     console.log(`[precision] ${tokenLabel} | active bin ${poolActiveBinId} outside range ${lowerBinId}-${upperBinId} — skip`)
-    sendNotification(
-      `⚠️ <b>Precision Curve Skipped</b>\n\n` +
-      `<b>${tokenLabel}</b>\n` +
-      `Active bin: <b>${poolActiveBinId}</b>\n` +
-      `Range: <b>${lowerBinId}-${upperBinId}</b>\n` +
-      `Reason: active bin outside range.`
-    )
     return false
   }
 
