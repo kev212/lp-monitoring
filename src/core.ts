@@ -424,7 +424,10 @@ async function monitorCycle(connection: Connection, walletPubkey: PublicKey, own
       if (pnlPercent > 0) {
         const spikeFromPeak = pnlPercent > pos.peakPnlPercent + 5
         const spikeFromLast = pos.lastPnlPercent !== null && (pnlPercent - pos.lastPnlPercent) > 5
-        const suspiciousSpike = spikeFromPeak || spikeFromLast
+        const activationCross = pos.lastPnlPercent !== null &&
+          pos.lastPnlPercent < config.trailingActivationPct - 2 &&
+          pnlPercent >= config.trailingActivationPct
+        const suspiciousSpike = spikeFromPeak || spikeFromLast || activationCross
 
         if (suspiciousSpike && config.lpAgentApiKey) {
           const now = Date.now()
@@ -444,7 +447,8 @@ async function monitorCycle(connection: Connection, walletPubkey: PublicKey, own
                 }
               }
             } catch {
-              // LP Agent unavailable — proceed with caution
+              console.log(`[peak-guard] ${tokenLabel} | suspicious spike ${pnlPercent.toFixed(2)}% — LP Agent unavailable, peak frozen`)
+              canTrustPeak = false
             }
           } else {
             console.log(`[peak-guard] ${tokenLabel} | suspicious spike ${pnlPercent.toFixed(2)}% — LP Agent budget exhausted, peak frozen`)
@@ -587,14 +591,28 @@ async function monitorCycle(connection: Connection, walletPubkey: PublicKey, own
               }
             }
 
-            // Cross-check: LP Agent independent PnL vs Meteora PnL (use cached result, no new API call)
+            // Retry LP Agent at recheck if unavailable at trigger time
+            let recheckLpAgent = lpAgentAtTrigger
+            if (!recheckLpAgent) {
+              try {
+                const freshLpPositions = await fetchLpAgentPositions(ownerStr)
+                if (freshLpPositions) {
+                  const freshLpPos = freshLpPositions.get(pos.positionPubkey)
+                  if (freshLpPos) recheckLpAgent = freshLpPos
+                }
+              } catch {
+                // still unavailable
+              }
+            }
+
+            // Cross-check: LP Agent independent PnL vs Meteora PnL
             let usedPnlPct = freshPnlPct
             let usedPnlSource = 'meteora'
-            if (lpAgentAtTrigger) {
-              const delta = Math.abs(freshPnlPct - lpAgentAtTrigger.pnlPercentNative)
+            if (recheckLpAgent) {
+              const delta = Math.abs(freshPnlPct - recheckLpAgent.pnlPercentNative)
               if (delta > 3) {
-                console.log(`[recheck] ${tokenLabel} | DELTA ${delta.toFixed(1)}%: meteora=${freshPnlPct.toFixed(2)}% vs lpagent=${lpAgentAtTrigger.pnlPercentNative.toFixed(2)}% — using lpagent`)
-                usedPnlPct = lpAgentAtTrigger.pnlPercentNative
+                console.log(`[recheck] ${tokenLabel} | DELTA ${delta.toFixed(1)}%: meteora=${freshPnlPct.toFixed(2)}% vs lpagent=${recheckLpAgent.pnlPercentNative.toFixed(2)}% — using lpagent`)
+                usedPnlPct = recheckLpAgent.pnlPercentNative
                 usedPnlSource = 'lpagent'
               }
             }
