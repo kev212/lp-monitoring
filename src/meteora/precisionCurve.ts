@@ -1,11 +1,14 @@
-import { Connection, Keypair, PublicKey, Transaction } from '@solana/web3.js'
+import { Connection, Keypair, PublicKey } from '@solana/web3.js'
 import { BN } from '@coral-xyz/anchor'
 import { StrategyType } from '@meteora-ag/dlmm'
-import { getPool } from './positions.js'
+import { getPool, clearPoolCache } from './positions.js'
 
 const BASIS_POINTS = new BN(10000)
 const STALE_BUFFER_BINS = 2
 const REMOVE_DELAY_MS = 1500
+const SOL_MINT = 'So11111111111111111111111111111111111111112'
+const SOL_FEE_BUFFER_LAMPORTS = BigInt(0.02 * 1e9)
+const SLIPPAGE_LEVELS = [1, 3, 5]
 
 export interface PrecisionCurveResult {
   success: boolean
@@ -52,7 +55,25 @@ function emptyResult(): PrecisionCurveResult {
   }
 }
 
+function isSolMint(mint: string): boolean {
+  return mint === SOL_MINT
+}
+
 async function getTokenBalance(connection: Connection, wallet: Keypair, mint: string): Promise<bigint> {
+  if (isSolMint(mint)) {
+    try {
+      const accounts = await connection.getTokenAccountsByOwner(
+        wallet.publicKey,
+        { mint: new PublicKey(SOL_MINT) }
+      )
+      let total = 0n
+      for (const acc of accounts.value) {
+        const view = new DataView(acc.account.data.buffer, acc.account.data.byteOffset + 64, 8)
+        total += view.getBigUint64(0, true)
+      }
+      return total
+    } catch { return 0n }
+  }
   try {
     const accounts = await connection.getTokenAccountsByOwner(
       wallet.publicKey,
@@ -67,6 +88,19 @@ async function getTokenBalance(connection: Connection, wallet: Keypair, mint: st
   } catch { return 0n }
 }
 
+async function getNativeSolLamports(connection: Connection, wallet: Keypair): Promise<bigint> {
+  try {
+    return BigInt(await connection.getBalance(wallet.publicKey))
+  } catch { return 0n }
+}
+
+async function captureBalances(connection: Connection, wallet: Keypair, tokenXMint: string, tokenYMint: string) {
+  const nativeSol = await getNativeSolLamports(connection, wallet)
+  const tokenX = await getTokenBalance(connection, wallet, tokenXMint)
+  const tokenY = await getTokenBalance(connection, wallet, tokenYMint)
+  return { nativeSol, tokenX, tokenY }
+}
+
 export async function executeDirectionalPrecisionCurve(
   connection: Connection,
   wallet: Keypair,
@@ -78,6 +112,7 @@ export async function executeDirectionalPrecisionCurve(
 ): Promise<PrecisionCurveResult> {
   const result = emptyResult()
   try {
+    clearPoolCache()
     const pool = await getPool(connection, new PublicKey(poolPubkey))
     const position = await pool.getPosition(new PublicKey(positionPubkey))
     if (!position) throw new Error('Position not found')
@@ -134,6 +169,10 @@ export async function executeDirectionalPrecisionCurve(
     result.xWithdrawn = amountX.toString()
     result.yWithdrawn = amountY.toString()
 
+    console.log(`[precision] pre-remove: activeBin=${activeBinId} staleRange=${staleFrom}-${staleTo} direction=${direction}`)
+    const preBal = await captureBalances(connection, wallet, tokenXMint, tokenYMint)
+    console.log(`[precision] pre-balances: nativeSol=${preBal.nativeSol} tokenX=${preBal.tokenX} tokenY=${preBal.tokenY}`)
+
     const removeTxs = await pool.removeLiquidity({
       user: wallet.publicKey,
       position: new PublicKey(positionPubkey),
@@ -155,22 +194,44 @@ export async function executeDirectionalPrecisionCurve(
 
     await new Promise<void>(resolve => { setTimeout(resolve, REMOVE_DELAY_MS) })
 
-    const walletX = await getTokenBalance(connection, wallet, tokenXMint)
-    const walletY = await getTokenBalance(connection, wallet, tokenYMint)
+    const postBal = await captureBalances(connection, wallet, tokenXMint, tokenYMint)
+    console.log(`[precision] post-balances: nativeSol=${postBal.nativeSol} tokenX=${postBal.tokenX} tokenY=${postBal.tokenY}`)
 
-    if (walletX === 0n && walletY === 0n) {
-      throw new Error('no tokens in wallet after remove — cannot re-add')
+    let deltaX = postBal.tokenX > preBal.tokenX ? postBal.tokenX - preBal.tokenX : 0n
+    let deltaY: bigint
+
+    if (isSolMint(tokenYMint)) {
+      const nativeSolDelta = postBal.nativeSol > preBal.nativeSol ? postBal.nativeSol - preBal.nativeSol : 0n
+      const wsolDelta = postBal.tokenY > preBal.tokenY ? postBal.tokenY - preBal.tokenY : 0n
+      const totalSolDelta = nativeSolDelta + wsolDelta
+      deltaY = totalSolDelta > SOL_FEE_BUFFER_LAMPORTS ? totalSolDelta - SOL_FEE_BUFFER_LAMPORTS : 0n
+      console.log(`[precision] SOL delta: native=${nativeSolDelta} wsol=${wsolDelta} total=${totalSolDelta} addY=${deltaY}`)
+    } else {
+      deltaY = postBal.tokenY > preBal.tokenY ? postBal.tokenY - preBal.tokenY : 0n
     }
 
-    result.xDeposited = walletX.toString()
-    result.yDeposited = walletY.toString()
+    if (isSolMint(tokenXMint)) {
+      const nativeSolDelta = postBal.nativeSol > preBal.nativeSol ? postBal.nativeSol - preBal.nativeSol : 0n
+      const wsolDelta = postBal.tokenX > preBal.tokenX ? postBal.tokenX - preBal.tokenX : 0n
+      const totalSolDelta = nativeSolDelta + wsolDelta
+      deltaX = totalSolDelta > SOL_FEE_BUFFER_LAMPORTS ? totalSolDelta - SOL_FEE_BUFFER_LAMPORTS : 0n
+      console.log(`[precision] SOL delta (X): native=${nativeSolDelta} wsol=${wsolDelta} total=${totalSolDelta} addX=${deltaX}`)
+    }
 
+    result.xDeposited = deltaX.toString()
+    result.yDeposited = deltaY.toString()
+    console.log(`[precision] add amounts: deltaX=${deltaX} deltaY=${deltaY}`)
+
+    if (deltaX === 0n && deltaY === 0n) {
+      throw new Error('no tokens gained from remove — cannot re-add')
+    }
+
+    clearPoolCache()
     const freshPool = await getPool(connection, new PublicKey(poolPubkey))
     const freshActiveBin = freshPool.lbPair.activeId
     result.activeBinId = freshActiveBin
     console.log(`[precision] refetch activeBin=${freshActiveBin} (was ${activeBinId})`)
 
-    const SLIPPAGE_LEVELS = [1, 3, 5]
     let addSig: string | null = null
 
     for (const slippage of SLIPPAGE_LEVELS) {
@@ -178,8 +239,8 @@ export async function executeDirectionalPrecisionCurve(
         const addTx = await freshPool.addLiquidityByStrategy({
           positionPubKey: new PublicKey(positionPubkey),
           user: wallet.publicKey,
-          totalXAmount: new BN(walletX.toString()),
-          totalYAmount: new BN(walletY.toString()),
+          totalXAmount: new BN(deltaX.toString()),
+          totalYAmount: new BN(deltaY.toString()),
           strategy: {
             maxBinId: upperBinId,
             minBinId: lowerBinId,
@@ -209,10 +270,9 @@ export async function executeDirectionalPrecisionCurve(
       }
     }
 
-    const finalX = await getTokenBalance(connection, wallet, tokenXMint)
-    const finalY = await getTokenBalance(connection, wallet, tokenYMint)
-    result.xLeftover = finalX.toString()
-    result.yLeftover = finalY.toString()
+    const finalBal = await captureBalances(connection, wallet, tokenXMint, tokenYMint)
+    result.xLeftover = finalBal.tokenX.toString()
+    result.yLeftover = isSolMint(tokenYMint) ? finalBal.nativeSol.toString() : finalBal.tokenY.toString()
 
     result.success = true
     return result
