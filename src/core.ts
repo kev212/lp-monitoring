@@ -771,6 +771,21 @@ async function maybeRunPrecisionCurve(
 
     if (!result.success) {
       updatePrecisionCurveBusy(pos.positionPubkey, false)
+
+      if (result.removeSucceeded && result.addFailed) {
+        console.log(`[precision] ${tokenLabel} | CRITICAL: remove succeeded but add failed: ${result.error}`)
+        sendNotification(
+          `🚨 <b>Precision Curve CRITICAL</b>\n\n` +
+          `<b>${tokenLabel}</b>\n` +
+          `Liquidity withdrawn but add-back failed!\n` +
+          `Tokens idle in wallet.\n` +
+          `Remove: ${result.removeSignature ? `<a href="https://solscan.io/tx/${result.removeSignature}">${result.removeSignature.slice(0, 6)}..${result.removeSignature.slice(-4)}</a>` : '-'}\n` +
+          `Reason: <code>${result.error || 'unknown'}</code>\n\n` +
+          `Position will NOT be auto-closed.`
+        )
+        return true
+      }
+
       console.log(`[precision] ${tokenLabel} | failed: ${result.error || 'unknown'}`)
       sendNotification(
         `❌ <b>Precision Curve Failed</b>\n\n` +

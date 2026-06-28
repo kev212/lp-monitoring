@@ -9,6 +9,8 @@ const REMOVE_DELAY_MS = 1500
 
 export interface PrecisionCurveResult {
   success: boolean
+  removeSucceeded: boolean
+  addFailed: boolean
   removeSignature: string | null
   addSignature: string | null
   activeBinId: number | null
@@ -30,6 +32,8 @@ export interface PrecisionCurveResult {
 function emptyResult(): PrecisionCurveResult {
   return {
     success: false,
+    removeSucceeded: false,
+    addFailed: false,
     removeSignature: null,
     addSignature: null,
     activeBinId: null,
@@ -147,6 +151,7 @@ export async function executeDirectionalPrecisionCurve(
       result.removeSignature = sig
       console.log(`[precision] remove liq tx: ${sig}`)
     }
+    result.removeSucceeded = true
 
     await new Promise<void>(resolve => { setTimeout(resolve, REMOVE_DELAY_MS) })
 
@@ -160,23 +165,49 @@ export async function executeDirectionalPrecisionCurve(
     result.xDeposited = walletX.toString()
     result.yDeposited = walletY.toString()
 
-    const addTx = await pool.addLiquidityByStrategy({
-      positionPubKey: new PublicKey(positionPubkey),
-      user: wallet.publicKey,
-      totalXAmount: new BN(walletX.toString()),
-      totalYAmount: new BN(walletY.toString()),
-      strategy: {
-        maxBinId: upperBinId,
-        minBinId: lowerBinId,
-        strategyType: StrategyType.Curve,
-      },
-    })
+    const freshPool = await getPool(connection, new PublicKey(poolPubkey))
+    const freshActiveBin = freshPool.lbPair.activeId
+    result.activeBinId = freshActiveBin
+    console.log(`[precision] refetch activeBin=${freshActiveBin} (was ${activeBinId})`)
 
-    addTx.sign(wallet)
-    const addSig = await connection.sendTransaction(addTx, [wallet])
-    await connection.confirmTransaction(addSig, 'confirmed')
-    result.addSignature = addSig
-    console.log(`[precision] add liq tx: ${addSig}`)
+    const SLIPPAGE_LEVELS = [1, 3, 5]
+    let addSig: string | null = null
+
+    for (const slippage of SLIPPAGE_LEVELS) {
+      try {
+        const addTx = await freshPool.addLiquidityByStrategy({
+          positionPubKey: new PublicKey(positionPubkey),
+          user: wallet.publicKey,
+          totalXAmount: new BN(walletX.toString()),
+          totalYAmount: new BN(walletY.toString()),
+          strategy: {
+            maxBinId: upperBinId,
+            minBinId: lowerBinId,
+            strategyType: StrategyType.Curve,
+          },
+          slippage,
+        })
+
+        addTx.sign(wallet)
+        addSig = await connection.sendTransaction(addTx, [wallet])
+        await connection.confirmTransaction(addSig, 'confirmed')
+        result.addSignature = addSig
+        console.log(`[precision] add liq tx (slippage=${slippage}): ${addSig}`)
+        break
+      } catch (addErr) {
+        const msg = addErr instanceof Error ? addErr.message : 'unknown'
+        console.log(`[precision] add liq failed (slippage=${slippage}): ${msg}`)
+        if (!msg.includes('ExceededBinSlippageTolerance')) {
+          throw addErr
+        }
+        if (slippage === SLIPPAGE_LEVELS[SLIPPAGE_LEVELS.length - 1]) {
+          result.addFailed = true
+          result.error = `add liquidity failed after ${SLIPPAGE_LEVELS.length} attempts: ${msg}`
+          return result
+        }
+        await new Promise<void>(resolve => { setTimeout(resolve, 800) })
+      }
+    }
 
     const finalX = await getTokenBalance(connection, wallet, tokenXMint)
     const finalY = await getTokenBalance(connection, wallet, tokenYMint)
