@@ -30,9 +30,31 @@ function isAllowedChat(chatId: number | string): boolean {
 }
 
 function setupCommandHandlers(bot: TelegramBot): void {
+  bot.setMyCommands([
+    { command: 'status', description: 'Show all active positions & PnL' },
+    { command: 'precision', description: 'Precision Curve settings menu' },
+    { command: 'help', description: 'List all available commands' },
+  ]).catch(err => console.log(`[telegram] setMyCommands failed: ${err.message}`))
+
+  bot.onText(/^\/status$/, msg => {
+    if (!msg.chat || !isAllowedChat(msg.chat.id)) return
+    sendStatusMenu(bot, msg.chat.id)
+  })
+
   bot.onText(/^\/precision(?:\s+(.+))?$/, msg => {
     if (!msg.chat || !isAllowedChat(msg.chat.id)) return
     sendPrecisionMenu(bot, msg.chat.id)
+  })
+
+  bot.onText(/^\/help$/, msg => {
+    if (!msg.chat || !isAllowedChat(msg.chat.id)) return
+    bot.sendMessage(msg.chat.id,
+      `📋 <b>Available Commands</b>\n\n` +
+      `/status — Show all active positions & PnL\n` +
+      `/precision — Precision Curve settings menu\n` +
+      `/help — List all available commands`,
+      { parse_mode: 'HTML', disable_web_page_preview: true }
+    ).catch(() => undefined)
   })
 
   bot.on('callback_query', async query => {
@@ -66,6 +88,38 @@ function setupCommandHandlers(bot: TelegramBot): void {
   })
 }
 
+function sendStatusMenu(bot: TelegramBot, chatId: number | string): void {
+  const positions = loadActivePositions()
+  if (positions.length === 0) {
+    bot.sendMessage(chatId, 'No active positions.', { parse_mode: 'HTML' }).catch(() => undefined)
+    return
+  }
+
+  const lines = [
+    `📊 <b>Active Positions (${positions.length})</b>`,
+    sep(),
+    ...positions.map((p, idx) => {
+      const label = `${p.tokenXSymbol || p.tokenXMint.slice(0, 4)}/${p.tokenYSymbol || p.tokenYMint.slice(0, 4)}`
+      const pnl = p.lastPnlPercent ?? 0
+      const sign = pnl >= 0 ? '+' : ''
+      const emoji = pnl >= 5 ? '🟢' : pnl >= 0 ? '📘' : pnl >= -5 ? '📙' : '🔴'
+      const value = p.lastEstimatedExitSol ?? 0
+      const peak = p.peakPnlPercent ?? 0
+      const trail = p.trailingActivated ? ' 🔻' : ''
+      return `${idx + 1}. ${emoji} <b>${label}</b> <code>${shortAddr(p.positionPubkey)}</code>\n` +
+        `   PnL: <b>${sign}${pnl.toFixed(2)}%</b> | Value: <b>${value.toFixed(4)} SOL</b>\n` +
+        `   SL: <b>${p.slPercent}%</b> TP: <b>+${p.tpPercent}%</b> | Peak: <b>${peak.toFixed(2)}%</b>${trail}`
+    }),
+  ]
+
+  bot.sendMessage(chatId, lines.join('\n'), {
+    parse_mode: 'HTML',
+    disable_web_page_preview: true,
+  }).catch(err => {
+    console.log(`[telegram] status menu failed: ${err.message}`)
+  })
+}
+
 function sendPrecisionMenu(bot: TelegramBot, chatId: number | string): void {
   const positions = loadActivePositions()
   if (positions.length === 0) {
@@ -76,7 +130,7 @@ function sendPrecisionMenu(bot: TelegramBot, chatId: number | string): void {
   const lines = [
     `<b>Precision Curve</b>`,
     sep(),
-    `Default: <b>off</b> | Threshold: <b>3 bins</b> | Auto-compound: <b>off</b> | Cooldown: <b>60s</b>`,
+    `Default: <b>off</b> | Threshold: <b>5 bins</b> | Cooldown: <b>5s</b>`,
     sep(),
     ...positions.map((p, idx) => {
       const label = `${p.tokenXSymbol || p.tokenXMint.slice(0, 4)}/${p.tokenYSymbol || p.tokenYMint.slice(0, 4)}`
