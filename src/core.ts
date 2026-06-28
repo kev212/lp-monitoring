@@ -47,7 +47,7 @@ let exitCooldowns = new Map<string, number>()
 let lastDiscoveryTime = 0
 let monitorRetries = new Map<string, number>()
 const pendingTriggers = new Map<string, { triggerType: TriggerType; timestamp: number; pnlAtTrigger: number }>()
-const DISCOVERY_INTERVAL_MS = 3 * 60 * 1000 // 3 menit
+const DISCOVERY_INTERVAL_MS = 1 * 60 * 1000 // 1 menit
 const MAX_MONITOR_RETRIES = 5
 const PRECISION_CURVE_COOLDOWN_MS = 5_000
 const LP_AGENT_GUARD_MIN_INTERVAL_MS = 12_500
@@ -161,7 +161,7 @@ async function discoverInitialPositions(connection: Connection, walletPubkey: Pu
       let slPercent = config.defaultSlPercent
 
       try {
-        const lpAgentPositions = await fetchLpAgentPositions(ownerStr)
+        const lpAgentPositions = await fetchLpAgentPositions(ownerStr, true)
         if (lpAgentPositions) {
           const lpPos = lpAgentPositions.get(dp.positionPubkey)
           if (lpPos) {
@@ -256,7 +256,7 @@ async function redetectStrategies(ownerStr: string): Promise<void> {
 
   console.log(`[strategy] redetecting ${unknownPositions.length} positions with unknown strategy...`)
   try {
-    const lpAgentPositions = await fetchLpAgentPositions(ownerStr)
+    const lpAgentPositions = await fetchLpAgentPositions(ownerStr, true)
     if (!lpAgentPositions) {
       console.log('[strategy] LP Agent unavailable, skipping redetect')
       return

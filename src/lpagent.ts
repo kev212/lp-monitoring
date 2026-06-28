@@ -36,7 +36,7 @@ interface LpAgentCacheEntry {
 
 const cache = new Map<string, LpAgentCacheEntry>()
 
-export async function fetchLpAgentPositions(owner: string): Promise<Map<string, LpAgentPosition> | null> {
+export async function fetchLpAgentPositions(owner: string, force = false): Promise<Map<string, LpAgentPosition> | null> {
   if (!config.lpAgentApiKey) return null
 
   const now = Date.now()
@@ -50,12 +50,13 @@ export async function fetchLpAgentPositions(owner: string): Promise<Map<string, 
 
   if (cached && now - cached.ts < CACHE_TTL_MS) return cached.data
 
-  if (cached && now - lastApiCallTime < API_MIN_INTERVAL_MS) {
-    return cached.data
-  }
-
-  if (now - lastApiCallTime < API_MIN_INTERVAL_MS) {
-    return null
+  if (!force) {
+    if (cached && now - lastApiCallTime < API_MIN_INTERVAL_MS) {
+      return cached.data
+    }
+    if (now - lastApiCallTime < API_MIN_INTERVAL_MS) {
+      return null
+    }
   }
 
   lastApiCallTime = now
