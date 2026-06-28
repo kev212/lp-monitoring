@@ -4,7 +4,8 @@ import { StrategyType, getLiquidityStrategyParameterBuilder, buildLiquidityStrat
 import { getPool } from './positions.js'
 
 const BASIS_POINTS = new BN(10000)
-const LEFTOVER_TOLERANCE_BPS = new BN(1) // 0.01%
+const TOPUP_TOLERANCE_BPS = new BN(1) // 0.01%
+const LEFTOVER_TOLERANCE_BPS = new BN(50) // 0.5%
 const DEFAULT_MAX_ACTIVE_BIN_SLIPPAGE = new BN(3)
 
 export interface PrecisionCurveResult {
@@ -17,9 +18,21 @@ export interface PrecisionCurveResult {
   yWithdrawn: string
   xDeposited: string
   yDeposited: string
+  xTopup: string
+  yTopup: string
+  xTopupPct: number
+  yTopupPct: number
   xLeftover: string
   yLeftover: string
+  xLeftoverPct: number
+  yLeftoverPct: number
+  skipReason: string | null
   error?: string
+}
+
+function pctBasis(amount: BN, basis: BN): number {
+  if (basis.isZero()) return amount.isZero() ? 0 : 100
+  return amount.mul(new BN(10000)).div(basis).toNumber() / 100
 }
 
 function emptyResult(): PrecisionCurveResult {
@@ -33,18 +46,25 @@ function emptyResult(): PrecisionCurveResult {
     yWithdrawn: '0',
     xDeposited: '0',
     yDeposited: '0',
+    xTopup: '0',
+    yTopup: '0',
+    xTopupPct: 0,
+    yTopupPct: 0,
     xLeftover: '0',
     yLeftover: '0',
+    xLeftoverPct: 0,
+    yLeftoverPct: 0,
+    skipReason: null,
   }
 }
 
-function withinTolerance(withdrawn: BN, deposited: BN): boolean {
-  if (withdrawn.isZero()) return deposited.isZero()
-  const diff = withdrawn.gt(deposited) ? withdrawn.sub(deposited) : deposited.sub(withdrawn)
-  return diff.mul(BASIS_POINTS).lte(withdrawn.mul(LEFTOVER_TOLERANCE_BPS))
+function topupWithinTolerance(amount: BN, basis: BN): boolean {
+  if (amount.isZero()) return true
+  if (basis.isZero()) return amount.isZero()
+  return amount.mul(BASIS_POINTS).lte(basis.mul(TOPUP_TOLERANCE_BPS))
 }
 
-function nearZero(amount: BN, basis: BN): boolean {
+function leftoverWithinTolerance(amount: BN, basis: BN): boolean {
   if (amount.isZero()) return true
   if (basis.isZero()) return amount.isZero()
   return amount.mul(BASIS_POINTS).lte(basis.mul(LEFTOVER_TOLERANCE_BPS))
@@ -138,23 +158,33 @@ export async function executePrecisionCurveRebalance(
     result.yWithdrawn = amountY.toString()
     result.xDeposited = sim.amountXDeposited.toString()
     result.yDeposited = sim.amountYDeposited.toString()
+    result.xTopup = sim.actualAmountXDeposited.toString()
+    result.yTopup = sim.actualAmountYDeposited.toString()
+    result.xLeftover = sim.actualAmountXWithdrawn.toString()
+    result.yLeftover = sim.actualAmountYWithdrawn.toString()
+    result.xTopupPct = pctBasis(sim.actualAmountXDeposited, amountX)
+    result.yTopupPct = pctBasis(sim.actualAmountYDeposited, amountY)
+    result.xLeftoverPct = pctBasis(sim.actualAmountXWithdrawn, amountX)
+    result.yLeftoverPct = pctBasis(sim.actualAmountYWithdrawn, amountY)
 
-    const xLeftover = sim.actualAmountXWithdrawn.add(sim.actualAmountXDeposited)
-    const yLeftover = sim.actualAmountYWithdrawn.add(sim.actualAmountYDeposited)
-    result.xLeftover = xLeftover.toString()
-    result.yLeftover = yLeftover.toString()
+    // Top-up check: strict, max 0.01%
+    if (sim.actualAmountXDeposited.gt(new BN(0)) && !topupWithinTolerance(sim.actualAmountXDeposited, amountX)) {
+      result.skipReason = `X top-up ${result.xTopupPct.toFixed(2)}% exceeds limit 0.01%`
+      return result
+    }
+    if (sim.actualAmountYDeposited.gt(new BN(0)) && !topupWithinTolerance(sim.actualAmountYDeposited, amountY)) {
+      result.skipReason = `Y top-up ${result.yTopupPct.toFixed(2)}% exceeds limit 0.01%`
+      return result
+    }
 
-    if (!withinTolerance(amountX, sim.amountXDeposited)) {
-      throw new Error(`X gross deposit mismatch: withdraw=${result.xWithdrawn} deposit=${result.xDeposited}`)
+    // Leftover check: max 0.5%
+    if (sim.actualAmountXWithdrawn.gt(new BN(0)) && !leftoverWithinTolerance(sim.actualAmountXWithdrawn, amountX)) {
+      result.skipReason = `X leftover ${result.xLeftoverPct.toFixed(2)}% exceeds limit 0.5%`
+      return result
     }
-    if (!withinTolerance(amountY, sim.amountYDeposited)) {
-      throw new Error(`Y gross deposit mismatch: withdraw=${result.yWithdrawn} deposit=${result.yDeposited}`)
-    }
-    if (!nearZero(xLeftover, amountX)) {
-      throw new Error(`X net leftover/topup too high: ${xLeftover.toString()}`)
-    }
-    if (!nearZero(yLeftover, amountY)) {
-      throw new Error(`Y net leftover/topup too high: ${yLeftover.toString()}`)
+    if (sim.actualAmountYWithdrawn.gt(new BN(0)) && !leftoverWithinTolerance(sim.actualAmountYWithdrawn, amountY)) {
+      result.skipReason = `Y leftover ${result.yLeftoverPct.toFixed(2)}% exceeds limit 0.5%`
+      return result
     }
 
     const built = await pool.rebalancePosition(simulation, DEFAULT_MAX_ACTIVE_BIN_SLIPPAGE, wallet.publicKey, 0.01)
