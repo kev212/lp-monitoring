@@ -1,12 +1,14 @@
 import TelegramBot from 'node-telegram-bot-api'
 import { config } from './config.js'
+import { loadActivePositions, updatePrecisionCurveEnabled } from './meteora/discovery.js'
 
 let _bot: TelegramBot | null = null
 
 function getBot(): TelegramBot | null {
   if (!config.telegramBotToken || !config.telegramChatId) return null
   if (!_bot) {
-    _bot = new TelegramBot(config.telegramBotToken, { polling: false })
+    _bot = new TelegramBot(config.telegramBotToken, { polling: true })
+    setupCommandHandlers(_bot)
   }
   return _bot
 }
@@ -21,6 +23,97 @@ export function sendNotification(message: string): void {
   }).catch(err => {
     console.log(`[telegram] send failed: ${err.message}`)
   })
+}
+
+function isAllowedChat(chatId: number | string): boolean {
+  return String(chatId) === String(config.telegramChatId)
+}
+
+function setupCommandHandlers(bot: TelegramBot): void {
+  bot.onText(/^\/precision(?:\s+(.+))?$/, msg => {
+    if (!msg.chat || !isAllowedChat(msg.chat.id)) return
+    sendPrecisionMenu(bot, msg.chat.id)
+  })
+
+  bot.on('callback_query', async query => {
+    const chatId = query.message?.chat.id
+    if (!chatId || !isAllowedChat(chatId)) return
+    const data = query.data || ''
+    if (!data.startsWith('pc:')) return
+
+    const [, action, pubkey] = data.split(':')
+    const positions = loadActivePositions()
+    const pos = positions.find(p => p.positionPubkey === pubkey)
+    if (!pos) {
+      await bot.answerCallbackQuery(query.id, { text: 'Position not active' }).catch(() => undefined)
+      sendPrecisionMenu(bot, chatId)
+      return
+    }
+
+    if (action === 'on') {
+      const activeBin = pos.precisionCurveLastActiveBin ?? null
+      updatePrecisionCurveEnabled(pos.positionPubkey, true, activeBin)
+      await bot.answerCallbackQuery(query.id, { text: 'Precision Curve enabled' }).catch(() => undefined)
+    } else if (action === 'off') {
+      updatePrecisionCurveEnabled(pos.positionPubkey, false)
+      await bot.answerCallbackQuery(query.id, { text: 'Precision Curve disabled' }).catch(() => undefined)
+    } else if (action === 'status') {
+      await bot.answerCallbackQuery(query.id, { text: precisionStatusText(pos), show_alert: true }).catch(() => undefined)
+      return
+    }
+
+    sendPrecisionMenu(bot, chatId)
+  })
+}
+
+function sendPrecisionMenu(bot: TelegramBot, chatId: number | string): void {
+  const positions = loadActivePositions()
+  if (positions.length === 0) {
+    bot.sendMessage(chatId, 'No active positions.', { parse_mode: 'HTML' }).catch(() => undefined)
+    return
+  }
+
+  const lines = [
+    `<b>Precision Curve</b>`,
+    sep(),
+    `Default: <b>off</b> | Auto-compound: <b>off</b> | Cooldown: <b>60s</b>`,
+    sep(),
+    ...positions.map((p, idx) => {
+      const label = `${p.tokenXSymbol || p.tokenXMint.slice(0, 4)}/${p.tokenYSymbol || p.tokenYMint.slice(0, 4)}`
+      const state = p.precisionCurveEnabled ? 'ON' : 'OFF'
+      const busy = p.precisionCurveBusy ? ' busy' : ''
+      const last = p.precisionCurveLastActiveBin === null ? '-' : String(p.precisionCurveLastActiveBin)
+      return `${idx + 1}. <b>${label}</b> <code>${shortAddr(p.positionPubkey)}</code> — <b>${state}</b>${busy}\nThreshold: <b>${p.precisionCurveThresholdBins} bins</b> | Last active bin: <b>${last}</b>`
+    })
+  ]
+
+  bot.sendMessage(chatId, lines.join('\n'), {
+    parse_mode: 'HTML',
+    disable_web_page_preview: true,
+    reply_markup: {
+      inline_keyboard: positions.flatMap(p => {
+        const label = `${p.tokenXSymbol || p.tokenXMint.slice(0, 4)}/${p.tokenYSymbol || p.tokenYMint.slice(0, 4)} ${shortAddr(p.positionPubkey)}`
+        return [[
+          { text: p.precisionCurveEnabled ? `Disable ${label}` : `Enable ${label}`, callback_data: `pc:${p.precisionCurveEnabled ? 'off' : 'on'}:${p.positionPubkey}` },
+          { text: 'Status', callback_data: `pc:status:${p.positionPubkey}` },
+        ]]
+      })
+    }
+  }).catch(err => {
+    console.log(`[telegram] precision menu failed: ${err.message}`)
+  })
+}
+
+function precisionStatusText(pos: ReturnType<typeof loadActivePositions>[number]): string {
+  const label = `${pos.tokenXSymbol || pos.tokenXMint.slice(0, 4)}/${pos.tokenYSymbol || pos.tokenYMint.slice(0, 4)}`
+  return [
+    `${label} ${shortAddr(pos.positionPubkey)}`,
+    `Precision Curve: ${pos.precisionCurveEnabled ? 'ON' : 'OFF'}`,
+    `Threshold: ${pos.precisionCurveThresholdBins} bins`,
+    `Last active bin: ${pos.precisionCurveLastActiveBin ?? '-'}`,
+    `Last reshape: ${pos.precisionCurveLastReshapeAt ? new Date(pos.precisionCurveLastReshapeAt).toISOString() : '-'}`,
+    `Busy: ${pos.precisionCurveBusy ? 'yes' : 'no'}`,
+  ].join('\n')
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────

@@ -25,6 +25,11 @@ export interface PositionRow {
   lastEstimatedExitSol: number | null
   lastSeenAt: number
   strategy: StrategyType
+  precisionCurveEnabled: boolean
+  precisionCurveLastActiveBin: number | null
+  precisionCurveLastReshapeAt: number | null
+  precisionCurveBusy: boolean
+  precisionCurveThresholdBins: number
   createdAt: number
   updatedAt: number
 }

@@ -32,6 +32,11 @@ function rowToPosition(row: any): PositionRow {
     lastEstimatedExitSol: row.last_estimated_exit_sol,
     lastSeenAt: row.last_seen_at,
     strategy: row.strategy || 'unknown',
+    precisionCurveEnabled: row.precision_curve_enabled === 1,
+    precisionCurveLastActiveBin: row.precision_curve_last_active_bin ?? null,
+    precisionCurveLastReshapeAt: row.precision_curve_last_reshape_at ?? null,
+    precisionCurveBusy: row.precision_curve_busy === 1,
+    precisionCurveThresholdBins: row.precision_curve_threshold_bins ?? 5,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   }
@@ -125,4 +130,33 @@ export function updatePositionStrategy(pubkey: string, strategy: StrategyType, s
   getDb().prepare(
     'UPDATE positions SET strategy = ?, sl_percent = ?, tp_percent = ?, updated_at = ? WHERE position_pubkey = ?'
   ).run(strategy, slPercent, tpPercent, Date.now(), pubkey)
+}
+
+export function updatePrecisionCurveEnabled(pubkey: string, enabled: boolean, currentActiveBin: number | null = null): void {
+  const db = getDb()
+  const now = Date.now()
+  db.prepare(
+    `UPDATE positions
+     SET precision_curve_enabled = ?,
+         precision_curve_last_active_bin = CASE WHEN ? = 1 THEN ? ELSE precision_curve_last_active_bin END,
+         precision_curve_busy = 0,
+         updated_at = ?
+     WHERE position_pubkey = ?`
+  ).run(enabled ? 1 : 0, enabled ? 1 : 0, currentActiveBin, now, pubkey)
+}
+
+export function updatePrecisionCurveBusy(pubkey: string, busy: boolean): void {
+  getDb().prepare('UPDATE positions SET precision_curve_busy = ?, updated_at = ? WHERE position_pubkey = ?')
+    .run(busy ? 1 : 0, Date.now(), pubkey)
+}
+
+export function updatePrecisionCurveState(pubkey: string, lastActiveBin: number, lastReshapeAt: number): void {
+  getDb().prepare(
+    'UPDATE positions SET precision_curve_last_active_bin = ?, precision_curve_last_reshape_at = ?, precision_curve_busy = 0, updated_at = ? WHERE position_pubkey = ?'
+  ).run(lastActiveBin, lastReshapeAt, Date.now(), pubkey)
+}
+
+export function updatePrecisionCurveThreshold(pubkey: string, thresholdBins: number): void {
+  getDb().prepare('UPDATE positions SET precision_curve_threshold_bins = ?, updated_at = ? WHERE position_pubkey = ?')
+    .run(thresholdBins, Date.now(), pubkey)
 }

@@ -12,6 +12,8 @@ import {
   updatePositionConfirmations,
   updatePeakPnl,
   updatePositionStrategy,
+  updatePrecisionCurveBusy,
+  updatePrecisionCurveState,
 } from './meteora/discovery.js'
 import {
   getAllPositionsForWallet,
@@ -23,6 +25,7 @@ import {
 import { estimateExitValue, clearPnlCache } from './meteora/valuation.js'
 import { fetchLpAgentPositions } from './lpagent.js'
 import { executeExit } from './meteora/exit.js'
+import { executePrecisionCurveRebalance } from './meteora/precisionCurve.js'
 import { evaluateTrigger, type BinData } from './risk/rules.js'
 import {
   sendNotification,
@@ -46,6 +49,7 @@ let monitorRetries = new Map<string, number>()
 const pendingTriggers = new Map<string, { triggerType: TriggerType; timestamp: number; pnlAtTrigger: number }>()
 const DISCOVERY_INTERVAL_MS = 3 * 60 * 1000 // 3 menit
 const MAX_MONITOR_RETRIES = 5
+const PRECISION_CURVE_COOLDOWN_MS = 60_000
 
 export async function startBot(): Promise<void> {
   console.log('[app] starting monitoring-lp...')
@@ -317,7 +321,7 @@ async function monitorCycle(connection: Connection, walletPubkey: PublicKey, own
       continue
     }
 
-    if (i > 0) await sleep(250)
+      if (i > 0) await sleep(250)
 
     try {
       const valuation = await estimateExitValue(pos.poolPubkey, ownerStr, pos.positionPubkey)
@@ -447,6 +451,10 @@ async function monitorCycle(connection: Connection, walletPubkey: PublicKey, own
         upperBinId: valuation.upperBinId,
         poolActiveBinId: valuation.poolActiveBinId,
       }
+
+      const precisionHandled = await maybeRunPrecisionCurve(pos, valuation.lowerBinId, valuation.upperBinId, valuation.poolActiveBinId)
+      if (precisionHandled) continue
+
       const decision = evaluateTrigger(pos, pnlPercent, binData)
       if (decision.shouldTrigger && decision.triggerType) {
         const tokenLabel = `${pos.tokenXSymbol || pos.tokenXMint.slice(0, 4)}/${pos.tokenYSymbol || pos.tokenYMint.slice(0, 4)}`
@@ -674,6 +682,111 @@ async function monitorCycle(connection: Connection, walletPubkey: PublicKey, own
     } catch (err) {
       console.log(`[monitor] error on ${pos.positionPubkey.slice(0, 8)}: ${err instanceof Error ? err.message : 'unknown'}`)
     }
+  }
+}
+
+async function maybeRunPrecisionCurve(
+  pos: PositionRow,
+  lowerBinId?: number,
+  upperBinId?: number,
+  poolActiveBinId?: number,
+): Promise<boolean> {
+  if (!pos.precisionCurveEnabled) return false
+  const tokenLabel = `${pos.tokenXSymbol || pos.tokenXMint.slice(0, 4)}/${pos.tokenYSymbol || pos.tokenYMint.slice(0, 4)}`
+
+  if (pos.precisionCurveBusy) {
+    console.log(`[precision] ${tokenLabel} | busy — skip trigger evaluation this cycle`)
+    return true
+  }
+
+  if (lowerBinId === undefined || upperBinId === undefined || poolActiveBinId === undefined) {
+    console.log(`[precision] ${tokenLabel} | missing bin data — skip`)
+    return false
+  }
+
+  if (poolActiveBinId < lowerBinId || poolActiveBinId > upperBinId) {
+    console.log(`[precision] ${tokenLabel} | active bin ${poolActiveBinId} outside range ${lowerBinId}-${upperBinId} — skip`)
+    sendNotification(
+      `⚠️ <b>Precision Curve Skipped</b>\n\n` +
+      `<b>${tokenLabel}</b>\n` +
+      `Active bin: <b>${poolActiveBinId}</b>\n` +
+      `Range: <b>${lowerBinId}-${upperBinId}</b>\n` +
+      `Reason: active bin outside range.`
+    )
+    return false
+  }
+
+  if (pos.precisionCurveLastActiveBin === null) {
+    updatePrecisionCurveState(pos.positionPubkey, poolActiveBinId, pos.precisionCurveLastReshapeAt || 0)
+    console.log(`[precision] ${tokenLabel} | baseline activeBin=${poolActiveBinId}`)
+    return false
+  }
+
+  const movedBins = Math.abs(poolActiveBinId - pos.precisionCurveLastActiveBin)
+  const threshold = pos.precisionCurveThresholdBins || 5
+  if (movedBins < threshold) return false
+
+  const lastReshapeAt = pos.precisionCurveLastReshapeAt || 0
+  const cooldownLeft = PRECISION_CURVE_COOLDOWN_MS - (Date.now() - lastReshapeAt)
+  if (lastReshapeAt > 0 && cooldownLeft > 0) {
+    console.log(`[precision] ${tokenLabel} | moved ${movedBins} bins but cooldown ${Math.ceil(cooldownLeft / 1000)}s left`)
+    return false
+  }
+
+  console.log(`[precision] ${tokenLabel} | moved ${movedBins} bins (${pos.precisionCurveLastActiveBin} -> ${poolActiveBinId}) — rebalance`)
+  sendNotification(
+    `🔁 <b>Precision Curve Reshape Started</b>\n\n` +
+    `<b>${tokenLabel}</b>\n` +
+    `Moved: <b>${movedBins} bins</b>\n` +
+    `Active: <b>${pos.precisionCurveLastActiveBin} → ${poolActiveBinId}</b>\n` +
+    `Range: <b>${lowerBinId}-${upperBinId}</b>\n` +
+    `Auto-compound: <b>off</b>`
+  )
+
+  updatePrecisionCurveBusy(pos.positionPubkey, true)
+  try {
+    const result = await executePrecisionCurveRebalance(
+      getConnection(),
+      getWallet(),
+      pos.positionPubkey,
+      pos.poolPubkey,
+    )
+
+    if (!result.success) {
+      updatePrecisionCurveBusy(pos.positionPubkey, false)
+      console.log(`[precision] ${tokenLabel} | failed: ${result.error || 'unknown'}`)
+      sendNotification(
+        `❌ <b>Precision Curve Failed</b>\n\n` +
+        `<b>${tokenLabel}</b>\n` +
+        `Reason: <code>${result.error || 'unknown'}</code>\n` +
+        `Position remains monitored.`
+      )
+      return true
+    }
+
+    updatePrecisionCurveState(pos.positionPubkey, poolActiveBinId, Date.now())
+    console.log(`[precision] ${tokenLabel} | rebalance tx: ${result.signature || 'n/a'}`)
+    sendNotification(
+      `✅ <b>Precision Curve Reshape Complete</b>\n\n` +
+      `<b>${tokenLabel}</b>\n` +
+      `Active baseline: <b>${poolActiveBinId}</b>\n` +
+      `Range: <b>${lowerBinId}-${upperBinId}</b>\n` +
+      `X withdrawn/deposited: <code>${result.xWithdrawn}</code> / <code>${result.xDeposited}</code>\n` +
+      `Y withdrawn/deposited: <code>${result.yWithdrawn}</code> / <code>${result.yDeposited}</code>\n` +
+      `Tx: ${result.signature ? `<a href="https://solscan.io/tx/${result.signature}">${result.signature.slice(0, 6)}..${result.signature.slice(-4)}</a>` : '-'}`
+    )
+    return true
+  } catch (err) {
+    updatePrecisionCurveBusy(pos.positionPubkey, false)
+    const message = err instanceof Error ? err.message : 'unknown error'
+    console.log(`[precision] ${tokenLabel} | error: ${message}`)
+    sendNotification(
+      `❌ <b>Precision Curve Failed</b>\n\n` +
+      `<b>${tokenLabel}</b>\n` +
+      `Reason: <code>${message}</code>\n` +
+      `Position remains monitored.`
+    )
+    return true
   }
 }
 

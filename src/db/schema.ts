@@ -22,6 +22,11 @@ export function initSchema(db: Database.Database): void {
       peak_pnl_percent REAL NOT NULL DEFAULT 0,
       trailing_activated INTEGER NOT NULL DEFAULT 0,
       strategy TEXT NOT NULL DEFAULT 'unknown',
+      precision_curve_enabled INTEGER NOT NULL DEFAULT 0,
+      precision_curve_last_active_bin INTEGER,
+      precision_curve_last_reshape_at INTEGER,
+      precision_curve_busy INTEGER NOT NULL DEFAULT 0,
+      precision_curve_threshold_bins INTEGER NOT NULL DEFAULT 5,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
@@ -77,5 +82,25 @@ export function initSchema(db: Database.Database): void {
   const hasStrategy = cols.some((c: any) => c.name === 'strategy')
   if (!hasStrategy) {
     db.exec("ALTER TABLE positions ADD COLUMN strategy TEXT NOT NULL DEFAULT 'unknown'")
+  }
+  const hasPrecisionCurveEnabled = cols.some((c: any) => c.name === 'precision_curve_enabled')
+  if (!hasPrecisionCurveEnabled) {
+    db.exec("ALTER TABLE positions ADD COLUMN precision_curve_enabled INTEGER NOT NULL DEFAULT 0")
+  }
+  const hasPrecisionCurveLastActiveBin = cols.some((c: any) => c.name === 'precision_curve_last_active_bin')
+  if (!hasPrecisionCurveLastActiveBin) {
+    db.exec("ALTER TABLE positions ADD COLUMN precision_curve_last_active_bin INTEGER")
+  }
+  const hasPrecisionCurveLastReshapeAt = cols.some((c: any) => c.name === 'precision_curve_last_reshape_at')
+  if (!hasPrecisionCurveLastReshapeAt) {
+    db.exec("ALTER TABLE positions ADD COLUMN precision_curve_last_reshape_at INTEGER")
+  }
+  const hasPrecisionCurveBusy = cols.some((c: any) => c.name === 'precision_curve_busy')
+  if (!hasPrecisionCurveBusy) {
+    db.exec("ALTER TABLE positions ADD COLUMN precision_curve_busy INTEGER NOT NULL DEFAULT 0")
+  }
+  const hasPrecisionCurveThresholdBins = cols.some((c: any) => c.name === 'precision_curve_threshold_bins')
+  if (!hasPrecisionCurveThresholdBins) {
+    db.exec("ALTER TABLE positions ADD COLUMN precision_curve_threshold_bins INTEGER NOT NULL DEFAULT 5")
   }
 }
