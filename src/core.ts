@@ -763,23 +763,6 @@ async function maybeRunPrecisionCurve(
       pos.poolPubkey,
     )
 
-    if (result.skipReason) {
-      updatePrecisionCurveBusy(pos.positionPubkey, false)
-      console.log(`[precision] ${tokenLabel} | skip: ${result.skipReason}`)
-      sendNotification(
-        `⏭️ <b>Precision Curve Skipped</b>\n\n` +
-        `<b>${tokenLabel}</b>\n` +
-        `Active bin: <b>${poolActiveBinId}</b>\n` +
-        `Range: <b>${lowerBinId}-${upperBinId}</b>\n` +
-        `Reason: <code>${result.skipReason}</code>\n\n` +
-        `X top-up: <code>${result.xTopup}</code> (${result.xTopupPct.toFixed(2)}%)\n` +
-        `Y top-up: <code>${result.yTopup}</code> (${result.yTopupPct.toFixed(2)}%)\n` +
-        `X leftover: <code>${result.xLeftover}</code> (${result.xLeftoverPct.toFixed(2)}%)\n` +
-        `Y leftover: <code>${result.yLeftover}</code> (${result.yLeftoverPct.toFixed(2)}%)`
-      )
-      return true
-    }
-
     if (!result.success) {
       updatePrecisionCurveBusy(pos.positionPubkey, false)
       console.log(`[precision] ${tokenLabel} | failed: ${result.error || 'unknown'}`)

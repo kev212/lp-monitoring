@@ -4,8 +4,6 @@ import { StrategyType, getLiquidityStrategyParameterBuilder, buildLiquidityStrat
 import { getPool } from './positions.js'
 
 const BASIS_POINTS = new BN(10000)
-const TOPUP_TOLERANCE_BPS = new BN(1) // 0.01%
-const LEFTOVER_TOLERANCE_BPS = new BN(50) // 0.5%
 const DEFAULT_MAX_ACTIVE_BIN_SLIPPAGE = new BN(3)
 
 export interface PrecisionCurveResult {
@@ -26,7 +24,6 @@ export interface PrecisionCurveResult {
   yLeftover: string
   xLeftoverPct: number
   yLeftoverPct: number
-  skipReason: string | null
   error?: string
 }
 
@@ -54,20 +51,7 @@ function emptyResult(): PrecisionCurveResult {
     yLeftover: '0',
     xLeftoverPct: 0,
     yLeftoverPct: 0,
-    skipReason: null,
   }
-}
-
-function topupWithinTolerance(amount: BN, basis: BN): boolean {
-  if (amount.isZero()) return true
-  if (basis.isZero()) return amount.isZero()
-  return amount.mul(BASIS_POINTS).lte(basis.mul(TOPUP_TOLERANCE_BPS))
-}
-
-function leftoverWithinTolerance(amount: BN, basis: BN): boolean {
-  if (amount.isZero()) return true
-  if (basis.isZero()) return amount.isZero()
-  return amount.mul(BASIS_POINTS).lte(basis.mul(LEFTOVER_TOLERANCE_BPS))
 }
 
 async function sendInstructionTx(
@@ -166,26 +150,6 @@ export async function executePrecisionCurveRebalance(
     result.yTopupPct = pctBasis(sim.actualAmountYDeposited, amountY)
     result.xLeftoverPct = pctBasis(sim.actualAmountXWithdrawn, amountX)
     result.yLeftoverPct = pctBasis(sim.actualAmountYWithdrawn, amountY)
-
-    // Top-up check: strict, max 0.01%
-    if (sim.actualAmountXDeposited.gt(new BN(0)) && !topupWithinTolerance(sim.actualAmountXDeposited, amountX)) {
-      result.skipReason = `X top-up ${result.xTopupPct.toFixed(2)}% exceeds limit 0.01%`
-      return result
-    }
-    if (sim.actualAmountYDeposited.gt(new BN(0)) && !topupWithinTolerance(sim.actualAmountYDeposited, amountY)) {
-      result.skipReason = `Y top-up ${result.yTopupPct.toFixed(2)}% exceeds limit 0.01%`
-      return result
-    }
-
-    // Leftover check: max 0.5%
-    if (sim.actualAmountXWithdrawn.gt(new BN(0)) && !leftoverWithinTolerance(sim.actualAmountXWithdrawn, amountX)) {
-      result.skipReason = `X leftover ${result.xLeftoverPct.toFixed(2)}% exceeds limit 0.5%`
-      return result
-    }
-    if (sim.actualAmountYWithdrawn.gt(new BN(0)) && !leftoverWithinTolerance(sim.actualAmountYWithdrawn, amountY)) {
-      result.skipReason = `Y leftover ${result.yLeftoverPct.toFixed(2)}% exceeds limit 0.5%`
-      return result
-    }
 
     const built = await pool.rebalancePosition(simulation, DEFAULT_MAX_ACTIVE_BIN_SLIPPAGE, wallet.publicKey, 0.01)
     for (const ix of built.initBinArrayInstructions) {
