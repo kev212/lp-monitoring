@@ -1,7 +1,8 @@
 export type PositionStatus = 'discovering' | 'monitoring' | 'exiting' | 'closed' | 'error'
 export type BasisConfidence = 'high' | 'medium' | 'low'
+export type StrategyType = 'single_side_quote' | 'single_side_token' | 'balanced' | 'unknown'
 export type EventType = 'POSITION_INIT' | 'ADD_LIQUIDITY' | 'REMOVE_LIQUIDITY' | 'CLAIM_FEE' | 'CLAIM_REWARD' | 'CLOSE_POSITION' | 'UNKNOWN'
-export type TriggerType = 'TP' | 'SL'
+export type TriggerType = 'TP' | 'SL' | 'TRAILING_STOP' | 'BIN_RANGE'
 export type ExitStatus = 'pending_remove' | 'removed' | 'swap_pending' | 'completed' | 'failed'
 
 export interface PositionRow {
@@ -9,6 +10,8 @@ export interface PositionRow {
   poolPubkey: string
   tokenXMint: string
   tokenYMint: string
+  tokenXSymbol: string
+  tokenYSymbol: string
   owner: string
   basisSol: number
   basisConfidence: BasisConfidence
@@ -16,9 +19,12 @@ export interface PositionRow {
   slPercent: number
   status: PositionStatus
   triggerConfirmations: number
+  peakPnlPercent: number
+  trailingActivated: boolean
   lastPnlPercent: number | null
   lastEstimatedExitSol: number | null
   lastSeenAt: number
+  strategy: StrategyType
   createdAt: number
   updatedAt: number
 }
@@ -67,6 +73,13 @@ export interface Config {
   maxRetries: number
   exitCooldownMs: number
   maxSwapSlippageBps: number
+  trailingActivationPct: number
+  trailingStopDropPct: number
+  recheckDelayMs: number
+  lpAgentApiKey: string
+  binRangeCloseEnabled: boolean
+  binRangePnlThreshold: number
+  binRangeMaxDistance: number
   dbPath: string
   logLevel: string
 }

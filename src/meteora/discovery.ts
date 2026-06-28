@@ -1,6 +1,6 @@
 import { Connection, PublicKey } from '@solana/web3.js'
 import { getDb } from '../db/client.js'
-import type { PositionRow, BasisConfidence } from '../types.js'
+import type { PositionRow, BasisConfidence, StrategyType } from '../types.js'
 
 const DLMM_PROGRAM_ID = new PublicKey('LBUZKhbPFn5XX4kz4LZ7Qd8hLEjNvF7M7bQeFqF7gYx')
 
@@ -11,14 +11,40 @@ export interface DiscoveredPosition {
   tokenYMint: string
 }
 
+function rowToPosition(row: any): PositionRow {
+  return {
+    positionPubkey: row.position_pubkey,
+    poolPubkey: row.pool_pubkey,
+    tokenXMint: row.token_x_mint,
+    tokenYMint: row.token_y_mint,
+    tokenXSymbol: row.token_x_symbol || '',
+    tokenYSymbol: row.token_y_symbol || '',
+    owner: row.owner,
+    basisSol: row.basis_sol,
+    basisConfidence: row.basis_confidence,
+    tpPercent: row.tp_percent,
+    slPercent: row.sl_percent,
+    status: row.status,
+    triggerConfirmations: row.trigger_confirmations,
+    peakPnlPercent: row.peak_pnl_percent ?? 0,
+    trailingActivated: row.trailing_activated === 1,
+    lastPnlPercent: row.last_pnl_percent,
+    lastEstimatedExitSol: row.last_estimated_exit_sol,
+    lastSeenAt: row.last_seen_at,
+    strategy: row.strategy || 'unknown',
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  }
+}
+
 export function loadKnownPositions(): PositionRow[] {
   const db = getDb()
-  return db.prepare('SELECT * FROM positions WHERE status != ?').all('closed') as PositionRow[]
+  return (db.prepare('SELECT * FROM positions').all() as any[]).map(rowToPosition)
 }
 
 export function loadActivePositions(): PositionRow[] {
   const db = getDb()
-  return db.prepare("SELECT * FROM positions WHERE status IN ('monitoring', 'exiting', 'discovering')").all() as PositionRow[]
+  return (db.prepare("SELECT * FROM positions WHERE status IN ('monitoring', 'exiting', 'discovering')").all() as any[]).map(rowToPosition)
 }
 
 export function upsertPosition(row: {
@@ -26,6 +52,8 @@ export function upsertPosition(row: {
   poolPubkey: string
   tokenXMint: string
   tokenYMint: string
+  tokenXSymbol: string
+  tokenYSymbol: string
   owner: string
   basisSol: number
   basisConfidence: BasisConfidence
@@ -33,30 +61,41 @@ export function upsertPosition(row: {
   slPercent: number
   status: PositionRow['status']
   triggerConfirmations: number
+  peakPnlPercent: number
+  trailingActivated: boolean
   lastPnlPercent: number | null
   lastEstimatedExitSol: number | null
   lastSeenAt: number
+  strategy: StrategyType
 }): void {
   const db = getDb()
   const now = Date.now()
   db.prepare(`
-    INSERT INTO positions (position_pubkey, pool_pubkey, token_x_mint, token_y_mint, owner,
+    INSERT INTO positions (position_pubkey, pool_pubkey, token_x_mint, token_y_mint, token_x_symbol, token_y_symbol, owner,
       basis_sol, basis_confidence, tp_percent, sl_percent, status, trigger_confirmations,
+      peak_pnl_percent, trailing_activated, strategy,
       last_pnl_percent, last_estimated_exit_sol, last_seen_at, created_at, updated_at)
-    VALUES (@positionPubkey, @poolPubkey, @tokenXMint, @tokenYMint, @owner,
+    VALUES (@positionPubkey, @poolPubkey, @tokenXMint, @tokenYMint, @tokenXSymbol, @tokenYSymbol, @owner,
       @basisSol, @basisConfidence, @tpPercent, @slPercent, @status, @triggerConfirmations,
+      @peakPnlPercent, @trailingActivated, @strategy,
       @lastPnlPercent, @lastEstimatedExitSol, @lastSeenAt, @createdAt, @updatedAt)
     ON CONFLICT(position_pubkey) DO UPDATE SET
       status = @status,
       basis_sol = @basisSol,
       basis_confidence = @basisConfidence,
+      token_x_symbol = @tokenXSymbol,
+      token_y_symbol = @tokenYSymbol,
       trigger_confirmations = @triggerConfirmations,
+      peak_pnl_percent = COALESCE(@peakPnlPercent, peak_pnl_percent),
+      trailing_activated = COALESCE(@trailingActivated, trailing_activated),
+      strategy = @strategy,
       last_pnl_percent = @lastPnlPercent,
       last_estimated_exit_sol = @lastEstimatedExitSol,
       last_seen_at = @lastSeenAt,
       updated_at = @updatedAt
   `).run({
     ...row,
+    trailingActivated: row.trailingActivated ? 1 : 0,
     createdAt: now,
     updatedAt: now,
   })
@@ -74,4 +113,16 @@ export function updatePositionPnl(pubkey: string, pnlPercent: number, estimatedE
 
 export function updatePositionConfirmations(pubkey: string, count: number): void {
   getDb().prepare('UPDATE positions SET trigger_confirmations = ?, updated_at = ? WHERE position_pubkey = ?').run(count, Date.now(), pubkey)
+}
+
+export function updatePeakPnl(pubkey: string, peakPct: number, trailingActivated: boolean): void {
+  getDb().prepare(
+    'UPDATE positions SET peak_pnl_percent = ?, trailing_activated = ?, updated_at = ? WHERE position_pubkey = ?'
+  ).run(peakPct, trailingActivated ? 1 : 0, Date.now(), pubkey)
+}
+
+export function updatePositionStrategy(pubkey: string, strategy: StrategyType, slPercent: number, tpPercent: number): void {
+  getDb().prepare(
+    'UPDATE positions SET strategy = ?, sl_percent = ?, tp_percent = ?, updated_at = ? WHERE position_pubkey = ?'
+  ).run(strategy, slPercent, tpPercent, Date.now(), pubkey)
 }

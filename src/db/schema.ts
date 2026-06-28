@@ -7,6 +7,8 @@ export function initSchema(db: Database.Database): void {
       pool_pubkey TEXT NOT NULL,
       token_x_mint TEXT NOT NULL,
       token_y_mint TEXT NOT NULL,
+      token_x_symbol TEXT NOT NULL DEFAULT '',
+      token_y_symbol TEXT NOT NULL DEFAULT '',
       owner TEXT NOT NULL,
       basis_sol REAL NOT NULL DEFAULT 0,
       basis_confidence TEXT NOT NULL DEFAULT 'low',
@@ -17,6 +19,9 @@ export function initSchema(db: Database.Database): void {
       last_pnl_percent REAL,
       last_estimated_exit_sol REAL,
       last_seen_at INTEGER NOT NULL,
+      peak_pnl_percent REAL NOT NULL DEFAULT 0,
+      trailing_activated INTEGER NOT NULL DEFAULT 0,
+      strategy TEXT NOT NULL DEFAULT 'unknown',
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
@@ -61,4 +66,16 @@ export function initSchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_position_events_pubkey ON position_events(position_pubkey);
     CREATE INDEX IF NOT EXISTS idx_executions_pubkey ON executions(position_pubkey);
   `)
+
+  // Add columns for existing DBs that were created before schema update
+  const cols = db.prepare("PRAGMA table_info('positions')").all() as any[]
+  const hasTokenXSymbol = cols.some((c: any) => c.name === 'token_x_symbol')
+  if (!hasTokenXSymbol) {
+    db.exec("ALTER TABLE positions ADD COLUMN token_x_symbol TEXT NOT NULL DEFAULT ''")
+    db.exec("ALTER TABLE positions ADD COLUMN token_y_symbol TEXT NOT NULL DEFAULT ''")
+  }
+  const hasStrategy = cols.some((c: any) => c.name === 'strategy')
+  if (!hasStrategy) {
+    db.exec("ALTER TABLE positions ADD COLUMN strategy TEXT NOT NULL DEFAULT 'unknown'")
+  }
 }

@@ -29,7 +29,7 @@ function classifyInstruction(logs: string[] | undefined): EventType {
   return 'UNKNOWN'
 }
 
-function extractTokenDeltas(tx: any, positionOwner: string): { xDelta: string; yDelta: string; solDelta: string } {
+function extractTokenDeltas(tx: any, positionOwner: string, tokenXMint?: string, tokenYMint?: string): { xDelta: string; yDelta: string; solDelta: string } {
   let xDelta = '0', yDelta = '0', solDelta = '0'
 
   const postBalances = tx.meta?.postTokenBalances || []
@@ -52,6 +52,13 @@ function extractTokenDeltas(tx: any, positionOwner: string): { xDelta: string; y
     }
   }
 
+  // Also check mints that appear only in post-balances (new token accounts)
+  for (const bal of postBalances) {
+    if (bal.owner === positionOwner && !preMap.has(bal.mint)) {
+      preMap.set(bal.mint, new Map())
+    }
+  }
+
   for (const [mint, preAmounts] of preMap) {
     let preTotal = 0
     for (const amount of preAmounts.values()) {
@@ -60,8 +67,13 @@ function extractTokenDeltas(tx: any, positionOwner: string): { xDelta: string; y
     const postTotal = Number(postMap.get(mint) || '0')
     const delta = postTotal - preTotal
     if (delta !== 0) {
-      if (mint === 'So11111111111111111111111111111111111111112' || mint === 'So11111111111111111111111111111111111111111') {
+      const isSol = mint === 'So11111111111111111111111111111111111111112' || mint === 'So11111111111111111111111111111111111111111'
+      if (isSol) {
         solDelta = delta.toString()
+      } else if (tokenXMint && mint === tokenXMint) {
+        xDelta = delta.toString()
+      } else if (tokenYMint && mint === tokenYMint) {
+        yDelta = delta.toString()
       } else if (xDelta === '0') {
         xDelta = delta.toString()
       } else {
@@ -73,7 +85,7 @@ function extractTokenDeltas(tx: any, positionOwner: string): { xDelta: string; y
   return { xDelta, yDelta, solDelta }
 }
 
-export function parseTransactionForPosition(tx: any, positionPubkey: string, positionOwner: string): ParsedEvent | null {
+export function parseTransactionForPosition(tx: any, positionPubkey: string, positionOwner: string, tokenXMint?: string, tokenYMint?: string): ParsedEvent | null {
   if (!tx?.meta || tx.meta.err) return null
   if (!tx.blockTime) return null
 
@@ -87,7 +99,7 @@ export function parseTransactionForPosition(tx: any, positionPubkey: string, pos
 
   const txLogs = tx.meta.logMessages || []
   const eventType = classifyInstruction(txLogs)
-  const deltas = extractTokenDeltas(tx, positionOwner)
+  const deltas = extractTokenDeltas(tx, positionOwner, tokenXMint, tokenYMint)
 
   const confidence: BasisConfidence =
     eventType !== 'UNKNOWN' && (deltas.xDelta !== '0' || deltas.yDelta !== '0' || deltas.solDelta !== '0')

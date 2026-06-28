@@ -57,7 +57,9 @@ export async function fetchAndParseHistory(
   connection: Connection,
   walletPubkey: PublicKey,
   positionPubkey: string,
-  ownerStr: string
+  ownerStr: string,
+  tokenXMint?: string,
+  tokenYMint?: string,
 ): Promise<ParsedEvent[]> {
   const events: ParsedEvent[] = []
   const lastSig = getSyncState(positionPubkey)
@@ -75,12 +77,6 @@ export async function fetchAndParseHistory(
 
       if (sigs.length === 0) break
 
-      for (const s of sigs) {
-        if (lastSig && s.signature === lastSig) {
-          break
-        }
-      }
-
       const stopIndex = lastSig ? sigs.findIndex(s => s.signature === lastSig) : -1
       const batch = stopIndex >= 0 ? sigs.slice(0, stopIndex) : sigs
 
@@ -91,7 +87,7 @@ export async function fetchAndParseHistory(
           })
           if (!tx) continue
 
-          const parsed = parseTransactionForPosition(tx, positionPubkey, ownerStr)
+          const parsed = parseTransactionForPosition(tx, positionPubkey, ownerStr, tokenXMint, tokenYMint)
           if (parsed) {
             events.push(parsed)
           }
@@ -168,7 +164,7 @@ export async function computeBasisFromEvents(
         }
       }
 
-      totalBasis -= Math.abs(solValue) * 0.15
+      totalBasis -= Math.abs(solValue)
     }
   }
 

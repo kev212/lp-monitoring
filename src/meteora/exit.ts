@@ -10,6 +10,7 @@ const SOL_MINTS = new Set([
   'So11111111111111111111111111111111111111112',
   'So11111111111111111111111111111111111111111',
 ])
+const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
 
 export function saveExecution(row: ExecutionRow): void {
   const db = getDb()
@@ -38,6 +39,8 @@ export function updateExecution(pubkey: string, status: ExitStatus, fields: Part
 export interface ExitResult {
   success: boolean
   solReceived: number
+  usdcReceived: number
+  rentRefundSol: number
   removeLiqSig: string | null
   swapSig: string | null
   error?: string
@@ -60,6 +63,8 @@ export async function executeExit(
   const result: ExitResult = {
     success: false,
     solReceived: 0,
+    usdcReceived: 0,
+    rentRefundSol: 0,
     removeLiqSig: null,
     swapSig: null,
   }
@@ -81,10 +86,46 @@ export async function executeExit(
 
   updatePositionStatus(positionPubkey, 'exiting')
 
+  const quoteIsUsdc = tokenXMint === USDC_MINT || tokenYMint === USDC_MINT
+
+  // Capture pre-exit SOL balance for accurate solReceived calculation
+  let preSolBalance = 0
+  try {
+    preSolBalance = await connection.getBalance(wallet.publicKey)
+  } catch {
+    console.log('[exit] failed to get pre-balance, solReceived may be inaccurate')
+  }
+
+  // Capture pre-exit USDC balance to exclude existing wallet USDC
+  let preUsdcBalance = 0n
+  if (quoteIsUsdc) {
+    try {
+      const accounts = await connection.getTokenAccountsByOwner(
+        wallet.publicKey,
+        { mint: new PublicKey(USDC_MINT) }
+      )
+      for (const acc of accounts.value) {
+        const view = new DataView(acc.account.data.buffer, acc.account.data.byteOffset + 64, 8)
+        preUsdcBalance += view.getBigUint64(0, true)
+      }
+    } catch {
+      console.log('[exit] failed to get pre-USDC balance, usdcReceived may be inaccurate')
+    }
+  }
+
   try {
     const pool = await getPool(connection, new PublicKey(poolPubkey))
     const pos = await pool.getPosition(new PublicKey(positionPubkey))
     if (!pos) throw new Error('Position not found')
+
+    // Capture position account rent before closing
+    try {
+      const accInfo = await connection.getAccountInfo(new PublicKey(positionPubkey))
+      result.rentRefundSol = accInfo ? accInfo.lamports / 1_000_000_000 : 0
+    } catch {
+      console.log('[exit] failed to get position account rent, rentRefundSol=0')
+      result.rentRefundSol = 0
+    }
 
     const pd = pos.positionData
     const removeTxs = await pool.removeLiquidity({
@@ -116,39 +157,101 @@ export async function executeExit(
   try {
     updateExecution(positionPubkey, 'swap_pending', {})
 
-    const nonSolTokens: string[] = []
-    if (!SOL_MINTS.has(tokenXMint)) nonSolTokens.push(tokenXMint)
-    if (!SOL_MINTS.has(tokenYMint)) nonSolTokens.push(tokenYMint)
+    // Helper: get token balance via ATA or owner query (with retry + delay for RPC consistency)
+    async function getTokenBalance(mint: string, attempt: number = 1): Promise<bigint> {
+      for (let i = 0; i < attempt; i++) {
+        if (i > 0) await new Promise<void>(resolve => { setTimeout(resolve, 800); })
+        try {
+          const accounts = await connection.getTokenAccountsByOwner(
+            wallet.publicKey,
+            { mint: new PublicKey(mint) }
+          )
+          if (accounts.value.length > 0) {
+            let total = 0n
+            for (const acc of accounts.value) {
+              const view = new DataView(acc.account.data.buffer, acc.account.data.byteOffset + 64, 8)
+              total += view.getBigUint64(0, true)
+            }
+            if (total > 0n) return total
+          }
+          return 0n
+        } catch { /* fallthrough to next attempt */ }
+      }
+      return 0n
+    }
 
-    for (const mint of nonSolTokens) {
-      const balance = await connection.getTokenAccountsByOwner(wallet.publicKey, { mint: new PublicKey(mint) })
-      let totalAmount = 0n
-      for (const acc of balance.value) {
-        const data = acc.account.data
-        const amount = BigInt('0x' + data.subarray(64, 72).toString('hex'))
-        totalAmount += amount
+    // Sleep after remove liquidity to let RPC catch up
+    await new Promise<void>(resolve => { setTimeout(resolve, 1500); })
+
+    const swapTarget = quoteIsUsdc ? USDC_MINT : undefined // undefined = WSOL (default)
+
+    // Build list of tokens to swap (skip SOL, skip USDC if quoteIsUsdc)
+    const tokensToSwap: string[] = []
+    if (!SOL_MINTS.has(tokenXMint) && !(quoteIsUsdc && tokenXMint === USDC_MINT)) tokensToSwap.push(tokenXMint)
+    if (!SOL_MINTS.has(tokenYMint) && !(quoteIsUsdc && tokenYMint === USDC_MINT)) tokensToSwap.push(tokenYMint)
+
+    // Unified retry loop: swap terus sampai balance 0 atau 5x percobaan
+    let hasUnswappableTokens = false
+    const MAX_SWAP_RETRIES = 5
+    const targetLabel = quoteIsUsdc ? 'USDC' : 'SOL'
+
+    for (const mint of tokensToSwap) {
+      for (let attempt = 1; attempt <= MAX_SWAP_RETRIES; attempt++) {
+        const balance = await getTokenBalance(mint, 2)
+        if (balance === 0n) break
+
+        console.log(`[exit] swap ${attempt}/${MAX_SWAP_RETRIES}: ${balance.toString()} ${mint.slice(0, 8)} → ${targetLabel}`)
+        const swapResult = await swapTokensToSol(connection, wallet, mint, balance.toString(), swapTarget)
+        if (swapResult?.signature) {
+          result.swapSig = swapResult.signature
+          break
+        }
+
+        await new Promise<void>(resolve => { setTimeout(resolve, 3_000); })
       }
 
-      if (totalAmount > 0n) {
-        const swapResult = await swapTokensToSol(connection, wallet, mint, totalAmount.toString())
-        if (swapResult) {
-          result.swapSig = swapResult.signature
-        }
+      await new Promise<void>(resolve => { setTimeout(resolve, 5_000); })
+      const finalBalance = await getTokenBalance(mint, 2)
+      if (finalBalance > 0n) {
+        console.log(`[exit] WARN: ${finalBalance.toString()} ${mint.slice(0, 8)} unswappable after ${MAX_SWAP_RETRIES} attempts`)
+        result.error = `Unswappable: ${finalBalance.toString()} ${mint.slice(0, 8)}`
+        hasUnswappableTokens = true
       }
     }
 
-    const solBalance = await connection.getBalance(wallet.publicKey)
-    result.solReceived = solBalance / 1_000_000_000
+    // Measure final balances
+    const postSolBalance = await connection.getBalance(wallet.publicKey)
+    result.solReceived = preSolBalance > 0
+      ? (postSolBalance - preSolBalance) / 1_000_000_000
+      : 0
 
-    updateExecution(positionPubkey, 'completed', {
-      swapSig: result.swapSig!,
-      finalSolReceived: result.solReceived,
-    })
+    if (quoteIsUsdc) {
+      const postUsdcBalance = await getTokenBalance(USDC_MINT, 2)
+      const netUsdc = postUsdcBalance > preUsdcBalance ? postUsdcBalance - preUsdcBalance : 0n
+      result.usdcReceived = Number(netUsdc) / 1e6
+    }
 
-    updatePositionStatus(positionPubkey, 'closed')
-    result.success = true
+    if (hasUnswappableTokens) {
+      updateExecution(positionPubkey, 'failed', {
+        swapSig: result.swapSig || null,
+        finalSolReceived: result.solReceived,
+        errorMessage: result.error || 'partial swap — tokens remain unswappable',
+      })
+      result.success = false
+    } else {
+      updateExecution(positionPubkey, 'completed', {
+        swapSig: result.swapSig!,
+        finalSolReceived: result.solReceived,
+      })
+      updatePositionStatus(positionPubkey, 'closed')
+      result.success = true
+    }
 
-    console.log(`[exit] completed, received ${result.solReceived.toFixed(6)} SOL`)
+    if (quoteIsUsdc) {
+      console.log(`[exit] ${hasUnswappableTokens ? 'partial' : 'completed'}, received ${result.usdcReceived.toFixed(2)} USDC`)
+    } else {
+      console.log(`[exit] ${hasUnswappableTokens ? 'partial' : 'completed'}, received ${result.solReceived.toFixed(6)} SOL`)
+    }
   } catch (err) {
     const msg = `swap failed: ${err instanceof Error ? err.message : 'unknown'}`
     console.log(`[exit] ${msg}`)

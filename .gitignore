@@ -1,4 +1,8 @@
 node_modules/
 dist/
 *.sqlite
+*.sqlite-*
 .env
+.env.*
+!.env.example
+opencode.jsonc
