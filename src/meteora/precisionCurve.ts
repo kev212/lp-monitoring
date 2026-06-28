@@ -8,7 +8,7 @@ const ACTIVE_SIDE_BUFFER_BINS = 2
 const REMOVE_DELAY_MS = 1500
 const SOL_MINT = 'So11111111111111111111111111111111111111112'
 const SOL_FEE_BUFFER_LAMPORTS = BigInt(0.001 * 1e9)
-const SLIPPAGE_LEVELS = [1, 3, 5]
+const SLIPPAGE_LEVELS = [100, 300, 500]
 
 export interface PrecisionCurveResult {
   success: boolean
@@ -258,6 +258,16 @@ export async function executeDirectionalPrecisionCurve(
         addTx.sign(wallet)
         addSig = await connection.sendTransaction(addTx, [wallet])
         await connection.confirmTransaction(addSig, 'confirmed')
+
+        const txResult = await connection.getTransaction(addSig, { maxSupportedTransactionVersion: 0 })
+        if (!txResult || txResult.meta?.err) {
+          const errMsg = txResult?.meta?.err
+            ? (typeof txResult.meta.err === 'string' ? txResult.meta.err : JSON.stringify(txResult.meta.err))
+            : 'no transaction result'
+          console.log(`[precision] add liq tx failed on-chain (slippage=${slippage}): ${errMsg}`)
+          throw new Error(`add liquidity failed on-chain: ${errMsg}`)
+        }
+
         result.addSignature = addSig
         console.log(`[precision] add liq tx (slippage=${slippage}): ${addSig}`)
         break
