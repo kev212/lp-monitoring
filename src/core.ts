@@ -49,7 +49,7 @@ let monitorRetries = new Map<string, number>()
 const pendingTriggers = new Map<string, { triggerType: TriggerType; timestamp: number; pnlAtTrigger: number }>()
 const DISCOVERY_INTERVAL_MS = 3 * 60 * 1000 // 3 menit
 const MAX_MONITOR_RETRIES = 5
-const PRECISION_CURVE_COOLDOWN_MS = 60_000
+const PRECISION_CURVE_COOLDOWN_MS = 5_000
 
 export async function startBot(): Promise<void> {
   console.log('[app] starting monitoring-lp...')
@@ -741,7 +741,7 @@ async function maybeRunPrecisionCurve(
       `<b>${tokenLabel}</b>\n` +
       `Active bin: <b>${poolActiveBinId}</b>\n` +
       `Range: <b>${lowerBinId}-${upperBinId}</b>\n` +
-      `Threshold: <b>${pos.precisionCurveThresholdBins || 3} bins</b> | Cooldown: <b>60s</b>`
+      `Threshold: <b>${pos.precisionCurveThresholdBins || 3} bins</b> | Cooldown: <b>5s</b>`
     )
   } else {
     const lastBin = pos.precisionCurveLastActiveBin!
