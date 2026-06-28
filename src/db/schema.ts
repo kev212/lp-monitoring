@@ -26,7 +26,7 @@ export function initSchema(db: Database.Database): void {
       precision_curve_last_active_bin INTEGER,
       precision_curve_last_reshape_at INTEGER,
       precision_curve_busy INTEGER NOT NULL DEFAULT 0,
-      precision_curve_threshold_bins INTEGER NOT NULL DEFAULT 3,
+      precision_curve_threshold_bins INTEGER NOT NULL DEFAULT 5,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );

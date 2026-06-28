@@ -767,7 +767,7 @@ async function maybeRunPrecisionCurve(
   if (!isInitialReshape) {
     const lastBin = pos.precisionCurveLastActiveBin!
     const movedBins = Math.abs(poolActiveBinId - lastBin)
-    const threshold = pos.precisionCurveThresholdBins || 3
+    const threshold = pos.precisionCurveThresholdBins || 5
     if (movedBins < threshold) return false
 
     const lastReshapeAt = pos.precisionCurveLastReshapeAt || 0
@@ -788,7 +788,7 @@ async function maybeRunPrecisionCurve(
       `<b>${tokenLabel}</b>\n` +
       `Active bin: <b>${poolActiveBinId}</b>\n` +
       `Range: <b>${lowerBinId}-${upperBinId}</b>\n` +
-      `Threshold: <b>${pos.precisionCurveThresholdBins || 3} bins</b> | Cooldown: <b>5s</b>`
+      `Threshold: <b>${pos.precisionCurveThresholdBins || 5} bins</b> | Cooldown: <b>5s</b>`
     )
   } else {
     const lastBin = pos.precisionCurveLastActiveBin!

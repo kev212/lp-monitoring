@@ -52,7 +52,7 @@ function setupCommandHandlers(bot: TelegramBot): void {
 
     if (action === 'on') {
       updatePrecisionCurveEnabled(pos.positionPubkey, true, null)
-      updatePrecisionCurveThreshold(pos.positionPubkey, 3)
+      updatePrecisionCurveThreshold(pos.positionPubkey, 5)
       await bot.answerCallbackQuery(query.id, { text: 'Precision Curve enabled — initial reshape pending' }).catch(() => undefined)
     } else if (action === 'off') {
       updatePrecisionCurveEnabled(pos.positionPubkey, false)

@@ -4,7 +4,7 @@ import { StrategyType } from '@meteora-ag/dlmm'
 import { getPool, clearPoolCache } from './positions.js'
 
 const BASIS_POINTS = new BN(10000)
-const STALE_BUFFER_BINS = 2
+const ACTIVE_SIDE_BUFFER_BINS = 2
 const REMOVE_DELAY_MS = 1500
 const SOL_MINT = 'So11111111111111111111111111111111111111112'
 const SOL_FEE_BUFFER_LAMPORTS = BigInt(0.001 * 1e9)
@@ -150,9 +150,9 @@ export async function executeDirectionalPrecisionCurve(
       direction = activeBinId - lastActiveBin
       if (direction > 0) {
         staleFrom = lowerBinId
-        staleTo = Math.min(upperBinId, activeBinId - STALE_BUFFER_BINS)
+        staleTo = Math.min(upperBinId, activeBinId - ACTIVE_SIDE_BUFFER_BINS - 1)
       } else if (direction < 0) {
-        staleFrom = Math.max(lowerBinId, activeBinId + STALE_BUFFER_BINS)
+        staleFrom = Math.max(lowerBinId, activeBinId + ACTIVE_SIDE_BUFFER_BINS + 1)
         staleTo = upperBinId
       } else {
         staleFrom = lowerBinId
