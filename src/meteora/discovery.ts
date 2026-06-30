@@ -4,6 +4,11 @@ import type { PositionRow, BasisConfidence, StrategyType } from '../types.js'
 
 const DLMM_PROGRAM_ID = new PublicKey('LBUZKhbPFn5XX4kz4LZ7Qd8hLEjNvF7M7bQeFqF7gYx')
 
+function safeParseJson<T>(json: string | null | undefined, fallback: T): T {
+  if (!json) return fallback
+  try { return JSON.parse(json) } catch { return fallback }
+}
+
 export interface DiscoveredPosition {
   positionPubkey: string
   poolPubkey: string
@@ -37,6 +42,9 @@ function rowToPosition(row: any): PositionRow {
     precisionCurveLastReshapeAt: row.precision_curve_last_reshape_at ?? null,
     precisionCurveBusy: row.precision_curve_busy === 1,
     precisionCurveThresholdBins: row.precision_curve_threshold_bins ?? 5,
+    precisionCurveRangeHalf: row.precision_curve_range_half ?? 100,
+    precisionCurveMovementLog: safeParseJson(row.precision_curve_movement_log, []),
+    precisionCurveRecoveryUntil: row.precision_curve_recovery_until ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   }
@@ -159,4 +167,19 @@ export function updatePrecisionCurveState(pubkey: string, lastActiveBin: number,
 export function updatePrecisionCurveThreshold(pubkey: string, thresholdBins: number): void {
   getDb().prepare('UPDATE positions SET precision_curve_threshold_bins = ?, updated_at = ? WHERE position_pubkey = ?')
     .run(thresholdBins, Date.now(), pubkey)
+}
+
+export function updatePrecisionCurveRangeHalf(pubkey: string, rangeHalf: number): void {
+  getDb().prepare('UPDATE positions SET precision_curve_range_half = ?, updated_at = ? WHERE position_pubkey = ?')
+    .run(rangeHalf, Date.now(), pubkey)
+}
+
+export function updatePrecisionCurveMovementLog(pubkey: string, movements: number[]): void {
+  getDb().prepare('UPDATE positions SET precision_curve_movement_log = ?, updated_at = ? WHERE position_pubkey = ?')
+    .run(JSON.stringify(movements), Date.now(), pubkey)
+}
+
+export function updatePrecisionCurveRecoveryUntil(pubkey: string, recoveryUntil: number | null): void {
+  getDb().prepare('UPDATE positions SET precision_curve_recovery_until = ?, updated_at = ? WHERE position_pubkey = ?')
+    .run(recoveryUntil, Date.now(), pubkey)
 }

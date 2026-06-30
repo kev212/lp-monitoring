@@ -9,6 +9,25 @@ const REMOVE_DELAY_MS = 1500
 const SOL_MINT = 'So11111111111111111111111111111111111111112'
 const SOL_FEE_BUFFER_LAMPORTS = BigInt(0.001 * 1e9)
 const SLIPPAGE_LEVELS = [100, 300, 500]
+const MAX_BINS_PER_REMOVE = 100
+const DYNAMIC_RANGE_MULTIPLIER = 2
+const DYNAMIC_RANGE_MIN = 50
+const DYNAMIC_RANGE_MAX = 500
+const MOVEMENT_LOG_MAX = 5
+export const THRESHOLD_RATIO = 0.1
+export const THRESHOLD_MIN = 3
+export const RECOVERY_MS = 10000
+
+function chunkRange(from: number, to: number, max: number): Array<{from: number, to: number}> {
+  const chunks = []
+  let start = from
+  while (start <= to) {
+    const end = Math.min(start + max - 1, to)
+    chunks.push({ from: start, to: end })
+    start = end + 1
+  }
+  return chunks
+}
 
 export interface PrecisionCurveResult {
   success: boolean
@@ -22,6 +41,9 @@ export interface PrecisionCurveResult {
   direction: number | null
   staleFrom: number | null
   staleTo: number | null
+  addLowerBinId: number | null
+  addUpperBinId: number | null
+  effectiveRangeHalf: number
   isInitial: boolean
   xWithdrawn: string
   yWithdrawn: string
@@ -46,6 +68,9 @@ function emptyResult(): PrecisionCurveResult {
     direction: null,
     staleFrom: null,
     staleTo: null,
+    addLowerBinId: null,
+    addUpperBinId: null,
+    effectiveRangeHalf: 0,
     isInitial: false,
     xWithdrawn: '0',
     yWithdrawn: '0',
@@ -111,6 +136,8 @@ export async function executeDirectionalPrecisionCurve(
   tokenXMint: string,
   tokenYMint: string,
   lastActiveBin: number | null,
+  rangeHalf: number,
+  movements: number[],
 ): Promise<PrecisionCurveResult> {
   const result = emptyResult()
   try {
@@ -175,23 +202,39 @@ export async function executeDirectionalPrecisionCurve(
     const preBal = await captureBalances(connection, wallet, tokenXMint, tokenYMint)
     console.log(`[precision] pre-balances: nativeSol=${preBal.nativeSol} tokenX=${preBal.tokenX} tokenY=${preBal.tokenY}`)
 
-    const removeTxs = await pool.removeLiquidity({
-      user: wallet.publicKey,
-      position: new PublicKey(positionPubkey),
-      fromBinId: staleFrom,
-      toBinId: staleTo,
-      bps: new BN(10000) as any,
-      shouldClaimAndClose: false,
-    })
+    const staleBins = staleTo - staleFrom + 1
+    const chunks = staleBins > MAX_BINS_PER_REMOVE
+      ? chunkRange(staleFrom, staleTo, MAX_BINS_PER_REMOVE)
+      : [{ from: staleFrom, to: staleTo }]
 
-    const txs = Array.isArray(removeTxs) ? removeTxs : [removeTxs]
-    for (const tx of txs) {
-      tx.sign(wallet)
-      const sig = await connection.sendTransaction(tx, [wallet])
-      await connection.confirmTransaction(sig, 'confirmed')
-      result.removeSignature = sig
-      console.log(`[precision] remove liq tx: ${sig}`)
+    if (chunks.length > 1) {
+      console.log(`[precision] ${staleBins} stale bins — split into ${chunks.length} chunks of max ${MAX_BINS_PER_REMOVE}`)
     }
+
+    for (const [i, chunk] of chunks.entries()) {
+      const removeTxs = await pool.removeLiquidity({
+        user: wallet.publicKey,
+        position: new PublicKey(positionPubkey),
+        fromBinId: chunk.from,
+        toBinId: chunk.to,
+        bps: new BN(10000) as any,
+        shouldClaimAndClose: false,
+      })
+
+      const txs = Array.isArray(removeTxs) ? removeTxs : [removeTxs]
+      for (const tx of txs) {
+        tx.sign(wallet)
+        const sig = await connection.sendTransaction(tx, [wallet])
+        await connection.confirmTransaction(sig, 'confirmed')
+        result.removeSignature = sig
+        console.log(`[precision] remove liq tx chunk ${i + 1}/${chunks.length} (${chunk.from}-${chunk.to}): ${sig}`)
+      }
+
+      if (i < chunks.length - 1) {
+        await new Promise<void>(resolve => { setTimeout(resolve, REMOVE_DELAY_MS) })
+      }
+    }
+
     result.removeSucceeded = true
 
     await new Promise<void>(resolve => { setTimeout(resolve, REMOVE_DELAY_MS) })
@@ -238,6 +281,15 @@ export async function executeDirectionalPrecisionCurve(
     result.activeBinId = freshActiveBin
     console.log(`[precision] refetch activeBin=${freshActiveBin} (was ${activeBinId})`)
 
+    const effectiveRangeHalf = movements.length > 0
+      ? Math.round(Math.max(rangeHalf, (movements.reduce((a, b) => a + b, 0) / movements.length) * DYNAMIC_RANGE_MULTIPLIER))
+      : rangeHalf
+
+    result.effectiveRangeHalf = effectiveRangeHalf
+    result.addLowerBinId = Math.max(lowerBinId, freshActiveBin - effectiveRangeHalf)
+    result.addUpperBinId = Math.min(upperBinId, freshActiveBin + effectiveRangeHalf)
+    console.log(`[precision] concentrated range: ${result.addLowerBinId}-${result.addUpperBinId} (half=${effectiveRangeHalf}, movements=[${movements.join(',')}])`)
+
     let addSig: string | null = null
 
     for (const slippage of SLIPPAGE_LEVELS) {
@@ -248,8 +300,8 @@ export async function executeDirectionalPrecisionCurve(
           totalXAmount: new BN(deltaX.toString()),
           totalYAmount: new BN(deltaY.toString()),
           strategy: {
-            maxBinId: upperBinId,
-            minBinId: lowerBinId,
+            maxBinId: result.addUpperBinId!,
+            minBinId: result.addLowerBinId!,
             strategyType: StrategyType.Curve,
           },
           slippage,

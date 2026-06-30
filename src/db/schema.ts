@@ -103,4 +103,16 @@ export function initSchema(db: Database.Database): void {
   if (!hasPrecisionCurveThresholdBins) {
     db.exec("ALTER TABLE positions ADD COLUMN precision_curve_threshold_bins INTEGER NOT NULL DEFAULT 5")
   }
+  const hasPrecisionCurveRangeHalf = cols.some((c: any) => c.name === 'precision_curve_range_half')
+  if (!hasPrecisionCurveRangeHalf) {
+    db.exec("ALTER TABLE positions ADD COLUMN precision_curve_range_half INTEGER NOT NULL DEFAULT 100")
+  }
+  const hasPrecisionCurveMovementLog = cols.some((c: any) => c.name === 'precision_curve_movement_log')
+  if (!hasPrecisionCurveMovementLog) {
+    db.exec("ALTER TABLE positions ADD COLUMN precision_curve_movement_log TEXT NOT NULL DEFAULT '[]'")
+  }
+  const hasPrecisionCurveRecoveryUntil = cols.some((c: any) => c.name === 'precision_curve_recovery_until')
+  if (!hasPrecisionCurveRecoveryUntil) {
+    db.exec("ALTER TABLE positions ADD COLUMN precision_curve_recovery_until INTEGER")
+  }
 }

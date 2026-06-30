@@ -14,6 +14,9 @@ import {
   updatePositionStrategy,
   updatePrecisionCurveBusy,
   updatePrecisionCurveState,
+  updatePrecisionCurveRangeHalf,
+  updatePrecisionCurveMovementLog,
+  updatePrecisionCurveRecoveryUntil,
 } from './meteora/discovery.js'
 import {
   getAllPositionsForWallet,
@@ -25,7 +28,7 @@ import {
 import { estimateExitValue, clearPnlCache } from './meteora/valuation.js'
 import { fetchLpAgentPositions } from './lpagent.js'
 import { executeExit } from './meteora/exit.js'
-import { executeDirectionalPrecisionCurve } from './meteora/precisionCurve.js'
+import { executeDirectionalPrecisionCurve, THRESHOLD_RATIO, THRESHOLD_MIN, RECOVERY_MS } from './meteora/precisionCurve.js'
 import { evaluateTrigger, type BinData } from './risk/rules.js'
 import {
   sendNotification,
@@ -431,7 +434,9 @@ async function monitorCycle(connection: Connection, walletPubkey: PublicKey, own
 
       // --- LP Agent Spike Guard: prevent fake positive spikes from corrupting peak/trailing ---
       let canTrustPeak = true
-      if (pnlPercent > 0) {
+      if (pos.precisionCurveEnabled) {
+        // precision curve: LP Agent PnL unreliable, skip spike guard
+      } else if (pnlPercent > 0) {
         const spikeFromPeak = pnlPercent > pos.peakPnlPercent + 5
         const spikeFromLast = pos.lastPnlPercent !== null && (pnlPercent - pos.lastPnlPercent) > 5
         const activationCross = pos.lastPnlPercent !== null &&
@@ -464,6 +469,14 @@ async function monitorCycle(connection: Connection, walletPubkey: PublicKey, own
             console.log(`[peak-guard] ${tokenLabel} | suspicious spike ${pnlPercent.toFixed(2)}% — LP Agent budget exhausted, peak frozen`)
             canTrustPeak = false
           }
+        }
+      }
+
+      // Freeze peak during precision curve busy or recovery window (PnL may be glitchy)
+      if (pos.precisionCurveEnabled) {
+        const recoveryUntil = pos.precisionCurveRecoveryUntil ?? 0
+        if (pos.precisionCurveBusy || Date.now() < recoveryUntil) {
+          canTrustPeak = false
         }
       }
 
@@ -528,7 +541,10 @@ async function monitorCycle(connection: Connection, walletPubkey: PublicKey, own
         }
 
         // Validate trigger with LP Agent — only block if delta > 3% AND LP Agent itself doesn't trigger
-        if (lpAgentAtTrigger) {
+        if (pos.precisionCurveEnabled) {
+          // precision curve position: LP Agent PnL also corrupted by reshapes
+          // trust corrected Meteora PnL (net deposit basis)
+        } else if (lpAgentAtTrigger) {
           const delta = Math.abs(pnlPercent - lpAgentAtTrigger.pnlPercentNative)
           if (delta > 3) {
             // Cek apakah LP Agent sendiri masih trigger condition
@@ -624,7 +640,7 @@ async function monitorCycle(connection: Connection, walletPubkey: PublicKey, own
             // Cross-check: LP Agent independent PnL vs Meteora PnL
             let usedPnlPct = freshPnlPct
             let usedPnlSource = 'meteora'
-            if (recheckLpAgent) {
+            if (!pos.precisionCurveEnabled && recheckLpAgent) {
               const delta = Math.abs(freshPnlPct - recheckLpAgent.pnlPercentNative)
               if (delta > 3) {
                 console.log(`[recheck] ${tokenLabel} | DELTA ${delta.toFixed(1)}%: meteora=${freshPnlPct.toFixed(2)}% vs lpagent=${recheckLpAgent.pnlPercentNative.toFixed(2)}% — using lpagent`)
@@ -783,8 +799,8 @@ async function maybeRunPrecisionCurve(
   if (!isInitialReshape) {
     const lastBin = pos.precisionCurveLastActiveBin!
     const movedBins = Math.abs(poolActiveBinId - lastBin)
-    const threshold = pos.precisionCurveThresholdBins || 5
-    if (movedBins < threshold) return false
+    const dynamicThreshold = Math.max(THRESHOLD_MIN, Math.round((pos.precisionCurveRangeHalf || 100) * THRESHOLD_RATIO))
+    if (movedBins < dynamicThreshold) return false
 
     const lastReshapeAt = pos.precisionCurveLastReshapeAt || 0
     const cooldownLeft = PRECISION_CURVE_COOLDOWN_MS - (Date.now() - lastReshapeAt)
@@ -797,6 +813,11 @@ async function maybeRunPrecisionCurve(
   const direction = isInitialReshape ? 0 : poolActiveBinId - pos.precisionCurveLastActiveBin!
   const dirLabel = direction === 0 ? 'initial' : direction > 0 ? 'right/up' : 'left/down'
 
+  const actualRangeHalf = Math.ceil((upperBinId - lowerBinId + 1) / 2)
+  const dynThreshold = isInitialReshape
+    ? Math.max(THRESHOLD_MIN, Math.round(actualRangeHalf * THRESHOLD_RATIO))
+    : Math.max(THRESHOLD_MIN, Math.round((pos.precisionCurveRangeHalf || actualRangeHalf) * THRESHOLD_RATIO))
+
   if (isInitialReshape) {
     console.log(`[precision] ${tokenLabel} | initial reshape at activeBin=${poolActiveBinId}`)
     sendNotification(
@@ -804,7 +825,7 @@ async function maybeRunPrecisionCurve(
       `<b>${tokenLabel}</b>\n` +
       `Active bin: <b>${poolActiveBinId}</b>\n` +
       `Range: <b>${lowerBinId}-${upperBinId}</b>\n` +
-      `Threshold: <b>${pos.precisionCurveThresholdBins || 5} bins</b> | Cooldown: <b>5s</b>`
+      `Threshold: <b>${dynThreshold} bins</b> | Cooldown: <b>5s</b>`
     )
   } else {
     const lastBin = pos.precisionCurveLastActiveBin!
@@ -830,6 +851,8 @@ async function maybeRunPrecisionCurve(
       pos.tokenXMint,
       pos.tokenYMint,
       pos.precisionCurveLastActiveBin,
+      pos.precisionCurveRangeHalf || 100,
+      pos.precisionCurveMovementLog || [],
     )
 
     if (!result.success) {
@@ -862,9 +885,36 @@ async function maybeRunPrecisionCurve(
 
     const newBaseline = result.activeBinId ?? poolActiveBinId
     updatePrecisionCurveState(pos.positionPubkey, newBaseline, Date.now())
+    updatePrecisionCurveRecoveryUntil(pos.positionPubkey, Date.now() + RECOVERY_MS)
+    console.log(`[precision] ${tokenLabel} | recovery window: ${RECOVERY_MS / 1000}s — peak frozen`)
+
+    if (isInitialReshape) {
+      updatePrecisionCurveRangeHalf(pos.positionPubkey, actualRangeHalf)
+      console.log(`[precision] ${tokenLabel} | initial range half: ${actualRangeHalf} (from ${lowerBinId}-${upperBinId})`)
+    }
+
     const staleRange = result.staleFrom !== null && result.staleTo !== null
       ? `${result.staleFrom} → ${result.staleTo}`
       : '-'
+    const addRange = result.addLowerBinId !== null && result.addUpperBinId !== null
+      ? `${result.addLowerBinId}-${result.addUpperBinId} (half=${result.effectiveRangeHalf})`
+      : '-'
+
+    if (!result.noop && !isInitialReshape) {
+      const movedBins = Math.abs(poolActiveBinId - pos.precisionCurveLastActiveBin!)
+      const newLog = [...(pos.precisionCurveMovementLog || []), movedBins].slice(-5)
+      updatePrecisionCurveMovementLog(pos.positionPubkey, newLog)
+
+      if (newLog.length >= 2) {
+        const avg = newLog.reduce((a, b) => a + b, 0) / newLog.length
+        const currentRange = pos.precisionCurveRangeHalf || 100
+        const newRange = Math.round(Math.min(Math.max(50, avg * 2), 500))
+        if (newRange !== currentRange) {
+          updatePrecisionCurveRangeHalf(pos.positionPubkey, newRange)
+          console.log(`[precision] ${tokenLabel} | dynamic range: ${currentRange} → ${newRange} (avg movement=${avg.toFixed(1)})`)
+        }
+      }
+    }
 
     if (result.noop) {
       console.log(`[precision] ${tokenLabel} | no-op: stale range empty — baseline ${newBaseline}`)
@@ -886,6 +936,7 @@ async function maybeRunPrecisionCurve(
       `Direction: <b>${dirLabel}</b>\n` +
       `Active baseline: <b>${newBaseline}</b>\n` +
       `Range: <b>${lowerBinId}-${upperBinId}</b>\n` +
+      `Concentrated: <b>${addRange}</b>\n` +
       `Stale range: <b>${staleRange}</b>\n` +
       `X withdrawn/deposited: <code>${result.xWithdrawn}</code> / <code>${result.xDeposited}</code>\n` +
       `Y withdrawn/deposited: <code>${result.yWithdrawn}</code> / <code>${result.yDeposited}</code>\n` +

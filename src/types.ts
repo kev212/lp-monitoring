@@ -30,6 +30,9 @@ export interface PositionRow {
   precisionCurveLastReshapeAt: number | null
   precisionCurveBusy: boolean
   precisionCurveThresholdBins: number
+  precisionCurveRangeHalf: number
+  precisionCurveMovementLog: number[]
+  precisionCurveRecoveryUntil: number | null
   createdAt: number
   updatedAt: number
 }
