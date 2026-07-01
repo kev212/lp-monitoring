@@ -9,6 +9,7 @@ import {
   upsertPosition,
   updatePositionStatus,
   updatePositionPnl,
+  updatePositionBasis,
   updatePositionConfirmations,
   updatePeakPnl,
   updatePositionStrategy,
@@ -17,6 +18,9 @@ import {
   updatePrecisionCurveRangeHalf,
   updatePrecisionCurveMovementLog,
   updatePrecisionCurveRecoveryUntil,
+  updatePrecisionCurvePendingStart,
+  updatePrecisionCurvePendingAmounts,
+  clearPrecisionCurvePending,
 } from './meteora/discovery.js'
 import {
   getAllPositionsForWallet,
@@ -29,7 +33,7 @@ import { estimateExitValue, clearPnlCache } from './meteora/valuation.js'
 import { fetchLpAgentPositions } from './lpagent.js'
 import { executeExit } from './meteora/exit.js'
 import { executeDirectionalPrecisionCurve, THRESHOLD_RATIO, THRESHOLD_MIN, RECOVERY_MS } from './meteora/precisionCurve.js'
-import { evaluateTrigger, type BinData } from './risk/rules.js'
+import { evaluateTrigger, getBinRangeMaxDistance, type BinData } from './risk/rules.js'
 import {
   sendNotification,
   formatPositionDiscovered,
@@ -55,6 +59,18 @@ const MAX_MONITOR_RETRIES = 5
 const PRECISION_CURVE_COOLDOWN_MS = 5_000
 const LP_AGENT_GUARD_MIN_INTERVAL_MS = 12_500
 let lastLpAgentGuardAt = 0
+
+function entryBasisSol(pos: PositionRow): number {
+  return pos.precisionCurveEnabled && pos.entryValueSol && pos.entryValueSol > 0
+    ? pos.entryValueSol
+    : pos.basisSol
+}
+
+function precisionSuppressed(pos: PositionRow): boolean {
+  if (!pos.precisionCurveEnabled) return false
+  if (pos.status === 'precision_readd_pending' || pos.precisionCurveBusy) return true
+  return Date.now() < (pos.precisionCurveRecoveryUntil ?? 0)
+}
 
 export async function startBot(): Promise<void> {
   console.log('[app] starting monitoring-lp...')
@@ -225,6 +241,7 @@ async function discoverInitialPositions(connection: Connection, walletPubkey: Pu
         tokenYSymbol: finalTokenYSymbol,
         owner: ownerStr,
         basisSol: finalBasis,
+        entryValueSol: finalBasis,
         basisConfidence: finalConfidence,
         tpPercent,
         slPercent,
@@ -329,6 +346,12 @@ async function monitorCycle(connection: Connection, walletPubkey: PublicKey, own
       continue
     }
 
+    if (pos.status === 'precision_readd_pending') {
+      if (i > 0) await sleep(250)
+      await maybeRunPrecisionCurve(pos)
+      continue
+    }
+
       if (i > 0) await sleep(250)
 
     try {
@@ -350,16 +373,16 @@ async function monitorCycle(connection: Connection, walletPubkey: PublicKey, own
 
       // Update basis if still 0 (history missed it) — use deposit estimate from SDK
       if (pos.basisSol <= 0 && valuation.depositEstimateSol > 0) {
-        const db = getDb()
-        db.prepare('UPDATE positions SET basis_sol = ?, basis_confidence = ?, updated_at = ? WHERE position_pubkey = ?')
-          .run(valuation.depositEstimateSol, 'medium', Date.now(), pos.positionPubkey)
+        updatePositionBasis(pos.positionPubkey, valuation.depositEstimateSol, 'medium')
         pos.basisSol = valuation.depositEstimateSol
+        pos.entryValueSol = pos.entryValueSol ?? valuation.depositEstimateSol
         pos.basisConfidence = 'medium'
         console.log(`[monitor] updated basis for ${pos.positionPubkey.slice(0, 8)}: ${valuation.depositEstimateSol.toFixed(4)} SOL (SDK estimate)`)
       }
 
       const quoteIsUsdc = pos.tokenXMint === USDC_MINT || pos.tokenYMint === USDC_MINT
       const quoteIsSol = pos.tokenXMint === SOL_MINT || pos.tokenYMint === SOL_MINT
+      const basisSol = entryBasisSol(pos)
 
       let pnlPercent: number
       let pnlSource = 'basis'
@@ -370,7 +393,10 @@ async function monitorCycle(connection: Connection, walletPubkey: PublicKey, own
         ? valuation.allTimeDepositSol - valuation.allTimeWithdrawalSol
         : 0
 
-      if (hasReshape && netDepositSol > 0 && typeof valuation.meteoraPnlSol === 'number') {
+      if (pos.precisionCurveEnabled && basisSol > 0) {
+        pnlPercent = ((valuation.estimatedExitSol - basisSol) / basisSol) * 100
+        pnlSource = 'entry-basis'
+      } else if (hasReshape && netDepositSol > 0 && typeof valuation.meteoraPnlSol === 'number') {
         pnlPercent = (valuation.meteoraPnlSol / netDepositSol) * 100
         pnlSource = 'meteora(net)'
       } else if (quoteIsUsdc) {
@@ -381,8 +407,8 @@ async function monitorCycle(connection: Connection, walletPubkey: PublicKey, own
         } else if (rawPnlSol !== undefined && rawPnlSol !== null && Number.isFinite(rawPnlSol) && !Number.isNaN(rawPnlSol)) {
           pnlPercent = rawPnlSol
           pnlSource = 'meteora(sol)'
-        } else if (pos.basisSol > 0) {
-          pnlPercent = ((valuation.estimatedExitSol - pos.basisSol) / pos.basisSol) * 100
+        } else if (basisSol > 0) {
+          pnlPercent = ((valuation.estimatedExitSol - basisSol) / basisSol) * 100
           pnlSource = 'basis'
         } else {
           pnlPercent = 0
@@ -396,8 +422,8 @@ async function monitorCycle(connection: Connection, walletPubkey: PublicKey, own
         } else if (rawPnlUsd !== undefined && rawPnlUsd !== null && Number.isFinite(rawPnlUsd) && !Number.isNaN(rawPnlUsd)) {
           pnlPercent = rawPnlUsd
           pnlSource = 'meteora(usd)'
-        } else if (pos.basisSol > 0) {
-          pnlPercent = ((valuation.estimatedExitSol - pos.basisSol) / pos.basisSol) * 100
+        } else if (basisSol > 0) {
+          pnlPercent = ((valuation.estimatedExitSol - basisSol) / basisSol) * 100
           pnlSource = 'basis'
         } else {
           pnlPercent = 0
@@ -406,8 +432,8 @@ async function monitorCycle(connection: Connection, walletPubkey: PublicKey, own
       }
 
       // Warn if API returned 0 PnL but valuation suggests profit/loss
-      if (pnlSource.startsWith('meteora') && pnlPercent === 0 && pos.basisSol > 0) {
-        const implied = ((valuation.estimatedExitSol - pos.basisSol) / pos.basisSol) * 100
+      if (pnlSource.startsWith('meteora') && pnlPercent === 0 && basisSol > 0) {
+        const implied = ((valuation.estimatedExitSol - basisSol) / basisSol) * 100
         if (Math.abs(implied) > 2) {
           console.log(`[warn] ${pos.tokenXSymbol || pos.tokenXMint.slice(0, 4)}/${pos.tokenYSymbol || pos.tokenYMint.slice(0, 4)} | Meteora API returned PnL=0 but implied=${implied.toFixed(2)}% — possible API issue`)
         }
@@ -426,7 +452,7 @@ async function monitorCycle(connection: Connection, walletPubkey: PublicKey, own
       console.log(
         `[monitor] ${tokenLabel}${dupMarker} | ${pos.status} | PnL: ${pnlSign}${pnlPercent.toFixed(2)}% (${pnlSource})` +
         ` | Value: ${valuation.estimatedExitSol.toFixed(4)} SOL` +
-        ` | Basis: ${pos.basisSol.toFixed(4)} SOL` +
+        ` | Basis: ${basisSol.toFixed(4)} SOL` +
         ` | SL: ${pos.slPercent}% TP: +${pos.tpPercent}%` +
         ` | Peak: ${pos.peakPnlPercent.toFixed(2)}%` +
         ` | ${triggerInfo}`
@@ -511,12 +537,17 @@ async function monitorCycle(connection: Connection, walletPubkey: PublicKey, own
       // --- end trailing ---
 
       const binData: BinData = {
+        lowerBinId: valuation.lowerBinId,
         upperBinId: valuation.upperBinId,
         poolActiveBinId: valuation.poolActiveBinId,
       }
 
-      const precisionHandled = await maybeRunPrecisionCurve(pos, valuation.lowerBinId, valuation.upperBinId, valuation.poolActiveBinId)
-      if (precisionHandled) continue
+      if (precisionSuppressed(pos)) {
+        pendingTriggers.delete(pos.positionPubkey)
+        if ((pos.triggerConfirmations || 0) > 0) updatePositionConfirmations(pos.positionPubkey, 0)
+        console.log(`[precision] ${tokenLabel} | busy/recovery — suppress exit triggers this cycle`)
+        continue
+      }
 
       const decision = evaluateTrigger(pos, pnlPercent, binData)
       if (decision.shouldTrigger && decision.triggerType) {
@@ -603,23 +634,25 @@ async function monitorCycle(connection: Connection, walletPubkey: PublicKey, own
               ? freshValuation.allTimeDepositSol - freshValuation.allTimeWithdrawalSol
               : 0
 
-            if (freshHasReshape && freshNetDepositSol > 0 && typeof freshValuation.meteoraPnlSol === 'number') {
+            if (pos.precisionCurveEnabled && basisSol > 0) {
+              freshPnlPct = ((freshValuation.estimatedExitSol - basisSol) / basisSol) * 100
+            } else if (freshHasReshape && freshNetDepositSol > 0 && typeof freshValuation.meteoraPnlSol === 'number') {
               freshPnlPct = (freshValuation.meteoraPnlSol / freshNetDepositSol) * 100
             } else if (quoteIsUsdc) {
               if (freshRawUsd !== undefined && freshRawUsd !== null && Number.isFinite(freshRawUsd) && !Number.isNaN(freshRawUsd)) {
                 freshPnlPct = freshRawUsd
               } else if (freshRawSol !== undefined && freshRawSol !== null && Number.isFinite(freshRawSol) && !Number.isNaN(freshRawSol)) {
                 freshPnlPct = freshRawSol
-              } else if (pos.basisSol > 0) {
-                freshPnlPct = ((freshValuation.estimatedExitSol - pos.basisSol) / pos.basisSol) * 100
+              } else if (basisSol > 0) {
+                freshPnlPct = ((freshValuation.estimatedExitSol - basisSol) / basisSol) * 100
               }
             } else {
               if (freshRawSol !== undefined && freshRawSol !== null && Number.isFinite(freshRawSol) && !Number.isNaN(freshRawSol)) {
                 freshPnlPct = freshRawSol
               } else if (freshRawUsd !== undefined && freshRawUsd !== null && Number.isFinite(freshRawUsd) && !Number.isNaN(freshRawUsd)) {
                 freshPnlPct = freshRawUsd
-              } else if (pos.basisSol > 0) {
-                freshPnlPct = ((freshValuation.estimatedExitSol - pos.basisSol) / pos.basisSol) * 100
+              } else if (basisSol > 0) {
+                freshPnlPct = ((freshValuation.estimatedExitSol - basisSol) / basisSol) * 100
               }
             }
 
@@ -639,7 +672,7 @@ async function monitorCycle(connection: Connection, walletPubkey: PublicKey, own
 
             // Cross-check: LP Agent independent PnL vs Meteora PnL
             let usedPnlPct = freshPnlPct
-            let usedPnlSource = 'meteora'
+            let usedPnlSource = pos.precisionCurveEnabled ? 'entry-basis' : 'meteora'
             if (!pos.precisionCurveEnabled && recheckLpAgent) {
               const delta = Math.abs(freshPnlPct - recheckLpAgent.pnlPercentNative)
               if (delta > 3) {
@@ -658,11 +691,13 @@ async function monitorCycle(connection: Connection, walletPubkey: PublicKey, own
             } else if (decision.triggerType === 'TP') {
               stillTriggers = usedPnlPct >= tp
             } else if (decision.triggerType === 'BIN_RANGE') {
+              const freshLower = freshValuation.lowerBinId
               const freshUpper = freshValuation.upperBinId
               const freshActive = freshValuation.poolActiveBinId
               if (freshUpper !== undefined && freshActive !== undefined) {
                 const dist = freshUpper - freshActive
-                stillTriggers = usedPnlPct > config.binRangePnlThreshold && dist >= 0 && dist <= config.binRangeMaxDistance
+                const maxDistance = getBinRangeMaxDistance({ lowerBinId: freshLower, upperBinId: freshUpper, poolActiveBinId: freshActive })
+                stillTriggers = usedPnlPct > config.binRangePnlThreshold && dist >= 0 && dist <= maxDistance
               }
             } else if (decision.triggerType === 'TRAILING_STOP') {
               const dropFromPeak = pos.peakPnlPercent - usedPnlPct
@@ -695,11 +730,11 @@ async function monitorCycle(connection: Connection, walletPubkey: PublicKey, own
         // --- Kirim notifikasi + execute exit ---
         const meteoraPnlSol = typeof valuation.meteoraPnlSol === 'number' && Number.isFinite(valuation.meteoraPnlSol)
           ? valuation.meteoraPnlSol
-          : (valuation.estimatedExitSol - pos.basisSol)
+          : (valuation.estimatedExitSol - basisSol)
         sendNotification(
           formatExitStarted(
             pos.positionPubkey, decision.triggerType, pnlPercent, meteoraPnlSol,
-            pos.basisSol, valuation.estimatedExitSol,
+            basisSol, valuation.estimatedExitSol,
             pos.tokenXMint.slice(0, 4),
             pos.tokenYMint.slice(0, 4),
             pos.poolPubkey, valuation.solUsdPrice
@@ -715,7 +750,7 @@ async function monitorCycle(connection: Connection, walletPubkey: PublicKey, own
           pos.tokenYMint,
           decision.triggerType,
           verifiedPnlPct,
-          pos.basisSol,
+          basisSol,
           valuation.estimatedExitSol
         )
 
@@ -723,7 +758,7 @@ async function monitorCycle(connection: Connection, walletPubkey: PublicKey, own
           const quoteIsUsdc = pos.tokenXMint === USDC_MINT || pos.tokenYMint === USDC_MINT
           const received = quoteIsUsdc ? result.usdcReceived : result.solReceived
           const adjReceived = received - (quoteIsUsdc ? 0 : result.rentRefundSol)
-          const basisForPnl = quoteIsUsdc ? pos.basisSol * valuation.solUsdPrice : pos.basisSol
+          const basisForPnl = quoteIsUsdc ? basisSol * valuation.solUsdPrice : basisSol
           const finalPnl = basisForPnl > 0
             ? ((adjReceived - basisForPnl) / basisForPnl) * 100
             : 0
@@ -757,14 +792,19 @@ async function monitorCycle(connection: Connection, walletPubkey: PublicKey, own
           updatePositionStatus(pos.positionPubkey, 'monitoring')
           updatePositionConfirmations(pos.positionPubkey, 0)
         }
+        continue
       } else if (decision.triggerType && !decision.shouldTrigger && decision.reason?.includes('awaiting confirmation')) {
         const count = (pos.triggerConfirmations || 0) + 1
         updatePositionConfirmations(pos.positionPubkey, count)
+        continue
       } else {
         if ((pos.triggerConfirmations || 0) > 0) {
           updatePositionConfirmations(pos.positionPubkey, 0)
         }
       }
+
+      const precisionHandled = await maybeRunPrecisionCurve(pos, valuation.lowerBinId, valuation.upperBinId, valuation.poolActiveBinId)
+      if (precisionHandled) continue
     } catch (err) {
       console.log(`[monitor] error on ${pos.positionPubkey.slice(0, 8)}: ${err instanceof Error ? err.message : 'unknown'}`)
     }
@@ -779,46 +819,59 @@ async function maybeRunPrecisionCurve(
 ): Promise<boolean> {
   if (!pos.precisionCurveEnabled) return false
   const tokenLabel = `${pos.tokenXSymbol || pos.tokenXMint.slice(0, 4)}/${pos.tokenYSymbol || pos.tokenYMint.slice(0, 4)}`
+  const isRecovery = pos.status === 'precision_readd_pending'
 
-  if (pos.precisionCurveBusy) {
+  if (pos.precisionCurveBusy && !isRecovery) {
     console.log(`[precision] ${tokenLabel} | busy — skip trigger evaluation this cycle`)
     return true
   }
 
-  if (lowerBinId === undefined || upperBinId === undefined || poolActiveBinId === undefined) {
+  if (!isRecovery && (lowerBinId === undefined || upperBinId === undefined || poolActiveBinId === undefined)) {
     console.log(`[precision] ${tokenLabel} | missing bin data — skip`)
     return false
   }
 
-  if (poolActiveBinId < lowerBinId || poolActiveBinId > upperBinId) {
+  if (!isRecovery && (poolActiveBinId! < lowerBinId! || poolActiveBinId! > upperBinId!)) {
     console.log(`[precision] ${tokenLabel} | active bin ${poolActiveBinId} outside range ${lowerBinId}-${upperBinId} — skip`)
     return false
   }
 
-  const isInitialReshape = pos.precisionCurveLastActiveBin === null
+  const isInitialReshape = !isRecovery && pos.precisionCurveLastActiveBin === null
   if (!isInitialReshape) {
-    const lastBin = pos.precisionCurveLastActiveBin!
-    const movedBins = Math.abs(poolActiveBinId - lastBin)
-    const dynamicThreshold = Math.max(THRESHOLD_MIN, Math.round((pos.precisionCurveRangeHalf || 100) * THRESHOLD_RATIO))
-    if (movedBins < dynamicThreshold) return false
+    if (!isRecovery) {
+      const lastBin = pos.precisionCurveLastActiveBin!
+      const movedBins = Math.abs(poolActiveBinId! - lastBin)
+      const dynamicThreshold = Math.max(THRESHOLD_MIN, Math.round((pos.precisionCurveRangeHalf || 100) * THRESHOLD_RATIO))
+      if (movedBins < dynamicThreshold) return false
+    }
 
     const lastReshapeAt = pos.precisionCurveLastReshapeAt || 0
     const cooldownLeft = PRECISION_CURVE_COOLDOWN_MS - (Date.now() - lastReshapeAt)
-    if (lastReshapeAt > 0 && cooldownLeft > 0) {
-      console.log(`[precision] ${tokenLabel} | moved ${movedBins} bins but cooldown ${Math.ceil(cooldownLeft / 1000)}s left`)
+    if (!isRecovery && lastReshapeAt > 0 && cooldownLeft > 0) {
+      console.log(`[precision] ${tokenLabel} | cooldown ${Math.ceil(cooldownLeft / 1000)}s left`)
       return false
     }
   }
 
-  const direction = isInitialReshape ? 0 : poolActiveBinId - pos.precisionCurveLastActiveBin!
-  const dirLabel = direction === 0 ? 'initial' : direction > 0 ? 'right/up' : 'left/down'
+  const direction = isRecovery ? 0 : isInitialReshape ? 0 : poolActiveBinId! - pos.precisionCurveLastActiveBin!
+  const dirLabel = isRecovery ? 'recovery' : direction === 0 ? 'initial' : direction > 0 ? 'right/up' : 'left/down'
 
-  const actualRangeHalf = Math.ceil((upperBinId - lowerBinId + 1) / 2)
+  const actualRangeHalf = lowerBinId !== undefined && upperBinId !== undefined
+    ? Math.ceil((upperBinId - lowerBinId + 1) / 2)
+    : pos.precisionCurveRangeHalf || 100
   const dynThreshold = isInitialReshape
     ? Math.max(THRESHOLD_MIN, Math.round(actualRangeHalf * THRESHOLD_RATIO))
     : Math.max(THRESHOLD_MIN, Math.round((pos.precisionCurveRangeHalf || actualRangeHalf) * THRESHOLD_RATIO))
 
-  if (isInitialReshape) {
+  if (isRecovery) {
+    console.log(`[precision] ${tokenLabel} | pending re-add recovery starting`)
+    sendNotification(
+      `♻️ <b>Precision Curve Re-add Recovery — Starting</b>\n\n` +
+      `<b>${tokenLabel}</b>\n` +
+      `Pending X: <code>${pos.precisionCurvePendingX || '0'}</code>\n` +
+      `Pending Y: <code>${pos.precisionCurvePendingY || '0'}</code>`
+    )
+  } else if (isInitialReshape) {
     console.log(`[precision] ${tokenLabel} | initial reshape at activeBin=${poolActiveBinId}`)
     sendNotification(
       `🔁 <b>Precision Curve Initial Reshape — Starting</b>\n\n` +
@@ -829,7 +882,7 @@ async function maybeRunPrecisionCurve(
     )
   } else {
     const lastBin = pos.precisionCurveLastActiveBin!
-    const movedBins = Math.abs(poolActiveBinId - lastBin)
+    const movedBins = Math.abs(poolActiveBinId! - lastBin)
     console.log(`[precision] ${tokenLabel} | moved ${movedBins} bins (${lastBin} -> ${poolActiveBinId}) — directional reshape ${dirLabel}`)
     sendNotification(
       `🔁 <b>Precision Directional Reshape — Starting</b>\n\n` +
@@ -853,6 +906,18 @@ async function maybeRunPrecisionCurve(
       pos.precisionCurveLastActiveBin,
       pos.precisionCurveRangeHalf || 100,
       pos.precisionCurveMovementLog || [],
+      isRecovery
+        ? {
+            enabled: true,
+            pendingX: pos.precisionCurvePendingX,
+            pendingY: pos.precisionCurvePendingY,
+            pendingPreBalances: pos.precisionCurvePendingPreBalances,
+          }
+        : undefined,
+      {
+        onPendingStart: (preBalancesJson) => updatePrecisionCurvePendingStart(pos.positionPubkey, preBalancesJson),
+        onPendingAmounts: (pendingX, pendingY) => updatePrecisionCurvePendingAmounts(pos.positionPubkey, pendingX, pendingY),
+      },
     )
 
     if (!result.success) {
@@ -867,9 +932,13 @@ async function maybeRunPrecisionCurve(
           `Tokens idle in wallet.\n` +
           `Remove: ${result.removeSignature ? `<a href="https://solscan.io/tx/${result.removeSignature}">${result.removeSignature.slice(0, 6)}..${result.removeSignature.slice(-4)}</a>` : '-'}\n` +
           `Reason: <code>${result.error || 'unknown'}</code>\n\n` +
-          `Position will NOT be auto-closed.`
+          `Bot will keep retrying re-add recovery.`
         )
         return true
+      }
+
+      if (!isRecovery && !result.removeSucceeded) {
+        clearPrecisionCurvePending(pos.positionPubkey, 'monitoring')
       }
 
       console.log(`[precision] ${tokenLabel} | failed: ${result.error || 'unknown'}`)
@@ -883,7 +952,7 @@ async function maybeRunPrecisionCurve(
       return true
     }
 
-    const newBaseline = result.activeBinId ?? poolActiveBinId
+    const newBaseline = result.activeBinId ?? poolActiveBinId ?? pos.precisionCurveLastActiveBin ?? 0
     updatePrecisionCurveState(pos.positionPubkey, newBaseline, Date.now())
     updatePrecisionCurveRecoveryUntil(pos.positionPubkey, Date.now() + RECOVERY_MS)
     console.log(`[precision] ${tokenLabel} | recovery window: ${RECOVERY_MS / 1000}s — peak frozen`)
@@ -896,12 +965,15 @@ async function maybeRunPrecisionCurve(
     const staleRange = result.staleFrom !== null && result.staleTo !== null
       ? `${result.staleFrom} → ${result.staleTo}`
       : '-'
+    const fullRange = result.lowerBinId !== null && result.upperBinId !== null
+      ? `${result.lowerBinId}-${result.upperBinId}`
+      : `${lowerBinId ?? '-'}-${upperBinId ?? '-'}`
     const addRange = result.addLowerBinId !== null && result.addUpperBinId !== null
       ? `${result.addLowerBinId}-${result.addUpperBinId} (half=${result.effectiveRangeHalf})`
       : '-'
 
-    if (!result.noop && !isInitialReshape) {
-      const movedBins = Math.abs(poolActiveBinId - pos.precisionCurveLastActiveBin!)
+    if (!result.noop && !isInitialReshape && !isRecovery) {
+      const movedBins = Math.abs(poolActiveBinId! - pos.precisionCurveLastActiveBin!)
       const newLog = [...(pos.precisionCurveMovementLog || []), movedBins].slice(-5)
       updatePrecisionCurveMovementLog(pos.positionPubkey, newLog)
 
@@ -931,11 +1003,11 @@ async function maybeRunPrecisionCurve(
 
     console.log(`[precision] ${tokenLabel} | reshape complete: remove=${result.removeSignature || 'n/a'} add=${result.addSignature || 'n/a'}`)
     sendNotification(
-      `✅ <b>Precision Directional Reshape Complete</b>\n\n` +
+      `✅ <b>${isRecovery ? 'Precision Re-add Recovery Complete' : 'Precision Directional Reshape Complete'}</b>\n\n` +
       `<b>${tokenLabel}</b>\n` +
       `Direction: <b>${dirLabel}</b>\n` +
       `Active baseline: <b>${newBaseline}</b>\n` +
-      `Range: <b>${lowerBinId}-${upperBinId}</b>\n` +
+      `Range: <b>${fullRange}</b>\n` +
       `Concentrated: <b>${addRange}</b>\n` +
       `Stale range: <b>${staleRange}</b>\n` +
       `X withdrawn/deposited: <code>${result.xWithdrawn}</code> / <code>${result.xDeposited}</code>\n` +

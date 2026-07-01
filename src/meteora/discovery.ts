@@ -26,6 +26,7 @@ function rowToPosition(row: any): PositionRow {
     tokenYSymbol: row.token_y_symbol || '',
     owner: row.owner,
     basisSol: row.basis_sol,
+    entryValueSol: row.entry_value_sol ?? null,
     basisConfidence: row.basis_confidence,
     tpPercent: row.tp_percent,
     slPercent: row.sl_percent,
@@ -45,6 +46,10 @@ function rowToPosition(row: any): PositionRow {
     precisionCurveRangeHalf: row.precision_curve_range_half ?? 100,
     precisionCurveMovementLog: safeParseJson(row.precision_curve_movement_log, []),
     precisionCurveRecoveryUntil: row.precision_curve_recovery_until ?? null,
+    precisionCurvePendingX: row.precision_curve_pending_x ?? null,
+    precisionCurvePendingY: row.precision_curve_pending_y ?? null,
+    precisionCurvePendingPreBalances: row.precision_curve_pending_pre_balances ?? null,
+    precisionCurvePendingStartedAt: row.precision_curve_pending_started_at ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   }
@@ -57,7 +62,7 @@ export function loadKnownPositions(): PositionRow[] {
 
 export function loadActivePositions(): PositionRow[] {
   const db = getDb()
-  return (db.prepare("SELECT * FROM positions WHERE status IN ('monitoring', 'exiting', 'discovering')").all() as any[]).map(rowToPosition)
+  return (db.prepare("SELECT * FROM positions WHERE status IN ('monitoring', 'exiting', 'discovering', 'precision_readd_pending')").all() as any[]).map(rowToPosition)
 }
 
 export function upsertPosition(row: {
@@ -69,6 +74,7 @@ export function upsertPosition(row: {
   tokenYSymbol: string
   owner: string
   basisSol: number
+  entryValueSol?: number | null
   basisConfidence: BasisConfidence
   tpPercent: number
   slPercent: number
@@ -85,16 +91,17 @@ export function upsertPosition(row: {
   const now = Date.now()
   db.prepare(`
     INSERT INTO positions (position_pubkey, pool_pubkey, token_x_mint, token_y_mint, token_x_symbol, token_y_symbol, owner,
-      basis_sol, basis_confidence, tp_percent, sl_percent, status, trigger_confirmations,
+      basis_sol, entry_value_sol, basis_confidence, tp_percent, sl_percent, status, trigger_confirmations,
       peak_pnl_percent, trailing_activated, strategy,
       last_pnl_percent, last_estimated_exit_sol, last_seen_at, created_at, updated_at)
     VALUES (@positionPubkey, @poolPubkey, @tokenXMint, @tokenYMint, @tokenXSymbol, @tokenYSymbol, @owner,
-      @basisSol, @basisConfidence, @tpPercent, @slPercent, @status, @triggerConfirmations,
+      @basisSol, @entryValueSol, @basisConfidence, @tpPercent, @slPercent, @status, @triggerConfirmations,
       @peakPnlPercent, @trailingActivated, @strategy,
       @lastPnlPercent, @lastEstimatedExitSol, @lastSeenAt, @createdAt, @updatedAt)
     ON CONFLICT(position_pubkey) DO UPDATE SET
       status = @status,
       basis_sol = @basisSol,
+      entry_value_sol = COALESCE(entry_value_sol, @entryValueSol),
       basis_confidence = @basisConfidence,
       token_x_symbol = @tokenXSymbol,
       token_y_symbol = @tokenYSymbol,
@@ -108,6 +115,7 @@ export function upsertPosition(row: {
       updated_at = @updatedAt
   `).run({
     ...row,
+    entryValueSol: row.entryValueSol ?? row.basisSol,
     trailingActivated: row.trailingActivated ? 1 : 0,
     createdAt: now,
     updatedAt: now,
@@ -122,6 +130,12 @@ export function updatePositionPnl(pubkey: string, pnlPercent: number, estimatedE
   getDb().prepare(
     'UPDATE positions SET last_pnl_percent = ?, last_estimated_exit_sol = ?, last_seen_at = ?, updated_at = ? WHERE position_pubkey = ?'
   ).run(pnlPercent, estimatedExitSol, Date.now(), Date.now(), pubkey)
+}
+
+export function updatePositionBasis(pubkey: string, basisSol: number, confidence: BasisConfidence): void {
+  getDb().prepare(
+    'UPDATE positions SET basis_sol = ?, entry_value_sol = COALESCE(entry_value_sol, ?), basis_confidence = ?, updated_at = ? WHERE position_pubkey = ?'
+  ).run(basisSol, basisSol, confidence, Date.now(), pubkey)
 }
 
 export function updatePositionConfirmations(pubkey: string, count: number): void {
@@ -148,6 +162,7 @@ export function updatePrecisionCurveEnabled(pubkey: string, enabled: boolean, cu
      SET precision_curve_enabled = ?,
          precision_curve_last_active_bin = CASE WHEN ? = 1 THEN ? ELSE precision_curve_last_active_bin END,
          precision_curve_busy = 0,
+         entry_value_sol = COALESCE(entry_value_sol, basis_sol),
          updated_at = ?
      WHERE position_pubkey = ?`
   ).run(enabled ? 1 : 0, enabled ? 1 : 0, currentActiveBin, now, pubkey)
@@ -160,7 +175,17 @@ export function updatePrecisionCurveBusy(pubkey: string, busy: boolean): void {
 
 export function updatePrecisionCurveState(pubkey: string, lastActiveBin: number, lastReshapeAt: number): void {
   getDb().prepare(
-    'UPDATE positions SET precision_curve_last_active_bin = ?, precision_curve_last_reshape_at = ?, precision_curve_busy = 0, updated_at = ? WHERE position_pubkey = ?'
+    `UPDATE positions
+     SET status = 'monitoring',
+         precision_curve_last_active_bin = ?,
+         precision_curve_last_reshape_at = ?,
+         precision_curve_busy = 0,
+         precision_curve_pending_x = NULL,
+         precision_curve_pending_y = NULL,
+         precision_curve_pending_pre_balances = NULL,
+         precision_curve_pending_started_at = NULL,
+         updated_at = ?
+     WHERE position_pubkey = ?`
   ).run(lastActiveBin, lastReshapeAt, Date.now(), pubkey)
 }
 
@@ -182,4 +207,40 @@ export function updatePrecisionCurveMovementLog(pubkey: string, movements: numbe
 export function updatePrecisionCurveRecoveryUntil(pubkey: string, recoveryUntil: number | null): void {
   getDb().prepare('UPDATE positions SET precision_curve_recovery_until = ?, updated_at = ? WHERE position_pubkey = ?')
     .run(recoveryUntil, Date.now(), pubkey)
+}
+
+export function updatePrecisionCurvePendingStart(pubkey: string, preBalancesJson: string): void {
+  getDb().prepare(
+    `UPDATE positions
+     SET status = 'precision_readd_pending',
+         precision_curve_busy = 1,
+         precision_curve_pending_pre_balances = ?,
+         precision_curve_pending_started_at = ?,
+         updated_at = ?
+     WHERE position_pubkey = ?`
+  ).run(preBalancesJson, Date.now(), Date.now(), pubkey)
+}
+
+export function updatePrecisionCurvePendingAmounts(pubkey: string, pendingX: string, pendingY: string): void {
+  getDb().prepare(
+    `UPDATE positions
+     SET precision_curve_pending_x = ?,
+         precision_curve_pending_y = ?,
+         updated_at = ?
+     WHERE position_pubkey = ?`
+  ).run(pendingX, pendingY, Date.now(), pubkey)
+}
+
+export function clearPrecisionCurvePending(pubkey: string, status: PositionRow['status'] = 'monitoring'): void {
+  getDb().prepare(
+    `UPDATE positions
+     SET status = ?,
+         precision_curve_busy = 0,
+         precision_curve_pending_x = NULL,
+         precision_curve_pending_y = NULL,
+         precision_curve_pending_pre_balances = NULL,
+         precision_curve_pending_started_at = NULL,
+         updated_at = ?
+     WHERE position_pubkey = ?`
+  ).run(status, Date.now(), pubkey)
 }
