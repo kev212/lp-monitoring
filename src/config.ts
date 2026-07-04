@@ -42,6 +42,9 @@ export const config: Config = {
   binRangeCloseEnabled: envBool('BIN_RANGE_CLOSE_ENABLED', true),
   binRangePnlThreshold: envNum('BIN_RANGE_PNL_THRESHOLD', 1.5),
   binRangeMaxDistance: envNum('BIN_RANGE_MAX_DISTANCE', 7),
+  binRangeDistanceRatio: envNum('BIN_RANGE_DISTANCE_RATIO', 0.05),
+  maxDrawdownThreshold: envNum('MAX_DRAWDOWN_THRESHOLD', -6),
+  maxDrawdownTpOverride: envNum('MAX_DRAWDOWN_TP_OVERRIDE', 2),
   dbPath: envStr('DB_PATH', './monitoring-lp.sqlite'),
   logLevel: envStr('LOG_LEVEL', 'info'),
 }

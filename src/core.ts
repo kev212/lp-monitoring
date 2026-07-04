@@ -423,11 +423,14 @@ async function monitorCycle(connection: Connection, walletPubkey: PublicKey, own
       const triggerInfo = pos.triggerConfirmations > 0
         ? `Conf: ${pos.triggerConfirmations}/${config.triggerConfirmations}`
         : 'Conf: 0'
+      const effectiveTp = pnlPercent <= config.maxDrawdownThreshold
+        ? config.maxDrawdownTpOverride
+        : (pos.tpPercent ?? config.defaultTpPercent)
       console.log(
         `[monitor] ${tokenLabel}${dupMarker} | ${pos.status} | PnL: ${pnlSign}${pnlPercent.toFixed(2)}% (${pnlSource})` +
         ` | Value: ${valuation.estimatedExitSol.toFixed(4)} SOL` +
         ` | Basis: ${pos.basisSol.toFixed(4)} SOL` +
-        ` | SL: ${pos.slPercent}% TP: +${pos.tpPercent}%` +
+        ` | SL: ${pos.slPercent}% TP: +${effectiveTp}%${pnlPercent <= config.maxDrawdownThreshold ? ' (DD)' : ''}` +
         ` | Peak: ${pos.peakPnlPercent.toFixed(2)}%` +
         ` | ${triggerInfo}`
       )
@@ -549,7 +552,7 @@ async function monitorCycle(connection: Connection, walletPubkey: PublicKey, own
           if (delta > 3) {
             // Cek apakah LP Agent sendiri masih trigger condition
             const sl = pos.slPercent ?? config.defaultSlPercent
-            const tp = pos.tpPercent ?? config.defaultTpPercent
+            const tp = pnlPercent <= config.maxDrawdownThreshold ? config.maxDrawdownTpOverride : (pos.tpPercent ?? config.defaultTpPercent)
             const lpPnl = lpAgentAtTrigger.pnlPercentNative
             let lpStillTriggers = false
             if (decision.triggerType === 'SL') {
@@ -650,7 +653,7 @@ async function monitorCycle(connection: Connection, walletPubkey: PublicKey, own
             }
 
             const sl = pos.slPercent ?? config.defaultSlPercent
-            const tp = pos.tpPercent ?? config.defaultTpPercent
+            const tp = usedPnlPct <= config.maxDrawdownThreshold ? config.maxDrawdownTpOverride : (pos.tpPercent ?? config.defaultTpPercent)
 
             let stillTriggers = false
             if (decision.triggerType === 'SL') {
