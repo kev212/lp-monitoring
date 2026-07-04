@@ -32,8 +32,7 @@ export function evaluateTrigger(
     return { shouldTrigger: false, triggerType: null, reason: 'position already exiting/closed' }
   }
 
-  const baseTp = position.tpPercent ?? config.defaultTpPercent
-  const tp = currentPnlPercent <= config.maxDrawdownThreshold ? config.maxDrawdownTpOverride : baseTp
+  const tp = position.tpPercent ?? config.defaultTpPercent
   const sl = position.slPercent ?? config.defaultSlPercent
   const trailDrop = config.trailingStopDropPct
 
@@ -51,8 +50,7 @@ export function evaluateTrigger(
   else if (currentPnlPercent >= tp) {
     triggered = true
     triggerType = 'TP'
-    const overrideNote = tp !== baseTp ? ` (DD↓ TP overridden ${baseTp}%→${tp}%)` : ''
-    reason = `TP hit: ${currentPnlPercent.toFixed(2)}% >= ${tp}%${overrideNote}`
+    reason = `TP hit: ${currentPnlPercent.toFixed(2)}% >= ${tp}%`
   }
   // Priority 3: BIN_RANGE — auto close when PnL > threshold & close to upper bin
   // NOTE: PnL threshold in the else-if condition so failing distance check falls through to trailing stop

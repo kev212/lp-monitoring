@@ -94,8 +94,6 @@ export interface Config {
   binRangePnlThreshold: number
   binRangeMaxDistance: number
   binRangeDistanceRatio: number
-  maxDrawdownThreshold: number
-  maxDrawdownTpOverride: number
   dbPath: string
   logLevel: string
 }
