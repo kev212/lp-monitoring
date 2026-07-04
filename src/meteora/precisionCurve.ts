@@ -55,24 +55,6 @@ export interface PrecisionCurveResult {
   error?: string
 }
 
-export interface PrecisionCurveRecoveryInput {
-  enabled: boolean
-  pendingX: string | null
-  pendingY: string | null
-  pendingPreBalances: string | null
-}
-
-export interface PrecisionCurveCallbacks {
-  onPendingStart?: (preBalancesJson: string) => void
-  onPendingAmounts?: (pendingX: string, pendingY: string) => void
-}
-
-interface BalanceSnapshot {
-  nativeSol: bigint
-  tokenX: bigint
-  tokenY: bigint
-}
-
 function emptyResult(): PrecisionCurveResult {
   return {
     success: false,
@@ -146,69 +128,6 @@ async function captureBalances(connection: Connection, wallet: Keypair, tokenXMi
   return { nativeSol, tokenX, tokenY }
 }
 
-function serializeBalances(balances: BalanceSnapshot): string {
-  return JSON.stringify({
-    nativeSol: balances.nativeSol.toString(),
-    tokenX: balances.tokenX.toString(),
-    tokenY: balances.tokenY.toString(),
-  })
-}
-
-function parseBalances(json: string | null): BalanceSnapshot | null {
-  if (!json) return null
-  try {
-    const parsed = JSON.parse(json)
-    return {
-      nativeSol: BigInt(parsed.nativeSol || '0'),
-      tokenX: BigInt(parsed.tokenX || '0'),
-      tokenY: BigInt(parsed.tokenY || '0'),
-    }
-  } catch {
-    return null
-  }
-}
-
-function parsePendingAmount(value: string | null): bigint {
-  if (!value) return 0n
-  try { return BigInt(value) } catch { return 0n }
-}
-
-function computeWithdrawnDeltas(
-  preBal: BalanceSnapshot,
-  postBal: BalanceSnapshot,
-  tokenXMint: string,
-  tokenYMint: string,
-): { deltaX: bigint; deltaY: bigint } {
-  let deltaX = postBal.tokenX > preBal.tokenX ? postBal.tokenX - preBal.tokenX : 0n
-  let deltaY: bigint
-  if (isSolMint(tokenYMint)) {
-    const nativeSolDelta = postBal.nativeSol > preBal.nativeSol ? postBal.nativeSol - preBal.nativeSol : 0n
-    const wsolDelta = postBal.tokenY > preBal.tokenY ? postBal.tokenY - preBal.tokenY : 0n
-    const totalSolDelta = nativeSolDelta + wsolDelta
-    deltaY = totalSolDelta > SOL_FEE_BUFFER_LAMPORTS ? totalSolDelta - SOL_FEE_BUFFER_LAMPORTS : 0n
-    console.log(`[precision] SOL delta: native=${nativeSolDelta} wsol=${wsolDelta} total=${totalSolDelta} addY=${deltaY}`)
-  } else {
-    deltaY = postBal.tokenY > preBal.tokenY ? postBal.tokenY - preBal.tokenY : 0n
-  }
-
-  if (isSolMint(tokenXMint)) {
-    const nativeSolDelta = postBal.nativeSol > preBal.nativeSol ? postBal.nativeSol - preBal.nativeSol : 0n
-    const wsolDelta = postBal.tokenX > preBal.tokenX ? postBal.tokenX - preBal.tokenX : 0n
-    const totalSolDelta = nativeSolDelta + wsolDelta
-    deltaX = totalSolDelta > SOL_FEE_BUFFER_LAMPORTS ? totalSolDelta - SOL_FEE_BUFFER_LAMPORTS : 0n
-    console.log(`[precision] SOL delta (X): native=${nativeSolDelta} wsol=${wsolDelta} total=${totalSolDelta} addX=${deltaX}`)
-  }
-
-  return { deltaX, deltaY }
-}
-
-function spendableForMint(balances: BalanceSnapshot, mint: string, side: 'x' | 'y'): bigint {
-  const tokenBalance = side === 'x' ? balances.tokenX : balances.tokenY
-  if (!isSolMint(mint)) return tokenBalance
-  const totalSol = balances.nativeSol + tokenBalance
-  return totalSol > SOL_FEE_BUFFER_LAMPORTS ? totalSol - SOL_FEE_BUFFER_LAMPORTS : 0n
-}
-
 export async function executeDirectionalPrecisionCurve(
   connection: Connection,
   wallet: Keypair,
@@ -219,11 +138,8 @@ export async function executeDirectionalPrecisionCurve(
   lastActiveBin: number | null,
   rangeHalf: number,
   movements: number[],
-  recovery?: PrecisionCurveRecoveryInput,
-  callbacks?: PrecisionCurveCallbacks,
 ): Promise<PrecisionCurveResult> {
   const result = emptyResult()
-  const recoveryMode = recovery?.enabled === true
   try {
     clearPoolCache()
     const pool = await getPool(connection, new PublicKey(poolPubkey))
@@ -244,117 +160,107 @@ export async function executeDirectionalPrecisionCurve(
 
     const amountX = new BN(pd.totalXAmount)
     const amountY = new BN(pd.totalYAmount)
-    if (!recoveryMode && amountX.isZero() && amountY.isZero()) throw new Error('position has no active liquidity')
+    if (amountX.isZero() && amountY.isZero()) throw new Error('position has no active liquidity')
 
-    const isInitial = !recoveryMode && lastActiveBin === null
+    const isInitial = lastActiveBin === null
     result.isInitial = isInitial
+
+    let staleFrom: number
+    let staleTo: number
+    let direction: number
+
+    if (isInitial) {
+      staleFrom = lowerBinId
+      staleTo = upperBinId
+      direction = 0
+    } else {
+      direction = activeBinId - lastActiveBin
+      if (direction > 0) {
+        staleFrom = lowerBinId
+        staleTo = Math.min(upperBinId, activeBinId - ACTIVE_SIDE_BUFFER_BINS - 1)
+      } else if (direction < 0) {
+        staleFrom = Math.max(lowerBinId, activeBinId + ACTIVE_SIDE_BUFFER_BINS + 1)
+        staleTo = upperBinId
+      } else {
+        staleFrom = lowerBinId
+        staleTo = upperBinId
+      }
+    }
+
+    result.direction = direction
+    result.staleFrom = staleFrom
+    result.staleTo = staleTo
+
+    if (staleFrom > staleTo) {
+      throw new Error(`invalid stale range: ${staleFrom}-${staleTo}`)
+    }
 
     result.xWithdrawn = amountX.toString()
     result.yWithdrawn = amountY.toString()
 
-    let deltaX = 0n
-    let deltaY = 0n
+    console.log(`[precision] pre-remove: activeBin=${activeBinId} staleRange=${staleFrom}-${staleTo} direction=${direction}`)
+    const preBal = await captureBalances(connection, wallet, tokenXMint, tokenYMint)
+    console.log(`[precision] pre-balances: nativeSol=${preBal.nativeSol} tokenX=${preBal.tokenX} tokenY=${preBal.tokenY}`)
 
-    if (recoveryMode) {
-      result.removeSucceeded = true
-      deltaX = parsePendingAmount(recovery?.pendingX ?? null)
-      deltaY = parsePendingAmount(recovery?.pendingY ?? null)
-      const currentBal = await captureBalances(connection, wallet, tokenXMint, tokenYMint)
-      if (deltaX === 0n && deltaY === 0n) {
-        const preBal = parseBalances(recovery?.pendingPreBalances ?? null)
-        if (preBal) {
-          console.log(`[precision] recovery balances: nativeSol=${currentBal.nativeSol} tokenX=${currentBal.tokenX} tokenY=${currentBal.tokenY}`)
-          const deltas = computeWithdrawnDeltas(preBal, currentBal, tokenXMint, tokenYMint)
-          deltaX = deltas.deltaX
-          deltaY = deltas.deltaY
-          callbacks?.onPendingAmounts?.(deltaX.toString(), deltaY.toString())
-        }
+    const staleBins = staleTo - staleFrom + 1
+    const chunks = staleBins > MAX_BINS_PER_REMOVE
+      ? chunkRange(staleFrom, staleTo, MAX_BINS_PER_REMOVE)
+      : [{ from: staleFrom, to: staleTo }]
+
+    if (chunks.length > 1) {
+      console.log(`[precision] ${staleBins} stale bins — split into ${chunks.length} chunks of max ${MAX_BINS_PER_REMOVE}`)
+    }
+
+    for (const [i, chunk] of chunks.entries()) {
+      const removeTxs = await pool.removeLiquidity({
+        user: wallet.publicKey,
+        position: new PublicKey(positionPubkey),
+        fromBinId: chunk.from,
+        toBinId: chunk.to,
+        bps: new BN(10000) as any,
+        shouldClaimAndClose: false,
+      })
+
+      const txs = Array.isArray(removeTxs) ? removeTxs : [removeTxs]
+      for (const tx of txs) {
+        tx.sign(wallet)
+        const sig = await connection.sendTransaction(tx, [wallet])
+        await connection.confirmTransaction(sig, 'confirmed')
+        result.removeSignature = sig
+        console.log(`[precision] remove liq tx chunk ${i + 1}/${chunks.length} (${chunk.from}-${chunk.to}): ${sig}`)
       }
-      const spendableX = spendableForMint(currentBal, tokenXMint, 'x')
-      const spendableY = spendableForMint(currentBal, tokenYMint, 'y')
-      if (deltaX > spendableX) deltaX = spendableX
-      if (deltaY > spendableY) deltaY = spendableY
-      callbacks?.onPendingAmounts?.(deltaX.toString(), deltaY.toString())
-      console.log(`[precision] recovery add amounts: deltaX=${deltaX} deltaY=${deltaY}`)
+
+      if (i < chunks.length - 1) {
+        await new Promise<void>(resolve => { setTimeout(resolve, REMOVE_DELAY_MS) })
+      }
+    }
+
+    result.removeSucceeded = true
+
+    await new Promise<void>(resolve => { setTimeout(resolve, REMOVE_DELAY_MS) })
+
+    const postBal = await captureBalances(connection, wallet, tokenXMint, tokenYMint)
+    console.log(`[precision] post-balances: nativeSol=${postBal.nativeSol} tokenX=${postBal.tokenX} tokenY=${postBal.tokenY}`)
+
+    let deltaX = postBal.tokenX > preBal.tokenX ? postBal.tokenX - preBal.tokenX : 0n
+    let deltaY: bigint
+
+    if (isSolMint(tokenYMint)) {
+      const nativeSolDelta = postBal.nativeSol > preBal.nativeSol ? postBal.nativeSol - preBal.nativeSol : 0n
+      const wsolDelta = postBal.tokenY > preBal.tokenY ? postBal.tokenY - preBal.tokenY : 0n
+      const totalSolDelta = nativeSolDelta + wsolDelta
+      deltaY = totalSolDelta > SOL_FEE_BUFFER_LAMPORTS ? totalSolDelta - SOL_FEE_BUFFER_LAMPORTS : 0n
+      console.log(`[precision] SOL delta: native=${nativeSolDelta} wsol=${wsolDelta} total=${totalSolDelta} addY=${deltaY}`)
     } else {
-      let staleFrom: number
-      let staleTo: number
-      let direction: number
+      deltaY = postBal.tokenY > preBal.tokenY ? postBal.tokenY - preBal.tokenY : 0n
+    }
 
-      if (isInitial) {
-        staleFrom = lowerBinId
-        staleTo = upperBinId
-        direction = 0
-      } else {
-        direction = activeBinId - lastActiveBin!
-        if (direction > 0) {
-          staleFrom = lowerBinId
-          staleTo = Math.min(upperBinId, activeBinId - ACTIVE_SIDE_BUFFER_BINS - 1)
-        } else if (direction < 0) {
-          staleFrom = Math.max(lowerBinId, activeBinId + ACTIVE_SIDE_BUFFER_BINS + 1)
-          staleTo = upperBinId
-        } else {
-          staleFrom = lowerBinId
-          staleTo = upperBinId
-        }
-      }
-
-      result.direction = direction
-      result.staleFrom = staleFrom
-      result.staleTo = staleTo
-
-      if (staleFrom > staleTo) {
-        throw new Error(`invalid stale range: ${staleFrom}-${staleTo}`)
-      }
-
-      console.log(`[precision] pre-remove: activeBin=${activeBinId} staleRange=${staleFrom}-${staleTo} direction=${direction}`)
-      const preBal = await captureBalances(connection, wallet, tokenXMint, tokenYMint)
-      callbacks?.onPendingStart?.(serializeBalances(preBal))
-      console.log(`[precision] pre-balances: nativeSol=${preBal.nativeSol} tokenX=${preBal.tokenX} tokenY=${preBal.tokenY}`)
-
-      const staleBins = staleTo - staleFrom + 1
-      const chunks = staleBins > MAX_BINS_PER_REMOVE
-        ? chunkRange(staleFrom, staleTo, MAX_BINS_PER_REMOVE)
-        : [{ from: staleFrom, to: staleTo }]
-
-      if (chunks.length > 1) {
-        console.log(`[precision] ${staleBins} stale bins — split into ${chunks.length} chunks of max ${MAX_BINS_PER_REMOVE}`)
-      }
-
-      for (const [i, chunk] of chunks.entries()) {
-        const removeTxs = await pool.removeLiquidity({
-          user: wallet.publicKey,
-          position: new PublicKey(positionPubkey),
-          fromBinId: chunk.from,
-          toBinId: chunk.to,
-          bps: new BN(10000) as any,
-          shouldClaimAndClose: false,
-        })
-
-        const txs = Array.isArray(removeTxs) ? removeTxs : [removeTxs]
-        for (const tx of txs) {
-          tx.sign(wallet)
-          const sig = await connection.sendTransaction(tx, [wallet])
-          await connection.confirmTransaction(sig, 'confirmed')
-          result.removeSignature = sig
-          console.log(`[precision] remove liq tx chunk ${i + 1}/${chunks.length} (${chunk.from}-${chunk.to}): ${sig}`)
-        }
-
-        if (i < chunks.length - 1) {
-          await new Promise<void>(resolve => { setTimeout(resolve, REMOVE_DELAY_MS) })
-        }
-      }
-
-      result.removeSucceeded = true
-
-      await new Promise<void>(resolve => { setTimeout(resolve, REMOVE_DELAY_MS) })
-
-      const postBal = await captureBalances(connection, wallet, tokenXMint, tokenYMint)
-      console.log(`[precision] post-balances: nativeSol=${postBal.nativeSol} tokenX=${postBal.tokenX} tokenY=${postBal.tokenY}`)
-      const deltas = computeWithdrawnDeltas(preBal, postBal, tokenXMint, tokenYMint)
-      deltaX = deltas.deltaX
-      deltaY = deltas.deltaY
-      callbacks?.onPendingAmounts?.(deltaX.toString(), deltaY.toString())
+    if (isSolMint(tokenXMint)) {
+      const nativeSolDelta = postBal.nativeSol > preBal.nativeSol ? postBal.nativeSol - preBal.nativeSol : 0n
+      const wsolDelta = postBal.tokenX > preBal.tokenX ? postBal.tokenX - preBal.tokenX : 0n
+      const totalSolDelta = nativeSolDelta + wsolDelta
+      deltaX = totalSolDelta > SOL_FEE_BUFFER_LAMPORTS ? totalSolDelta - SOL_FEE_BUFFER_LAMPORTS : 0n
+      console.log(`[precision] SOL delta (X): native=${nativeSolDelta} wsol=${wsolDelta} total=${totalSolDelta} addX=${deltaX}`)
     }
 
     result.xDeposited = deltaX.toString()
@@ -362,10 +268,7 @@ export async function executeDirectionalPrecisionCurve(
     console.log(`[precision] add amounts: deltaX=${deltaX} deltaY=${deltaY}`)
 
     if (deltaX === 0n && deltaY === 0n) {
-      const staleLabel = result.staleFrom !== null && result.staleTo !== null
-        ? `${result.staleFrom}-${result.staleTo}`
-        : 'pending re-add'
-      console.log(`[precision] no-op: ${staleLabel} has no liquidity to add — updating baseline to ${activeBinId}`)
+      console.log(`[precision] no-op: stale range ${staleFrom}-${staleTo} has no liquidity — updating baseline to ${activeBinId}`)
       result.activeBinId = activeBinId
       result.success = true
       result.noop = true
@@ -442,7 +345,6 @@ export async function executeDirectionalPrecisionCurve(
     result.success = true
     return result
   } catch (err) {
-    if (result.removeSucceeded) result.addFailed = true
     result.error = err instanceof Error ? err.message : 'unknown error'
     return result
   }

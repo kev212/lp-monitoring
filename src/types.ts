@@ -1,4 +1,4 @@
-export type PositionStatus = 'discovering' | 'monitoring' | 'exiting' | 'closed' | 'error' | 'precision_readd_pending'
+export type PositionStatus = 'discovering' | 'monitoring' | 'exiting' | 'closed' | 'error'
 export type BasisConfidence = 'high' | 'medium' | 'low'
 export type StrategyType = 'single_side_quote' | 'single_side_token' | 'balanced' | 'unknown'
 export type EventType = 'POSITION_INIT' | 'ADD_LIQUIDITY' | 'REMOVE_LIQUIDITY' | 'CLAIM_FEE' | 'CLAIM_REWARD' | 'CLOSE_POSITION' | 'UNKNOWN'
@@ -14,7 +14,6 @@ export interface PositionRow {
   tokenYSymbol: string
   owner: string
   basisSol: number
-  entryValueSol: number | null
   basisConfidence: BasisConfidence
   tpPercent: number
   slPercent: number
@@ -34,10 +33,6 @@ export interface PositionRow {
   precisionCurveRangeHalf: number
   precisionCurveMovementLog: number[]
   precisionCurveRecoveryUntil: number | null
-  precisionCurvePendingX: string | null
-  precisionCurvePendingY: string | null
-  precisionCurvePendingPreBalances: string | null
-  precisionCurvePendingStartedAt: number | null
   createdAt: number
   updatedAt: number
 }
@@ -93,7 +88,6 @@ export interface Config {
   binRangeCloseEnabled: boolean
   binRangePnlThreshold: number
   binRangeMaxDistance: number
-  binRangeDistanceRatio: number
   dbPath: string
   logLevel: string
 }

@@ -8,19 +8,8 @@ export interface TriggerDecision {
 }
 
 export interface BinData {
-  lowerBinId?: number
   upperBinId?: number
   poolActiveBinId?: number
-}
-
-export function getBinRangeMaxDistance(binData?: BinData): number {
-  if (binData?.lowerBinId !== undefined && binData.upperBinId !== undefined) {
-    const width = binData.upperBinId - binData.lowerBinId + 1
-    if (width > 0 && config.binRangeDistanceRatio > 0) {
-      return Math.max(1, Math.round(width * config.binRangeDistanceRatio))
-    }
-  }
-  return config.binRangeMaxDistance
 }
 
 export function evaluateTrigger(
@@ -59,11 +48,10 @@ export function evaluateTrigger(
            binData?.poolActiveBinId !== undefined &&
            currentPnlPercent > config.binRangePnlThreshold) {
     const distance = binData.upperBinId - binData.poolActiveBinId
-    const maxDistance = getBinRangeMaxDistance(binData)
-    if (distance >= 0 && distance <= maxDistance) {
+    if (distance >= 0 && distance <= config.binRangeMaxDistance) {
       triggered = true
       triggerType = 'BIN_RANGE'
-      reason = `BIN_RANGE: PnL ${currentPnlPercent.toFixed(2)}% > ${config.binRangePnlThreshold}% & distance ${distance} bins <= ${maxDistance}`
+      reason = `BIN_RANGE: PnL ${currentPnlPercent.toFixed(2)}% > ${config.binRangePnlThreshold}% & distance ${distance} bins <= ${config.binRangeMaxDistance}`
     }
   }
   // Priority 4: Trailing stop — hanya kalo trailing aktif, PnL positif, & PnL di bawah TP

@@ -11,7 +11,6 @@ export function initSchema(db: Database.Database): void {
       token_y_symbol TEXT NOT NULL DEFAULT '',
       owner TEXT NOT NULL,
       basis_sol REAL NOT NULL DEFAULT 0,
-      entry_value_sol REAL,
       basis_confidence TEXT NOT NULL DEFAULT 'low',
       tp_percent REAL NOT NULL DEFAULT 5,
       sl_percent REAL NOT NULL DEFAULT -15,
@@ -28,10 +27,6 @@ export function initSchema(db: Database.Database): void {
       precision_curve_last_reshape_at INTEGER,
       precision_curve_busy INTEGER NOT NULL DEFAULT 0,
       precision_curve_threshold_bins INTEGER NOT NULL DEFAULT 5,
-      precision_curve_pending_x TEXT,
-      precision_curve_pending_y TEXT,
-      precision_curve_pending_pre_balances TEXT,
-      precision_curve_pending_started_at INTEGER,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
@@ -120,25 +115,4 @@ export function initSchema(db: Database.Database): void {
   if (!hasPrecisionCurveRecoveryUntil) {
     db.exec("ALTER TABLE positions ADD COLUMN precision_curve_recovery_until INTEGER")
   }
-  const hasEntryValueSol = cols.some((c: any) => c.name === 'entry_value_sol')
-  if (!hasEntryValueSol) {
-    db.exec("ALTER TABLE positions ADD COLUMN entry_value_sol REAL")
-  }
-  const hasPrecisionCurvePendingX = cols.some((c: any) => c.name === 'precision_curve_pending_x')
-  if (!hasPrecisionCurvePendingX) {
-    db.exec("ALTER TABLE positions ADD COLUMN precision_curve_pending_x TEXT")
-  }
-  const hasPrecisionCurvePendingY = cols.some((c: any) => c.name === 'precision_curve_pending_y')
-  if (!hasPrecisionCurvePendingY) {
-    db.exec("ALTER TABLE positions ADD COLUMN precision_curve_pending_y TEXT")
-  }
-  const hasPrecisionCurvePendingPreBalances = cols.some((c: any) => c.name === 'precision_curve_pending_pre_balances')
-  if (!hasPrecisionCurvePendingPreBalances) {
-    db.exec("ALTER TABLE positions ADD COLUMN precision_curve_pending_pre_balances TEXT")
-  }
-  const hasPrecisionCurvePendingStartedAt = cols.some((c: any) => c.name === 'precision_curve_pending_started_at')
-  if (!hasPrecisionCurvePendingStartedAt) {
-    db.exec("ALTER TABLE positions ADD COLUMN precision_curve_pending_started_at INTEGER")
-  }
-  db.exec("UPDATE positions SET entry_value_sol = basis_sol WHERE entry_value_sol IS NULL AND basis_sol > 0")
 }
