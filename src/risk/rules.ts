@@ -22,7 +22,7 @@ export function evaluateTrigger(
   }
 
   const baseTp = position.tpPercent ?? config.defaultTpPercent
-  const tp = currentPnlPercent <= config.maxDrawdownThreshold ? config.maxDrawdownTpOverride : baseTp
+  const tp = position.drawdownTpOverrideActive ? config.maxDrawdownTpOverride : baseTp
   const sl = position.slPercent ?? config.defaultSlPercent
   const trailDrop = config.trailingStopDropPct
 

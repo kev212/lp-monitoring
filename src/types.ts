@@ -33,6 +33,7 @@ export interface PositionRow {
   precisionCurveRangeHalf: number
   precisionCurveMovementLog: number[]
   precisionCurveRecoveryUntil: number | null
+  drawdownTpOverrideActive: boolean
   createdAt: number
   updatedAt: number
 }

@@ -45,6 +45,7 @@ function rowToPosition(row: any): PositionRow {
     precisionCurveRangeHalf: row.precision_curve_range_half ?? 100,
     precisionCurveMovementLog: safeParseJson(row.precision_curve_movement_log, []),
     precisionCurveRecoveryUntil: row.precision_curve_recovery_until ?? null,
+    drawdownTpOverrideActive: row.drawdown_tp_override_active === 1,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   }
@@ -182,4 +183,9 @@ export function updatePrecisionCurveMovementLog(pubkey: string, movements: numbe
 export function updatePrecisionCurveRecoveryUntil(pubkey: string, recoveryUntil: number | null): void {
   getDb().prepare('UPDATE positions SET precision_curve_recovery_until = ?, updated_at = ? WHERE position_pubkey = ?')
     .run(recoveryUntil, Date.now(), pubkey)
+}
+
+export function updateDrawdownTpOverride(pubkey: string, active: boolean): void {
+  getDb().prepare('UPDATE positions SET drawdown_tp_override_active = ?, updated_at = ? WHERE position_pubkey = ?')
+    .run(active ? 1 : 0, Date.now(), pubkey)
 }

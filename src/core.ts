@@ -17,6 +17,7 @@ import {
   updatePrecisionCurveRangeHalf,
   updatePrecisionCurveMovementLog,
   updatePrecisionCurveRecoveryUntil,
+  updateDrawdownTpOverride,
 } from './meteora/discovery.js'
 import {
   getAllPositionsForWallet,
@@ -423,14 +424,14 @@ async function monitorCycle(connection: Connection, walletPubkey: PublicKey, own
       const triggerInfo = pos.triggerConfirmations > 0
         ? `Conf: ${pos.triggerConfirmations}/${config.triggerConfirmations}`
         : 'Conf: 0'
-      const effectiveTp = pnlPercent <= config.maxDrawdownThreshold
+      const effectiveTp = pos.drawdownTpOverrideActive
         ? config.maxDrawdownTpOverride
         : (pos.tpPercent ?? config.defaultTpPercent)
       console.log(
         `[monitor] ${tokenLabel}${dupMarker} | ${pos.status} | PnL: ${pnlSign}${pnlPercent.toFixed(2)}% (${pnlSource})` +
         ` | Value: ${valuation.estimatedExitSol.toFixed(4)} SOL` +
         ` | Basis: ${pos.basisSol.toFixed(4)} SOL` +
-        ` | SL: ${pos.slPercent}% TP: +${effectiveTp}%${pnlPercent <= config.maxDrawdownThreshold ? ' (DD)' : ''}` +
+        ` | SL: ${pos.slPercent}% TP: +${effectiveTp}%${pos.drawdownTpOverrideActive ? ' (DD LOCK)' : ''}` +
         ` | Peak: ${pos.peakPnlPercent.toFixed(2)}%` +
         ` | ${triggerInfo}`
       )
@@ -513,6 +514,13 @@ async function monitorCycle(connection: Connection, walletPubkey: PublicKey, own
       }
       // --- end trailing ---
 
+      // --- Drawdown TP lock: sekali kena <= threshold, TP dikunci ke override selamanya ---
+      if (!pos.drawdownTpOverrideActive && pnlPercent <= config.maxDrawdownThreshold) {
+        pos.drawdownTpOverrideActive = true
+        updateDrawdownTpOverride(pos.positionPubkey, true)
+        console.log(`[drawdown] ${tokenLabel} | TP LOCKED to ${config.maxDrawdownTpOverride}% (PnL ${pnlPercent.toFixed(2)}% <= ${config.maxDrawdownThreshold}%)`)
+      }
+
       const binData: BinData = {
         upperBinId: valuation.upperBinId,
         poolActiveBinId: valuation.poolActiveBinId,
@@ -552,7 +560,7 @@ async function monitorCycle(connection: Connection, walletPubkey: PublicKey, own
           if (delta > 3) {
             // Cek apakah LP Agent sendiri masih trigger condition
             const sl = pos.slPercent ?? config.defaultSlPercent
-            const tp = pnlPercent <= config.maxDrawdownThreshold ? config.maxDrawdownTpOverride : (pos.tpPercent ?? config.defaultTpPercent)
+            const tp = pos.drawdownTpOverrideActive ? config.maxDrawdownTpOverride : (pos.tpPercent ?? config.defaultTpPercent)
             const lpPnl = lpAgentAtTrigger.pnlPercentNative
             let lpStillTriggers = false
             if (decision.triggerType === 'SL') {
@@ -653,7 +661,7 @@ async function monitorCycle(connection: Connection, walletPubkey: PublicKey, own
             }
 
             const sl = pos.slPercent ?? config.defaultSlPercent
-            const tp = usedPnlPct <= config.maxDrawdownThreshold ? config.maxDrawdownTpOverride : (pos.tpPercent ?? config.defaultTpPercent)
+            const tp = pos.drawdownTpOverrideActive ? config.maxDrawdownTpOverride : (pos.tpPercent ?? config.defaultTpPercent)
 
             let stillTriggers = false
             if (decision.triggerType === 'SL') {

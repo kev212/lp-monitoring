@@ -115,4 +115,8 @@ export function initSchema(db: Database.Database): void {
   if (!hasPrecisionCurveRecoveryUntil) {
     db.exec("ALTER TABLE positions ADD COLUMN precision_curve_recovery_until INTEGER")
   }
+  const hasDrawdownTpOverrideActive = cols.some((c: any) => c.name === 'drawdown_tp_override_active')
+  if (!hasDrawdownTpOverrideActive) {
+    db.exec("ALTER TABLE positions ADD COLUMN drawdown_tp_override_active INTEGER NOT NULL DEFAULT 0")
+  }
 }
