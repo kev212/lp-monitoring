@@ -27,6 +27,25 @@ export function initSchema(db: Database.Database): void {
       precision_curve_last_reshape_at INTEGER,
       precision_curve_busy INTEGER NOT NULL DEFAULT 0,
       precision_curve_threshold_bins INTEGER NOT NULL DEFAULT 5,
+      precision_curve_range_half INTEGER NOT NULL DEFAULT 100,
+      precision_curve_movement_log TEXT NOT NULL DEFAULT '[]',
+      precision_curve_recovery_until INTEGER,
+      flip_mode_enabled INTEGER NOT NULL DEFAULT 0,
+      flip_mode_busy INTEGER NOT NULL DEFAULT 0,
+      flip_mode_last_progress_pct REAL,
+      flip_mode_last_active_bin INTEGER,
+      flip_mode_last_flip_at INTEGER,
+      flip_mode_recovery_until INTEGER,
+      flip_mode_pending_add INTEGER NOT NULL DEFAULT 0,
+      flip_mode_pending_token_mint TEXT,
+      flip_mode_pending_token_side TEXT,
+      flip_mode_pending_token_amount TEXT,
+      flip_mode_pending_progress_pct REAL,
+      flip_mode_pending_active_bin INTEGER,
+      flip_mode_pending_since INTEGER,
+      flip_mode_pending_attempts INTEGER NOT NULL DEFAULT 0,
+      flip_mode_pending_last_error TEXT,
+      drawdown_tp_override_active INTEGER NOT NULL DEFAULT 0,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
@@ -118,5 +137,65 @@ export function initSchema(db: Database.Database): void {
   const hasDrawdownTpOverrideActive = cols.some((c: any) => c.name === 'drawdown_tp_override_active')
   if (!hasDrawdownTpOverrideActive) {
     db.exec("ALTER TABLE positions ADD COLUMN drawdown_tp_override_active INTEGER NOT NULL DEFAULT 0")
+  }
+  const hasFlipModeEnabled = cols.some((c: any) => c.name === 'flip_mode_enabled')
+  if (!hasFlipModeEnabled) {
+    db.exec("ALTER TABLE positions ADD COLUMN flip_mode_enabled INTEGER NOT NULL DEFAULT 0")
+  }
+  const hasFlipModeBusy = cols.some((c: any) => c.name === 'flip_mode_busy')
+  if (!hasFlipModeBusy) {
+    db.exec("ALTER TABLE positions ADD COLUMN flip_mode_busy INTEGER NOT NULL DEFAULT 0")
+  }
+  const hasFlipModeLastProgressPct = cols.some((c: any) => c.name === 'flip_mode_last_progress_pct')
+  if (!hasFlipModeLastProgressPct) {
+    db.exec("ALTER TABLE positions ADD COLUMN flip_mode_last_progress_pct REAL")
+  }
+  const hasFlipModeLastActiveBin = cols.some((c: any) => c.name === 'flip_mode_last_active_bin')
+  if (!hasFlipModeLastActiveBin) {
+    db.exec("ALTER TABLE positions ADD COLUMN flip_mode_last_active_bin INTEGER")
+  }
+  const hasFlipModeLastFlipAt = cols.some((c: any) => c.name === 'flip_mode_last_flip_at')
+  if (!hasFlipModeLastFlipAt) {
+    db.exec("ALTER TABLE positions ADD COLUMN flip_mode_last_flip_at INTEGER")
+  }
+  const hasFlipModeRecoveryUntil = cols.some((c: any) => c.name === 'flip_mode_recovery_until')
+  if (!hasFlipModeRecoveryUntil) {
+    db.exec("ALTER TABLE positions ADD COLUMN flip_mode_recovery_until INTEGER")
+  }
+  const hasFlipModePendingAdd = cols.some((c: any) => c.name === 'flip_mode_pending_add')
+  if (!hasFlipModePendingAdd) {
+    db.exec("ALTER TABLE positions ADD COLUMN flip_mode_pending_add INTEGER NOT NULL DEFAULT 0")
+  }
+  const hasFlipModePendingTokenMint = cols.some((c: any) => c.name === 'flip_mode_pending_token_mint')
+  if (!hasFlipModePendingTokenMint) {
+    db.exec("ALTER TABLE positions ADD COLUMN flip_mode_pending_token_mint TEXT")
+  }
+  const hasFlipModePendingTokenSide = cols.some((c: any) => c.name === 'flip_mode_pending_token_side')
+  if (!hasFlipModePendingTokenSide) {
+    db.exec("ALTER TABLE positions ADD COLUMN flip_mode_pending_token_side TEXT")
+  }
+  const hasFlipModePendingTokenAmount = cols.some((c: any) => c.name === 'flip_mode_pending_token_amount')
+  if (!hasFlipModePendingTokenAmount) {
+    db.exec("ALTER TABLE positions ADD COLUMN flip_mode_pending_token_amount TEXT")
+  }
+  const hasFlipModePendingProgressPct = cols.some((c: any) => c.name === 'flip_mode_pending_progress_pct')
+  if (!hasFlipModePendingProgressPct) {
+    db.exec("ALTER TABLE positions ADD COLUMN flip_mode_pending_progress_pct REAL")
+  }
+  const hasFlipModePendingActiveBin = cols.some((c: any) => c.name === 'flip_mode_pending_active_bin')
+  if (!hasFlipModePendingActiveBin) {
+    db.exec("ALTER TABLE positions ADD COLUMN flip_mode_pending_active_bin INTEGER")
+  }
+  const hasFlipModePendingSince = cols.some((c: any) => c.name === 'flip_mode_pending_since')
+  if (!hasFlipModePendingSince) {
+    db.exec("ALTER TABLE positions ADD COLUMN flip_mode_pending_since INTEGER")
+  }
+  const hasFlipModePendingAttempts = cols.some((c: any) => c.name === 'flip_mode_pending_attempts')
+  if (!hasFlipModePendingAttempts) {
+    db.exec("ALTER TABLE positions ADD COLUMN flip_mode_pending_attempts INTEGER NOT NULL DEFAULT 0")
+  }
+  const hasFlipModePendingLastError = cols.some((c: any) => c.name === 'flip_mode_pending_last_error')
+  if (!hasFlipModePendingLastError) {
+    db.exec("ALTER TABLE positions ADD COLUMN flip_mode_pending_last_error TEXT")
   }
 }

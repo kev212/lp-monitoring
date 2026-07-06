@@ -18,6 +18,13 @@ import {
   updatePrecisionCurveMovementLog,
   updatePrecisionCurveRecoveryUntil,
   updateDrawdownTpOverride,
+  updateFlipModeBusy,
+  updateFlipModeState,
+  updateFlipModeRecoveryUntil,
+  setFlipModePendingAdd,
+  updateFlipModePendingAttempt,
+  updateFlipModePendingAmount,
+  clearFlipModePendingAdd,
 } from './meteora/discovery.js'
 import {
   getAllPositionsForWallet,
@@ -30,6 +37,7 @@ import { estimateExitValue, clearPnlCache } from './meteora/valuation.js'
 import { fetchLpAgentPositions } from './lpagent.js'
 import { executeExit } from './meteora/exit.js'
 import { executeDirectionalPrecisionCurve, THRESHOLD_RATIO, THRESHOLD_MIN, RECOVERY_MS } from './meteora/precisionCurve.js'
+import { calculateFlipProgressPct, executeFlipMode, retryPendingFlipAdd } from './meteora/flipMode.js'
 import { evaluateTrigger, type BinData } from './risk/rules.js'
 import {
   sendNotification,
@@ -54,6 +62,7 @@ const pendingTriggers = new Map<string, { triggerType: TriggerType; timestamp: n
 const DISCOVERY_INTERVAL_MS = 1 * 60 * 1000 // 1 menit
 const MAX_MONITOR_RETRIES = 5
 const PRECISION_CURVE_COOLDOWN_MS = 5_000
+const FLIP_MODE_RECOVERY_MS = 10_000
 const LP_AGENT_GUARD_MIN_INTERVAL_MS = 12_500
 let lastLpAgentGuardAt = 0
 
@@ -217,6 +226,25 @@ async function discoverInitialPositions(connection: Connection, walletPubkey: Pu
         // LP Agent check failed, use defaults
       }
 
+      // --- Auto Flip Mode for new positions: single-side quote only ---
+      let flipModeEnabled = false
+      let flipModeReason = ''
+      if (val) {
+        const txMintIsQuote = tokenXMint === SOL_MINT || tokenXMint === USDC_MINT
+        const tyMintIsQuote = tokenYMint === SOL_MINT || tokenYMint === USDC_MINT
+        if (txMintIsQuote) {
+          if (val.allTimeDepositTokenXAmount > 0 && val.allTimeDepositTokenYAmount === 0) {
+            flipModeEnabled = true
+            flipModeReason = 'auto: single-side quote'
+          }
+        } else if (tyMintIsQuote) {
+          if (val.allTimeDepositTokenYAmount > 0 && val.allTimeDepositTokenXAmount === 0) {
+            flipModeEnabled = true
+            flipModeReason = 'auto: single-side quote'
+          }
+        }
+      }
+
       upsertPosition({
         positionPubkey: dp.positionPubkey,
         poolPubkey: dp.poolPubkey,
@@ -237,6 +265,7 @@ async function discoverInitialPositions(connection: Connection, walletPubkey: Pu
         lastEstimatedExitSol: null,
         lastSeenAt: Date.now(),
         strategy,
+        flipModeEnabled,
       })
 
       sendNotification(formatPositionDiscovered(
@@ -246,11 +275,12 @@ async function discoverInitialPositions(connection: Connection, walletPubkey: Pu
         currentValue, pnlPct, val?.solUsdPrice || 0, ownerStr,
         val?.tokenXAmount, val?.tokenYAmount,
         val?.tokenXFees, val?.tokenYFees,
-        strategy, slPercent, tpPercent
+        strategy, slPercent, tpPercent,
+        flipModeEnabled, flipModeReason
       ))
       const isDupeDiscovery = loadKnownPositions().some(p => p.tokenXMint === tokenXMint && p.positionPubkey !== dp.positionPubkey)
       const dupMarkerDisc = isDupeDiscovery ? ' [DUPE-TOKEN]' : ''
-      console.log(`[discovery] registered position ${dp.positionPubkey.slice(0, 8)}${dupMarkerDisc} strategy=${strategy} SL=${slPercent}% TP=${tpPercent}% basis=${finalBasis.toFixed(4)}`)
+      console.log(`[discovery] registered position ${dp.positionPubkey.slice(0, 8)}${dupMarkerDisc} strategy=${strategy} SL=${slPercent}% TP=${tpPercent}% basis=${finalBasis.toFixed(4)}${flipModeEnabled ? ' flip=ON(' + flipModeReason + ')' : ''}`)
     } catch (err) {
       console.log(`[discovery] failed on ${dp.positionPubkey.slice(0, 8)}: ${err instanceof Error ? err.message : 'unknown'}`)
     }
@@ -438,8 +468,8 @@ async function monitorCycle(connection: Connection, walletPubkey: PublicKey, own
 
       // --- LP Agent Spike Guard: prevent fake positive spikes from corrupting peak/trailing ---
       let canTrustPeak = true
-      if (pos.precisionCurveEnabled) {
-        // precision curve: LP Agent PnL unreliable, skip spike guard
+      if (pos.precisionCurveEnabled || pos.flipModeEnabled || pos.flipModePendingAdd) {
+        // reshaped positions: LP Agent PnL can diverge from Meteora net basis, skip spike guard
       } else if (pnlPercent > 0) {
         const spikeFromPeak = pnlPercent > pos.peakPnlPercent + 5
         const spikeFromLast = pos.lastPnlPercent !== null && (pnlPercent - pos.lastPnlPercent) > 5
@@ -480,6 +510,13 @@ async function monitorCycle(connection: Connection, walletPubkey: PublicKey, own
       if (pos.precisionCurveEnabled) {
         const recoveryUntil = pos.precisionCurveRecoveryUntil ?? 0
         if (pos.precisionCurveBusy || Date.now() < recoveryUntil) {
+          canTrustPeak = false
+        }
+      }
+
+      if (pos.flipModeEnabled || pos.flipModePendingAdd) {
+        const recoveryUntil = pos.flipModeRecoveryUntil ?? 0
+        if (pos.flipModeBusy || pos.flipModePendingAdd || Date.now() < recoveryUntil) {
           canTrustPeak = false
         }
       }
@@ -526,6 +563,9 @@ async function monitorCycle(connection: Connection, walletPubkey: PublicKey, own
         poolActiveBinId: valuation.poolActiveBinId,
       }
 
+      const flipHandled = await maybeRunFlipMode(pos, valuation.lowerBinId, valuation.upperBinId, valuation.poolActiveBinId)
+      if (flipHandled) continue
+
       const precisionHandled = await maybeRunPrecisionCurve(pos, valuation.lowerBinId, valuation.upperBinId, valuation.poolActiveBinId)
       if (precisionHandled) continue
 
@@ -552,8 +592,8 @@ async function monitorCycle(connection: Connection, walletPubkey: PublicKey, own
         }
 
         // Validate trigger with LP Agent — only block if delta > 3% AND LP Agent itself doesn't trigger
-        if (pos.precisionCurveEnabled) {
-          // precision curve position: LP Agent PnL also corrupted by reshapes
+        if (pos.precisionCurveEnabled || pos.flipModeEnabled || pos.flipModePendingAdd) {
+          // reshaped position: LP Agent PnL also corrupted by remove/add cycles
           // trust corrected Meteora PnL (net deposit basis)
         } else if (lpAgentAtTrigger) {
           const delta = Math.abs(pnlPercent - lpAgentAtTrigger.pnlPercentNative)
@@ -651,7 +691,7 @@ async function monitorCycle(connection: Connection, walletPubkey: PublicKey, own
             // Cross-check: LP Agent independent PnL vs Meteora PnL
             let usedPnlPct = freshPnlPct
             let usedPnlSource = 'meteora'
-            if (!pos.precisionCurveEnabled && recheckLpAgent) {
+            if (!pos.precisionCurveEnabled && !pos.flipModeEnabled && !pos.flipModePendingAdd && recheckLpAgent) {
               const delta = Math.abs(freshPnlPct - recheckLpAgent.pnlPercentNative)
               if (delta > 3) {
                 console.log(`[recheck] ${tokenLabel} | DELTA ${delta.toFixed(1)}%: meteora=${freshPnlPct.toFixed(2)}% vs lpagent=${recheckLpAgent.pnlPercentNative.toFixed(2)}% — using lpagent`)
@@ -779,6 +819,234 @@ async function monitorCycle(connection: Connection, walletPubkey: PublicKey, own
     } catch (err) {
       console.log(`[monitor] error on ${pos.positionPubkey.slice(0, 8)}: ${err instanceof Error ? err.message : 'unknown'}`)
     }
+  }
+}
+
+async function maybeRunFlipMode(
+  pos: PositionRow,
+  lowerBinId?: number,
+  upperBinId?: number,
+  poolActiveBinId?: number,
+): Promise<boolean> {
+  const tokenLabel = `${pos.tokenXSymbol || pos.tokenXMint.slice(0, 4)}/${pos.tokenYSymbol || pos.tokenYMint.slice(0, 4)}`
+
+  if (pos.flipModePendingAdd) {
+    if (pos.flipModeBusy) {
+      console.log(`[flip] ${tokenLabel} | add-back retry already busy`)
+      return true
+    }
+
+    updateFlipModeBusy(pos.positionPubkey, true)
+    const result = await retryPendingFlipAdd(getConnection(), getWallet(), pos)
+    const remaining = BigInt(result.tokenAmountRemaining || '0')
+    const attempted = BigInt(result.tokenAmountAttempted || '0')
+
+    if (result.success) {
+      if (remaining > 0n) {
+        updateFlipModePendingAmount(
+          pos.positionPubkey,
+          remaining.toString(),
+          `partial add-back succeeded, remaining=${remaining.toString()}`,
+        )
+        console.log(`[flip] ${tokenLabel} | partial add-back succeeded: attempted=${attempted} remaining=${remaining}`)
+        sendNotification(
+          `🔁 <b>Flip Mode Add-back Partial</b>\n\n` +
+          `<b>${tokenLabel}</b>\n` +
+          `Added: <code>${attempted.toString()}</code>\n` +
+          `Remaining: <code>${remaining.toString()}</code>\n` +
+          `Will retry remaining amount next cycle.\n` +
+          `Add: ${result.addSignature ? `<a href="https://solscan.io/tx/${result.addSignature}">${result.addSignature.slice(0, 6)}..${result.addSignature.slice(-4)}</a>` : '-'}`
+        )
+        return true
+      }
+
+      clearFlipModePendingAdd(pos.positionPubkey)
+      const progress = pos.flipModePendingProgressPct ?? pos.flipModeLastProgressPct
+      const activeBin = result.activeBinId ?? pos.flipModePendingActiveBin ?? pos.flipModeLastActiveBin
+      if (progress !== null && progress !== undefined && activeBin !== null && activeBin !== undefined) {
+        updateFlipModeState(pos.positionPubkey, progress, activeBin, Date.now())
+      }
+      updateFlipModeRecoveryUntil(pos.positionPubkey, Date.now() + FLIP_MODE_RECOVERY_MS)
+      console.log(`[flip] ${tokenLabel} | pending add-back complete: add=${result.addSignature || 'n/a'}`)
+      sendNotification(
+        `✅ <b>Flip Mode Add-back Complete</b>\n\n` +
+        `<b>${tokenLabel}</b>\n` +
+        `Amount: <code>${attempted.toString()}</code>\n` +
+        `Active bin: <b>${activeBin ?? '-'}</b>\n` +
+        `Range: <b>${result.lowerBinId ?? '-'}-${result.upperBinId ?? '-'}</b>\n` +
+        `Slippage: <b>${result.addSlippage ?? '-'}</b>\n` +
+        `Add: ${result.addSignature ? `<a href="https://solscan.io/tx/${result.addSignature}">${result.addSignature.slice(0, 6)}..${result.addSignature.slice(-4)}</a>` : '-'}`
+      )
+      return true
+    }
+
+    const currentPending = BigInt(pos.flipModePendingTokenAmount || '0')
+    if (remaining >= 0n && remaining < currentPending) {
+      if (remaining === 0n) {
+        clearFlipModePendingAdd(pos.positionPubkey)
+        const progress = pos.flipModePendingProgressPct ?? pos.flipModeLastProgressPct
+        const activeBin = result.activeBinId ?? pos.flipModePendingActiveBin ?? pos.flipModeLastActiveBin
+        if (progress !== null && progress !== undefined && activeBin !== null && activeBin !== undefined) {
+          updateFlipModeState(pos.positionPubkey, progress, activeBin, Date.now())
+        }
+        updateFlipModeRecoveryUntil(pos.positionPubkey, Date.now() + FLIP_MODE_RECOVERY_MS)
+        console.log(`[flip] ${tokenLabel} | pending add-back complete after partial return: add=${result.addSignature || 'n/a'}`)
+        sendNotification(
+          `✅ <b>Flip Mode Add-back Complete</b>\n\n` +
+          `<b>${tokenLabel}</b>\n` +
+          `Amount: <code>${attempted.toString()}</code>\n` +
+          `Add: ${result.addSignature ? `<a href="https://solscan.io/tx/${result.addSignature}">${result.addSignature.slice(0, 6)}..${result.addSignature.slice(-4)}</a>` : '-'}`
+        )
+        return true
+      }
+
+      updateFlipModePendingAmount(
+        pos.positionPubkey,
+        remaining.toString(),
+        result.error || `partial add-back succeeded, remaining=${remaining.toString()}`,
+      )
+      console.log(`[flip] ${tokenLabel} | partial add-back persisted: pending ${currentPending} -> ${remaining}`)
+      sendNotification(
+        `🔁 <b>Flip Mode Add-back Partial</b>\n\n` +
+        `<b>${tokenLabel}</b>\n` +
+        `Previous pending: <code>${currentPending.toString()}</code>\n` +
+        `Remaining: <code>${remaining.toString()}</code>\n` +
+        `Reason: <code>${result.error || 'partial add-back'}</code>\n\n` +
+        `Bot will retry the remaining amount next cycle.`
+      )
+      return true
+    }
+
+    const nextAttempt = pos.flipModePendingAttempts + 1
+    updateFlipModePendingAttempt(pos.positionPubkey, result.error || 'unknown error')
+    console.log(`[flip] ${tokenLabel} | pending add-back retry ${nextAttempt} failed: ${result.error || 'unknown error'}`)
+    if (nextAttempt === 1 || nextAttempt % 5 === 0) {
+      sendNotification(
+        `🔁 <b>Flip Mode Add-back Retrying</b>\n\n` +
+        `<b>${tokenLabel}</b>\n` +
+        `Attempt: <b>${nextAttempt}</b>\n` +
+        `Pending amount: <code>${pos.flipModePendingTokenAmount || '0'}</code>\n` +
+        `Reason: <code>${result.error || 'unknown error'}</code>\n\n` +
+        `Bot will keep retrying until add-back succeeds.`
+      )
+    }
+    return true
+  }
+
+  if (!pos.flipModeEnabled) return false
+  if (pos.flipModeBusy) {
+    console.log(`[flip] ${tokenLabel} | busy — skip trigger evaluation this cycle`)
+    return true
+  }
+
+  if (lowerBinId === undefined || upperBinId === undefined || poolActiveBinId === undefined) {
+    console.log(`[flip] ${tokenLabel} | missing bin data — skip`)
+    return false
+  }
+
+  if (poolActiveBinId < lowerBinId || poolActiveBinId > upperBinId) {
+    console.log(`[flip] ${tokenLabel} | active bin ${poolActiveBinId} outside range ${lowerBinId}-${upperBinId} — skip`)
+    return false
+  }
+
+  const progressPct = calculateFlipProgressPct(lowerBinId, upperBinId, poolActiveBinId)
+  if (progressPct === null) return false
+
+  const lastProgress = pos.flipModeLastProgressPct
+  const nextTrigger = lastProgress === null
+    ? config.flipModeInitialTriggerPct
+    : lastProgress + config.flipModeRepeatStepPct
+
+  if (progressPct < nextTrigger) return false
+
+  console.log(`[flip] ${tokenLabel} | trigger progress=${progressPct.toFixed(2)}% next=${nextTrigger.toFixed(2)}% activeBin=${poolActiveBinId}`)
+  sendNotification(
+    `🔁 <b>Flip Mode — Starting</b>\n\n` +
+    `<b>${tokenLabel}</b>\n` +
+    `Progress: <b>${progressPct.toFixed(2)}%</b>\n` +
+    `Trigger: <b>${nextTrigger.toFixed(2)}%</b>\n` +
+    `Active bin: <b>${poolActiveBinId}</b>\n` +
+    `Range: <b>${lowerBinId}-${upperBinId}</b>\n` +
+    `Action: withdraw non-quote token liquidity, add back as BidAsk.`
+  )
+
+  updateFlipModeBusy(pos.positionPubkey, true)
+  try {
+    const result = await executeFlipMode(getConnection(), getWallet(), pos, progressPct)
+    const activeBin = result.activeBinId ?? poolActiveBinId
+
+    if (result.success) {
+      updateFlipModeState(pos.positionPubkey, progressPct, activeBin, Date.now())
+      updateFlipModeRecoveryUntil(pos.positionPubkey, Date.now() + FLIP_MODE_RECOVERY_MS)
+
+      if (result.noop) {
+        console.log(`[flip] ${tokenLabel} | no-op complete at progress=${progressPct.toFixed(2)}%`)
+        sendNotification(
+          `ℹ️ <b>Flip Mode — No-op</b>\n\n` +
+          `<b>${tokenLabel}</b>\n` +
+          `Progress: <b>${progressPct.toFixed(2)}%</b>\n` +
+          `No token-only liquidity found.\n` +
+          `Baseline updated; next trigger at <b>${(progressPct + config.flipModeRepeatStepPct).toFixed(2)}%</b>.`
+        )
+        return true
+      }
+
+      console.log(`[flip] ${tokenLabel} | complete: remove=${result.removeSignatures.at(-1) || 'n/a'} add=${result.addSignature || 'n/a'}`)
+      sendNotification(
+        `✅ <b>Flip Mode Complete</b>\n\n` +
+        `<b>${tokenLabel}</b>\n` +
+        `Progress: <b>${progressPct.toFixed(2)}%</b>\n` +
+        `Token side: <b>${result.tokenSide ?? '-'}</b>\n` +
+        `Token amount: <code>${result.tokenAmount}</code>\n` +
+        `Remove ranges: <b>${result.removeRanges.map(r => r.from === r.to ? `${r.from}` : `${r.from}-${r.to}`).join(',') || '-'}</b>\n` +
+        `Add range: <b>${result.addLowerBinId ?? '-'}-${result.addUpperBinId ?? '-'}</b>\n` +
+        `Remove: ${result.removeSignatures.length > 0 ? `<a href="https://solscan.io/tx/${result.removeSignatures.at(-1)}">${result.removeSignatures.at(-1)!.slice(0, 6)}..${result.removeSignatures.at(-1)!.slice(-4)}</a>` : '-'}\n` +
+        `Add: ${result.addSignature ? `<a href="https://solscan.io/tx/${result.addSignature}">${result.addSignature.slice(0, 6)}..${result.addSignature.slice(-4)}</a>` : '-'}`
+      )
+      return true
+    }
+
+    if (result.pendingAdd && result.tokenMint && result.tokenSide) {
+      setFlipModePendingAdd(pos.positionPubkey, {
+        tokenMint: result.tokenMint,
+        tokenSide: result.tokenSide,
+        tokenAmount: result.tokenAmount,
+        progressPct,
+        activeBin,
+        error: result.error || 'add-back pending retry',
+      })
+      console.log(`[flip] ${tokenLabel} | add-back pending: amount=${result.tokenAmount} error=${result.error || 'unknown'}`)
+      sendNotification(
+        `🔁 <b>Flip Mode Add-back Pending</b>\n\n` +
+        `<b>${tokenLabel}</b>\n` +
+        `Token amount: <code>${result.tokenAmount}</code>\n` +
+        `Remove: ${result.removeSignatures.length > 0 ? `<a href="https://solscan.io/tx/${result.removeSignatures.at(-1)}">${result.removeSignatures.at(-1)!.slice(0, 6)}..${result.removeSignatures.at(-1)!.slice(-4)}</a>` : '-'}\n` +
+        `Reason: <code>${result.error || 'unknown error'}</code>\n\n` +
+        `Bot will keep retrying until BidAsk add-back succeeds.`
+      )
+      return true
+    }
+
+    updateFlipModeBusy(pos.positionPubkey, false)
+    console.log(`[flip] ${tokenLabel} | not completed, will retry when trigger is still valid: ${result.error || 'unknown error'}`)
+    sendNotification(
+      `⚠️ <b>Flip Mode Not Completed</b>\n\n` +
+      `<b>${tokenLabel}</b>\n` +
+      `Reason: <code>${result.error || 'unknown error'}</code>\n` +
+      `No pending add-back was created. Bot will retry on the next valid cycle.`
+    )
+    return true
+  } catch (err) {
+    updateFlipModeBusy(pos.positionPubkey, false)
+    const message = err instanceof Error ? err.message : 'unknown error'
+    console.log(`[flip] ${tokenLabel} | error, will retry: ${message}`)
+    sendNotification(
+      `⚠️ <b>Flip Mode Retry Needed</b>\n\n` +
+      `<b>${tokenLabel}</b>\n` +
+      `Reason: <code>${message}</code>\n` +
+      `Bot will retry on the next valid cycle.`
+    )
+    return true
   }
 }
 

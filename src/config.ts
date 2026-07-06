@@ -45,6 +45,8 @@ export const config: Config = {
   binRangeDistanceRatio: envNum('BIN_RANGE_DISTANCE_RATIO', 0.05),
   maxDrawdownThreshold: envNum('MAX_DRAWDOWN_THRESHOLD', -6),
   maxDrawdownTpOverride: envNum('MAX_DRAWDOWN_TP_OVERRIDE', 2),
+  flipModeInitialTriggerPct: envNum('FLIP_MODE_INITIAL_TRIGGER_PCT', 40),
+  flipModeRepeatStepPct: envNum('FLIP_MODE_REPEAT_STEP_PCT', 5),
   dbPath: envStr('DB_PATH', './monitoring-lp.sqlite'),
   logLevel: envStr('LOG_LEVEL', 'info'),
 }

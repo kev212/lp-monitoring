@@ -6,7 +6,7 @@
  * No external price oracles — pure Meteora data.
  */
 const PNL_API_BASE = 'https://dlmm.datapi.meteora.ag/positions'
-const CACHE_TTL_MS = 2_000
+const CACHE_TTL_MS = 0
 
 interface PnlPositionData {
   pnlPctChange?: string | number
@@ -19,7 +19,11 @@ interface PnlPositionData {
     unclaimedFeeTokenX?: { amountSol?: string | number; usd?: string | number }
     unclaimedFeeTokenY?: { amountSol?: string | number; usd?: string | number }
   }
-  allTimeDeposits?: { total?: { sol?: string | number; usd?: string | number } }
+  allTimeDeposits?: {
+    total?: { sol?: string | number; usd?: string | number }
+    tokenX?: { amount?: string | number; usd?: string | number; amountSol?: string | number }
+    tokenY?: { amount?: string | number; usd?: string | number; amountSol?: string | number }
+  }
   allTimeWithdrawals?: { total?: { sol?: string | number; usd?: string | number } }
   allTimeFees?: { total?: { sol?: string | number; usd?: string | number } }
   feePerTvl24h?: string | number
@@ -38,6 +42,8 @@ export interface ValuationResult {
   tokenYValueSol: number
   depositEstimateSol: number
   allTimeDepositSol: number
+  allTimeDepositTokenXAmount: number
+  allTimeDepositTokenYAmount: number
   allTimeWithdrawalSol: number
   tokenXAmount: number
   tokenYAmount: number
@@ -143,6 +149,8 @@ export async function estimateExitValue(
           tokenYValueSol: 0,
           depositEstimateSol: Math.max(0, balancesSol - pnlSol),
           allTimeDepositSol: Number(pnlData.allTimeDeposits?.total?.sol || 0),
+          allTimeDepositTokenXAmount: Number(pnlData.allTimeDeposits?.tokenX?.amount || 0),
+          allTimeDepositTokenYAmount: Number(pnlData.allTimeDeposits?.tokenY?.amount || 0),
           allTimeWithdrawalSol: Number(pnlData.allTimeWithdrawals?.total?.sol || 0),
           tokenXAmount: 0,
           tokenYAmount: 0,

@@ -1,8 +1,16 @@
 import TelegramBot from 'node-telegram-bot-api'
 import { config } from './config.js'
-import { loadActivePositions, updatePrecisionCurveEnabled, updatePrecisionCurveThreshold } from './meteora/discovery.js'
+import { loadActivePositions, updateFlipModeEnabled, updatePrecisionCurveEnabled, updatePrecisionCurveThreshold } from './meteora/discovery.js'
+import { getDb } from './db/client.js'
 
 let _bot: TelegramBot | null = null
+
+const TELEGRAM_COMMANDS = [
+  { command: 'status', description: 'Show all active positions & PnL' },
+  { command: 'precision', description: 'Precision Curve settings menu' },
+  { command: 'flip', description: 'Flip Mode settings menu' },
+  { command: 'help', description: 'List all available commands' },
+]
 
 function getBot(): TelegramBot | null {
   if (!config.telegramBotToken || !config.telegramChatId) return null
@@ -30,11 +38,39 @@ function isAllowedChat(chatId: number | string): boolean {
 }
 
 function setupCommandHandlers(bot: TelegramBot): void {
-  bot.setMyCommands([
-    { command: 'status', description: 'Show all active positions & PnL' },
-    { command: 'precision', description: 'Precision Curve settings menu' },
-    { command: 'help', description: 'List all available commands' },
-  ]).catch(err => console.log(`[telegram] setMyCommands failed: ${err.message}`))
+  const db = getDb()
+  const wiped = db.prepare("SELECT value FROM sync_state WHERE key = 'telegram_commands_wiped_v2'").get() as any
+
+  if (!wiped || wiped.value !== '1') {
+    const scopes: Array<{ scope?: { type: string }; label: string }> = [
+      { scope: { type: 'default' }, label: 'default' },
+      { scope: { type: 'all_private_chats' }, label: 'all_private_chats' },
+      { scope: { type: 'all_group_chats' }, label: 'all_group_chats' },
+      { scope: { type: 'all_chat_administrators' }, label: 'all_chat_administrators' },
+    ]
+    const failures: string[] = []
+
+    ;(async () => {
+      for (const s of scopes) {
+        try {
+          await (bot as any).setMyCommands(TELEGRAM_COMMANDS, s.scope ? { scope: s.scope } : {})
+        } catch (err: any) {
+          failures.push(`${s.label}: ${err.message}`)
+        }
+      }
+      if (failures.length > 0) {
+        console.log(`[telegram] wipe v2 failures: ${failures.join('; ')} — retrying next restart`)
+      } else {
+        db.prepare("INSERT OR REPLACE INTO sync_state (key, value, updated_at) VALUES ('telegram_commands_wiped_v2', '1', ?)").run(Date.now())
+        console.log('[telegram] wiped v2 all scopes with bot commands')
+      }
+      console.log(`[telegram] registered commands: ${TELEGRAM_COMMANDS.map(c => `/${c.command}`).join(', ')}`)
+    })().catch((err: any) => console.log(`[telegram] wipe v2 error: ${err.message}`))
+  } else {
+    bot.setMyCommands(TELEGRAM_COMMANDS)
+      .then(() => console.log(`[telegram] registered commands: ${TELEGRAM_COMMANDS.map(c => `/${c.command}`).join(', ')}`))
+      .catch(err => console.log(`[telegram] setMyCommands failed: ${err.message}`))
+  }
 
   bot.onText(/^\/status$/, msg => {
     if (!msg.chat || !isAllowedChat(msg.chat.id)) return
@@ -46,13 +82,16 @@ function setupCommandHandlers(bot: TelegramBot): void {
     sendPrecisionMenu(bot, msg.chat.id)
   })
 
+  bot.onText(/^\/flip(?:\s+(.+))?$/, msg => {
+    if (!msg.chat || !isAllowedChat(msg.chat.id)) return
+    sendFlipMenu(bot, msg.chat.id)
+  })
+
   bot.onText(/^\/help$/, msg => {
     if (!msg.chat || !isAllowedChat(msg.chat.id)) return
     bot.sendMessage(msg.chat.id,
       `📋 <b>Available Commands</b>\n\n` +
-      `/status — Show all active positions & PnL\n` +
-      `/precision — Precision Curve settings menu\n` +
-      `/help — List all available commands`,
+      TELEGRAM_COMMANDS.map(c => `/${c.command} — ${c.description}`).join('\n'),
       { parse_mode: 'HTML', disable_web_page_preview: true }
     ).catch(() => undefined)
   })
@@ -61,30 +100,47 @@ function setupCommandHandlers(bot: TelegramBot): void {
     const chatId = query.message?.chat.id
     if (!chatId || !isAllowedChat(chatId)) return
     const data = query.data || ''
-    if (!data.startsWith('pc:')) return
+    if (!data.startsWith('pc:') && !data.startsWith('flip:')) return
 
     const [, action, pubkey] = data.split(':')
     const positions = loadActivePositions()
     const pos = positions.find(p => p.positionPubkey === pubkey)
     if (!pos) {
       await bot.answerCallbackQuery(query.id, { text: 'Position not active' }).catch(() => undefined)
+      if (data.startsWith('flip:')) sendFlipMenu(bot, chatId)
+      else sendPrecisionMenu(bot, chatId)
+      return
+    }
+
+    if (data.startsWith('pc:')) {
+      if (action === 'on') {
+        updatePrecisionCurveEnabled(pos.positionPubkey, true, null)
+        updatePrecisionCurveThreshold(pos.positionPubkey, 5)
+        await bot.answerCallbackQuery(query.id, { text: 'Precision Curve enabled — Flip Mode disabled' }).catch(() => undefined)
+      } else if (action === 'off') {
+        updatePrecisionCurveEnabled(pos.positionPubkey, false)
+        await bot.answerCallbackQuery(query.id, { text: 'Precision Curve disabled' }).catch(() => undefined)
+      } else if (action === 'status') {
+        await bot.answerCallbackQuery(query.id, { text: precisionStatusText(pos), show_alert: true }).catch(() => undefined)
+        return
+      }
+
       sendPrecisionMenu(bot, chatId)
       return
     }
 
     if (action === 'on') {
-      updatePrecisionCurveEnabled(pos.positionPubkey, true, null)
-      updatePrecisionCurveThreshold(pos.positionPubkey, 5)
-      await bot.answerCallbackQuery(query.id, { text: 'Precision Curve enabled — initial reshape pending' }).catch(() => undefined)
+      updateFlipModeEnabled(pos.positionPubkey, true)
+      await bot.answerCallbackQuery(query.id, { text: 'Flip Mode enabled — Precision disabled' }).catch(() => undefined)
     } else if (action === 'off') {
-      updatePrecisionCurveEnabled(pos.positionPubkey, false)
-      await bot.answerCallbackQuery(query.id, { text: 'Precision Curve disabled' }).catch(() => undefined)
+      updateFlipModeEnabled(pos.positionPubkey, false)
+      await bot.answerCallbackQuery(query.id, { text: 'Flip Mode disabled' }).catch(() => undefined)
     } else if (action === 'status') {
-      await bot.answerCallbackQuery(query.id, { text: precisionStatusText(pos), show_alert: true }).catch(() => undefined)
+      await bot.answerCallbackQuery(query.id, { text: flipStatusText(pos), show_alert: true }).catch(() => undefined)
       return
     }
 
-    sendPrecisionMenu(bot, chatId)
+    sendFlipMenu(bot, chatId)
   })
 }
 
@@ -106,9 +162,10 @@ function sendStatusMenu(bot: TelegramBot, chatId: number | string): void {
       const value = p.lastEstimatedExitSol ?? 0
       const peak = p.peakPnlPercent ?? 0
       const trail = p.trailingActivated ? ' 🔻' : ''
+      const modes = `${p.precisionCurveEnabled ? ' Precision' : ''}${p.flipModeEnabled ? ' Flip' : ''}${p.flipModePendingAdd ? ' FlipPending' : ''}`
       return `${idx + 1}. ${emoji} <b>${label}</b> <code>${shortAddr(p.positionPubkey)}</code>\n` +
         `   PnL: <b>${sign}${pnl.toFixed(2)}%</b> | Value: <b>${value.toFixed(4)} SOL</b>\n` +
-        `   SL: <b>${p.slPercent}%</b> TP: <b>+${p.tpPercent}%</b> | Peak: <b>${peak.toFixed(2)}%</b>${trail}`
+        `   SL: <b>${p.slPercent}%</b> TP: <b>+${p.tpPercent}%</b> | Peak: <b>${peak.toFixed(2)}%</b>${trail}${modes}`
     }),
   ]
 
@@ -117,6 +174,47 @@ function sendStatusMenu(bot: TelegramBot, chatId: number | string): void {
     disable_web_page_preview: true,
   }).catch(err => {
     console.log(`[telegram] status menu failed: ${err.message}`)
+  })
+}
+
+function sendFlipMenu(bot: TelegramBot, chatId: number | string): void {
+  const positions = loadActivePositions()
+  if (positions.length === 0) {
+    bot.sendMessage(chatId, 'No active positions.', { parse_mode: 'HTML' }).catch(() => undefined)
+    return
+  }
+
+  const lines = [
+    `<b>Flip Mode</b>`,
+    sep(),
+    `Default: <b>off</b> | First trigger: <b>${config.flipModeInitialTriggerPct}%</b> | Repeat: <b>${config.flipModeRepeatStepPct}%</b>`,
+    `Withdraw non-SOL token-only liquidity and add back as BidAsk.`,
+    sep(),
+    ...positions.map((p, idx) => {
+      const label = `${p.tokenXSymbol || p.tokenXMint.slice(0, 4)}/${p.tokenYSymbol || p.tokenYMint.slice(0, 4)}`
+      const state = p.flipModeEnabled ? 'ON' : 'OFF'
+      const busy = p.flipModeBusy ? ' busy' : ''
+      const pending = p.flipModePendingAdd ? ' pending-add' : ''
+      const last = p.flipModeLastProgressPct === null ? '-' : `${p.flipModeLastProgressPct.toFixed(2)}%`
+      const next = nextFlipTriggerPct(p)
+      return `${idx + 1}. <b>${label}</b> <code>${shortAddr(p.positionPubkey)}</code> — <b>${state}</b>${busy}${pending}\nLast flip: <b>${last}</b> | Next trigger: <b>${next.toFixed(2)}%</b>`
+    })
+  ]
+
+  bot.sendMessage(chatId, lines.join('\n'), {
+    parse_mode: 'HTML',
+    disable_web_page_preview: true,
+    reply_markup: {
+      inline_keyboard: positions.flatMap(p => {
+        const label = `${p.tokenXSymbol || p.tokenXMint.slice(0, 4)}/${p.tokenYSymbol || p.tokenYMint.slice(0, 4)} ${shortAddr(p.positionPubkey)}`
+        return [[
+          { text: p.flipModeEnabled ? `Disable ${label}` : `Enable ${label}`, callback_data: `flip:${p.flipModeEnabled ? 'off' : 'on'}:${p.positionPubkey}` },
+          { text: 'Status', callback_data: `flip:status:${p.positionPubkey}` },
+        ]]
+      })
+    }
+  }).catch(err => {
+    console.log(`[telegram] flip menu failed: ${err.message}`)
   })
 }
 
@@ -167,6 +265,31 @@ function precisionStatusText(pos: ReturnType<typeof loadActivePositions>[number]
     `Last active bin: ${pos.precisionCurveLastActiveBin ?? '-'}`,
     `Last reshape: ${pos.precisionCurveLastReshapeAt ? new Date(pos.precisionCurveLastReshapeAt).toISOString() : '-'}`,
     `Busy: ${pos.precisionCurveBusy ? 'yes' : 'no'}`,
+  ].join('\n')
+}
+
+function nextFlipTriggerPct(pos: ReturnType<typeof loadActivePositions>[number]): number {
+  return pos.flipModeLastProgressPct === null
+    ? config.flipModeInitialTriggerPct
+    : pos.flipModeLastProgressPct + config.flipModeRepeatStepPct
+}
+
+function flipStatusText(pos: ReturnType<typeof loadActivePositions>[number]): string {
+  const label = `${pos.tokenXSymbol || pos.tokenXMint.slice(0, 4)}/${pos.tokenYSymbol || pos.tokenYMint.slice(0, 4)}`
+  return [
+    `${label} ${shortAddr(pos.positionPubkey)}`,
+    `Flip Mode: ${pos.flipModeEnabled ? 'ON' : 'OFF'}`,
+    `First trigger: ${config.flipModeInitialTriggerPct}%`,
+    `Repeat step: ${config.flipModeRepeatStepPct}%`,
+    `Last progress: ${pos.flipModeLastProgressPct === null ? '-' : `${pos.flipModeLastProgressPct.toFixed(2)}%`}`,
+    `Next trigger: ${nextFlipTriggerPct(pos).toFixed(2)}%`,
+    `Last active bin: ${pos.flipModeLastActiveBin ?? '-'}`,
+    `Last flip: ${pos.flipModeLastFlipAt ? new Date(pos.flipModeLastFlipAt).toISOString() : '-'}`,
+    `Busy: ${pos.flipModeBusy ? 'yes' : 'no'}`,
+    `Pending add: ${pos.flipModePendingAdd ? 'yes' : 'no'}`,
+    `Pending amount: ${pos.flipModePendingTokenAmount ?? '-'}`,
+    `Pending attempts: ${pos.flipModePendingAttempts}`,
+    `Last error: ${pos.flipModePendingLastError ?? '-'}`,
   ].join('\n')
 }
 
@@ -273,6 +396,9 @@ export function formatPositionDiscovered(
   slPercent?: number,
   /** TP percent */
   tpPercent?: number,
+  /** Flip mode auto status */
+  flipModeEnabled?: boolean,
+  flipModeReason?: string,
 ): string {
   const confidenceEmoji = confidence === 'high' ? '🟢' : confidence === 'medium' ? '🟡' : '⚪'
   const profitSol = valueSol - depositSol
@@ -313,6 +439,9 @@ export function formatPositionDiscovered(
     `Confidence: ${confidenceEmoji} <b>${confidence}</b>`,
     strategy ? `Strategy: <b>${strategy}</b>` : null,
     slPercent !== undefined && tpPercent !== undefined ? `SL: <b>${slPercent}%</b> | TP: <b>+${tpPercent}%</b>` : null,
+    flipModeEnabled !== undefined
+      ? `Flip Mode: <b>${flipModeEnabled ? `ON (${flipModeReason || 'auto'})` : 'OFF'}</b>`
+      : null,
     sep(),
     `Wallet: ${solscanAddr(wallet)} · ${gmgnWallet(wallet)}`,
   ].filter(Boolean).join('\n')
