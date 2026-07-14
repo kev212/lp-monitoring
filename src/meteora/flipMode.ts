@@ -2,14 +2,18 @@ import { Connection, Keypair, PublicKey } from '@solana/web3.js'
 import { BN } from '@coral-xyz/anchor'
 import { StrategyType } from '@meteora-ag/dlmm'
 import { clearPoolCache, getPool } from './positions.js'
+import { getSolPriceInUsd } from '../pricing.js'
 import type { PositionRow, TokenSide } from '../types.js'
 
 const BASIS_POINTS = new BN(10000)
+const DUST_USD_THRESHOLD = 0.1
 const REMOVE_DELAY_MS = 1500
-const MAX_BINS_PER_REMOVE = 100
+const MAX_BINS_PER_REMOVE = 69
 const SOL_MINT = 'So11111111111111111111111111111111111111112'
 const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
 const SLIPPAGE_LEVELS = [5]
+const MAX_BINS_SINGLE_TX = 69
+const PROTECTED_BIN_DISTANCE = 1
 
 function isQuoteMint(mint: string): boolean {
   return mint === SOL_MINT || mint === USDC_MINT
@@ -45,6 +49,7 @@ export interface FlipModeResult {
 
 export interface FlipAddBackResult {
   success: boolean
+  dustComplete?: boolean
   tokenAmountAttempted: string
   tokenAmountRemaining: string
   activeBinId: number | null
@@ -146,13 +151,15 @@ function formatRanges(ranges: Range[]): string {
   return ranges.map(r => r.from === r.to ? `${r.from}` : `${r.from}-${r.to}`).join(',')
 }
 
-function findTokenOnlyRanges(positionBinData: any[], quoteSide: TokenSide, tokenSide: TokenSide): Range[] {
+function findTokenOnlyRanges(positionBinData: any[], quoteSide: TokenSide, tokenSide: TokenSide, activeBinId: number): Range[] {
   const tokenOnlyBinIds: number[] = []
   for (const bin of positionBinData || []) {
     const tokenAmount = getBinSideAmount(bin, tokenSide)
     const quoteAmount = getBinSideAmount(bin, quoteSide)
     if (tokenAmount.gt(new BN(0)) && quoteAmount.isZero()) {
-      tokenOnlyBinIds.push(Number(bin.binId))
+      const binId = Number(bin.binId)
+      if (Math.abs(binId - activeBinId) <= PROTECTED_BIN_DISTANCE) continue
+      tokenOnlyBinIds.push(binId)
     }
   }
   return buildContiguousRanges(tokenOnlyBinIds)
@@ -186,6 +193,41 @@ async function sendAndConfirm(connection: Connection, wallet: Keypair, tx: any):
   return sig
 }
 
+async function getTokenAmountUsd(
+  pool: any,
+  tokenSide: TokenSide,
+  amount: bigint,
+  poolPubkey: string,
+): Promise<number> {
+  try {
+    const activeBin = pool.lbPair.activeId
+    const binStep = pool.lbPair.binStep
+    const pricePerLamport = Math.pow(1 + binStep / 10000, activeBin)
+
+    const quoteSide = tokenSide === 'X' ? 'Y' : 'X'
+    const quoteMint = quoteSide === 'Y'
+      ? pool.lbPair.tokenYMint.toBase58()
+      : pool.lbPair.tokenXMint.toBase58()
+
+    const valueInQuoteLamports = tokenSide === 'X'
+      ? Number(amount) * pricePerLamport
+      : Number(amount) / pricePerLamport
+
+    if (quoteMint === USDC_MINT) {
+      return valueInQuoteLamports / 1_000_000
+    }
+
+    if (quoteMint === SOL_MINT) {
+      const solPrice = await getSolPriceInUsd()
+      return valueInQuoteLamports / 1_000_000_000 * solPrice
+    }
+
+    return Infinity
+  } catch {
+    return Infinity
+  }
+}
+
 async function addBackBidAsk(
   connection: Connection,
   wallet: Keypair,
@@ -194,6 +236,7 @@ async function addBackBidAsk(
   tokenSide: TokenSide,
   tokenMint: string,
   amount: bigint,
+  removedBinCount?: number,
 ): Promise<FlipAddBackResult> {
   const result: FlipAddBackResult = {
     success: false,
@@ -213,30 +256,110 @@ async function addBackBidAsk(
   }
 
   try {
+    clearPoolCache()
+    const pool = await getPool(connection, new PublicKey(poolPubkey))
+    const position = await pool.getPosition(new PublicKey(positionPubkey))
+    if (!position) throw new Error('Position not found')
+
+    const lowerBinId = position.positionData.lowerBinId
+    const upperBinId = position.positionData.upperBinId
+    const activeBinId = pool.lbPair.activeId
+    result.lowerBinId = lowerBinId
+    result.upperBinId = upperBinId
+    result.activeBinId = activeBinId
+
+    const binCount = upperBinId - lowerBinId + 1
+    const addBinCount = removedBinCount ?? binCount
+
+    const usdValue = await getTokenAmountUsd(pool, tokenSide, amount, poolPubkey)
+    if (usdValue < DUST_USD_THRESHOLD) {
+      console.log(`[flip] add-back dust balance ($${usdValue.toFixed(6)} < $${DUST_USD_THRESHOLD}) — clearing pending`)
+      result.success = true
+      result.dustComplete = true
+      result.tokenAmountRemaining = '0'
+      result.activeBinId = pool.lbPair.activeId
+      result.lowerBinId = lowerBinId
+      result.upperBinId = upperBinId
+      return result
+    }
+
+    if (addBinCount <= MAX_BINS_SINGLE_TX) {
+      // Single-tx: addLiquidityByStrategy on full position range
+      let lastError = 'unknown error'
+      for (const slippage of SLIPPAGE_LEVELS) {
+        const preBalance = await getTokenBalance(connection, wallet, tokenMint)
+        try {
+          const addTx = await pool.addLiquidityByStrategy({
+            positionPubKey: new PublicKey(positionPubkey),
+            user: wallet.publicKey,
+            totalXAmount: tokenSide === 'X' ? new BN(amount.toString()) : new BN(0),
+            totalYAmount: tokenSide === 'Y' ? new BN(amount.toString()) : new BN(0),
+            strategy: {
+              minBinId: lowerBinId,
+              maxBinId: upperBinId,
+              strategyType: StrategyType.BidAsk,
+              singleSidedX: tokenSide === 'X',
+            },
+            slippage,
+          })
+
+          const sig = await sendAndConfirm(connection, wallet, addTx)
+          const txResult = await connection.getTransaction(sig, { maxSupportedTransactionVersion: 0 }).catch(() => null)
+          if (txResult?.meta?.err) {
+            const errMsg = typeof txResult.meta.err === 'string' ? txResult.meta.err : JSON.stringify(txResult.meta.err)
+            throw new Error(`add liquidity failed on-chain: ${errMsg}`)
+          }
+
+          result.addSignature = sig
+          result.addSignatures = [sig]
+          result.success = true
+          result.tokenAmountRemaining = '0'
+          result.addSlippage = slippage
+          result.lowerBinId = lowerBinId
+          result.upperBinId = upperBinId
+          console.log(`[flip] add-back tx (slippage=${slippage}, bins=${lowerBinId}-${upperBinId}): ${sig}`)
+          return result
+        } catch (err) {
+          lastError = err instanceof Error ? err.message : 'unknown error'
+          const postBalance = await getTokenBalance(connection, wallet, tokenMint)
+          const spent = preBalance > postBalance ? preBalance - postBalance : 0n
+          if (spent > 0n) {
+            const remaining = spent >= amount ? 0n : amount - spent
+            result.tokenAmountRemaining = remaining.toString()
+            result.success = remaining === 0n
+            result.addSlippage = slippage
+            result.error = result.success
+              ? undefined
+              : `partial add-back succeeded, remaining=${remaining.toString()}; last error: ${lastError}`
+            result.lowerBinId = lowerBinId
+            result.upperBinId = upperBinId
+            console.log(`[flip] partial add-back: spent=${spent} remaining=${remaining} lastError=${lastError}`)
+            return result
+          }
+          console.log(`[flip] add-back failed before spending tokens (slippage=${slippage}): ${lastError}`)
+          await sleep(800)
+        }
+      }
+      result.error = lastError
+      result.lowerBinId = lowerBinId
+      result.upperBinId = upperBinId
+      return result
+    }
+
+    // addBinCount > MAX_BINS_SINGLE_TX: chunked via addLiquidityByStrategyChunkable
+    console.log(`[flip] add-back chunked: ${addBinCount} bins (full range ${lowerBinId}-${upperBinId})`)
+
+    let totalSpent = 0n
     let lastError = 'unknown error'
 
     for (const slippage of SLIPPAGE_LEVELS) {
       const preBalance = await getTokenBalance(connection, wallet, tokenMint)
       try {
-        clearPoolCache()
-        const pool = await getPool(connection, new PublicKey(poolPubkey))
-        const position = await pool.getPosition(new PublicKey(positionPubkey))
-        if (!position) throw new Error('Position not found')
-
-        const lowerBinId = position.positionData.lowerBinId
-        const upperBinId = position.positionData.upperBinId
-        const activeBinId = pool.lbPair.activeId
-        result.lowerBinId = lowerBinId
-        result.upperBinId = upperBinId
-        result.activeBinId = activeBinId
-
-        const totalXAmount = tokenSide === 'X' ? new BN(amount.toString()) : new BN(0)
-        const totalYAmount = tokenSide === 'Y' ? new BN(amount.toString()) : new BN(0)
         const addTxs = await pool.addLiquidityByStrategyChunkable({
           positionPubKey: new PublicKey(positionPubkey),
           user: wallet.publicKey,
-          totalXAmount,
-          totalYAmount,
+          totalXAmount: tokenSide === 'X' ? new BN(amount.toString()) : new BN(0),
+          totalYAmount: tokenSide === 'Y' ? new BN(amount.toString()) : new BN(0),
           strategy: {
             minBinId: lowerBinId,
             maxBinId: upperBinId,
@@ -246,51 +369,50 @@ async function addBackBidAsk(
           slippage,
         })
 
-        if (addTxs.length > 1) {
-          console.log(`[flip] add-back split into ${addTxs.length} chunks (slippage=${slippage})`)
-        }
+        console.log(`[flip] add-back split into ${addTxs.length} txns (slippage=${slippage})`)
 
-        for (const [i, tx] of addTxs.entries()) {
+        for (const [j, tx] of addTxs.entries()) {
           const sig = await sendAndConfirm(connection, wallet, tx)
           const txResult = await connection.getTransaction(sig, { maxSupportedTransactionVersion: 0 }).catch(() => null)
           if (txResult?.meta?.err) {
             const errMsg = typeof txResult.meta.err === 'string' ? txResult.meta.err : JSON.stringify(txResult.meta.err)
             throw new Error(`add liquidity failed on-chain: ${errMsg}`)
           }
-
           result.addSignature = sig
           result.addSignatures.push(sig)
-          console.log(`[flip] add-back tx chunk ${i + 1}/${addTxs.length} (slippage=${slippage}): ${sig}`)
-
-          if (i < addTxs.length - 1) await sleep(REMOVE_DELAY_MS)
+          console.log(`[flip] add-back chunk ${j + 1}/${addTxs.length} (slippage=${slippage}): ${sig}`)
+          if (j < addTxs.length - 1) await sleep(REMOVE_DELAY_MS)
         }
 
-        result.success = true
-        result.tokenAmountRemaining = '0'
+        totalSpent = amount
         result.addSlippage = slippage
-        return result
+        break
       } catch (err) {
         lastError = err instanceof Error ? err.message : 'unknown error'
         const postBalance = await getTokenBalance(connection, wallet, tokenMint)
         const spent = preBalance > postBalance ? preBalance - postBalance : 0n
         if (spent > 0n) {
-          const remaining = spent >= amount ? 0n : amount - spent
-          result.tokenAmountRemaining = remaining.toString()
-          result.success = remaining === 0n
+          totalSpent = spent
           result.addSlippage = slippage
-          result.error = result.success
-            ? undefined
-            : `partial add-back succeeded, remaining=${remaining.toString()}; last error: ${lastError}`
-          console.log(`[flip] partial add-back: spent=${spent} remaining=${remaining} lastError=${lastError}`)
-          return result
+          console.log(`[flip] partial add-back: spent=${spent} error=${lastError}`)
+          break
         }
-
-        console.log(`[flip] add-back failed before any chunk spent tokens (slippage=${slippage}): ${lastError}`)
+        console.log(`[flip] add-back failed before spending tokens (slippage=${slippage}): ${lastError}`)
         await sleep(800)
       }
     }
 
-    result.error = lastError
+    const remaining = amount > totalSpent ? amount - totalSpent : 0n
+    result.tokenAmountRemaining = remaining.toString()
+    result.success = remaining === 0n
+    result.lowerBinId = lowerBinId
+    result.upperBinId = upperBinId
+    result.error = remaining === 0n
+      ? undefined
+      : totalSpent > 0n
+        ? `partial add-back succeeded, remaining=${remaining.toString()}; last error: ${lastError}`
+        : lastError
+    console.log(`[flip] add-back result: success=${result.success} spent=${totalSpent} remaining=${remaining}`)
     return result
   } catch (err) {
     result.error = err instanceof Error ? err.message : 'unknown error'
@@ -345,7 +467,7 @@ export async function retryPendingFlipAdd(
   const addRemaining = BigInt(addResult.tokenAmountRemaining || amountToAdd.toString())
   const spent = amountToAdd > addRemaining ? amountToAdd - addRemaining : 0n
   const totalRemaining = addResult.success
-    ? pendingAmount - amountToAdd
+    ? (addResult.dustComplete ? 0n : pendingAmount - amountToAdd)
     : pendingAmount - spent
 
   return {
@@ -393,7 +515,7 @@ export async function executeFlipMode(
       throw new Error(`active bin ${activeBinId} outside range ${lowerBinId}-${upperBinId}`)
     }
 
-    const tokenOnlyRanges = findTokenOnlyRanges(pd.positionBinData, quoteSide, tokenSide)
+    const tokenOnlyRanges = findTokenOnlyRanges(pd.positionBinData, quoteSide, tokenSide, activeBinId)
     result.removeRanges = tokenOnlyRanges
     if (tokenOnlyRanges.length === 0) {
       result.success = true
@@ -402,8 +524,11 @@ export async function executeFlipMode(
       return result
     }
 
-    const removeRanges = chunkRanges(tokenOnlyRanges)
-    console.log(`[flip] remove token-only ranges: ${formatRanges(removeRanges)} tokenSide=${tokenSide}`)
+    const removedBinCount = tokenOnlyRanges.reduce((sum, r) => sum + (r.to - r.from + 1), 0)
+    const removeRanges = removedBinCount <= MAX_BINS_PER_REMOVE
+      ? tokenOnlyRanges
+      : chunkRanges(tokenOnlyRanges)
+    console.log(`[flip] remove token-only ranges: ${formatRanges(removeRanges)} tokenSide=${tokenSide} bins=${removedBinCount}`)
     const preBalance = await getTokenBalance(connection, wallet, tokenMint)
 
     let removeError: string | null = null
@@ -454,6 +579,7 @@ export async function executeFlipMode(
       tokenSide,
       tokenMint,
       delta,
+      removedBinCount,
     )
 
     result.addSignature = addResult.addSignature

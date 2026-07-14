@@ -46,7 +46,7 @@ export const config: Config = {
   maxDrawdownThreshold: envNum('MAX_DRAWDOWN_THRESHOLD', -6),
   maxDrawdownTpOverride: envNum('MAX_DRAWDOWN_TP_OVERRIDE', 2),
   flipModeInitialTriggerPct: envNum('FLIP_MODE_INITIAL_TRIGGER_PCT', 40),
-  flipModeRepeatStepPct: envNum('FLIP_MODE_REPEAT_STEP_PCT', 5),
+  flipModeRepeatStepPct: envNum('FLIP_MODE_REPEAT_STEP_PCT', 10),
   dbPath: envStr('DB_PATH', './monitoring-lp.sqlite'),
   logLevel: envStr('LOG_LEVEL', 'info'),
 }

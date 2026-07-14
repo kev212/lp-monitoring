@@ -1,6 +1,6 @@
 import { Connection, PublicKey } from '@solana/web3.js'
 import { config } from './config.js'
-import { getConnection } from './solana/connection.js'
+import { getConnection, withValuationFallback } from './solana/connection.js'
 import { loadWallet, getWallet } from './solana/wallet.js'
 import { getDb } from './db/client.js'
 import {
@@ -28,13 +28,11 @@ import {
 } from './meteora/discovery.js'
 import {
   getAllPositionsForWallet,
-  getPositionDetail,
   getPool,
   getPoolInfo,
-  clearPoolCache,
 } from './meteora/positions.js'
-import { estimateExitValue, clearPnlCache } from './meteora/valuation.js'
-import { fetchLpAgentPositions } from './lpagent.js'
+import { clearPnlCache, estimateExitValue, getDiscoveryBasis, type ValuationResult } from './meteora/valuation.js'
+import { fetchLpAgentPositions, type LpAgentPosition } from './lpagent.js'
 import { executeExit } from './meteora/exit.js'
 import { executeDirectionalPrecisionCurve, THRESHOLD_RATIO, THRESHOLD_MIN, RECOVERY_MS } from './meteora/precisionCurve.js'
 import { calculateFlipProgressPct, executeFlipMode, retryPendingFlipAdd } from './meteora/flipMode.js'
@@ -42,14 +40,13 @@ import { evaluateTrigger, type BinData } from './risk/rules.js'
 import {
   sendNotification,
   formatPositionDiscovered,
-  formatPnlAlert,
   formatExitStarted,
   formatExitSuccess,
   formatExitFailed,
   formatBotStart,
   formatBotStop,
 } from './telegram.js'
-import type { PositionRow, PositionStatus, BasisConfidence, TriggerType, StrategyType } from './types.js'
+import type { PositionRow, BasisConfidence, TriggerType, StrategyType } from './types.js'
 
 const SOL_MINT = 'So11111111111111111111111111111111111111112'
 const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
@@ -65,6 +62,18 @@ const PRECISION_CURVE_COOLDOWN_MS = 5_000
 const FLIP_MODE_RECOVERY_MS = 10_000
 const LP_AGENT_GUARD_MIN_INTERVAL_MS = 12_500
 let lastLpAgentGuardAt = 0
+const lastProcessedValuationAt = new Map<string, number>()
+
+function lpAgentPnl(position: LpAgentPosition): number {
+  return position.pnlPercentNative
+}
+
+function pnlFromValuation(valuation: ValuationResult, basisSol: number): { pnlPercent: number; source: string } {
+  return {
+    pnlPercent: basisSol > 0 ? valuation.onchainPnlPercent : 0,
+    source: valuation.source,
+  }
+}
 
 export async function startBot(): Promise<void> {
   console.log('[app] starting monitoring-lp...')
@@ -123,50 +132,43 @@ async function discoverInitialPositions(connection: Connection, walletPubkey: Pu
 
   for (const dp of discovered) {
     const existing = loadKnownPositions().find(p => p.positionPubkey === dp.positionPubkey)
-    if (existing) continue
+    if (existing) {
+      continue
+    }
 
     try {
-      // Use token info from Portfolio API; fallback to getPoolInfo if DLMM API (no token data)
+      // Use API metadata when present; mints and decimals are authoritative on-chain.
       let tokenXMint = dp.tokenXMint
       let tokenYMint = dp.tokenYMint
       let tokenXSymbol = dp.tokenXSymbol
       let tokenYSymbol = dp.tokenYSymbol
 
       if (!tokenXMint || !tokenYMint) {
+        const pool = await getPool(connection, new PublicKey(dp.poolPubkey))
+        tokenXMint = (pool.tokenX as any).publicKey?.toBase58?.() || (pool.lbPair as any).tokenXMint?.toBase58?.() || ''
+        tokenYMint = (pool.tokenY as any).publicKey?.toBase58?.() || (pool.lbPair as any).tokenYMint?.toBase58?.() || ''
         const poolInfo = await getPoolInfo(dp.poolPubkey)
         if (!tokenXSymbol) tokenXSymbol = poolInfo.tokenXSymbol
         if (!tokenYSymbol) tokenYSymbol = poolInfo.tokenYSymbol
-        // If still no mints, skip this position
         if (!tokenXMint || !tokenYMint) {
           console.log(`[discovery] ${dp.positionPubkey.slice(0, 8)} — no token mints, skipping`)
           continue
         }
       }
 
-      // Get position value + deposit from Meteora PnL API (no RPC needed)
       let currentValue = 0
       let finalBasis = 0
       let pnlPct = 0
       let val: Awaited<ReturnType<typeof estimateExitValue>> = null
       try {
-        val = await Promise.race([
-          estimateExitValue(dp.poolPubkey, ownerStr, dp.positionPubkey),
-          new Promise<never>((_, reject) => setTimeout(() => reject(new Error('estimateExitValue timeout')), 10_000))
-        ])
-        if (val && val.estimatedExitSol > 0) {
-          currentValue = val.estimatedExitSol
-          if (val.allTimeWithdrawalSol > 0) {
-            finalBasis = val.allTimeDepositSol - val.allTimeWithdrawalSol
-          } else {
-            finalBasis = val.allTimeDepositSol > 0 ? val.allTimeDepositSol : val.depositEstimateSol
-          }
-          if (finalBasis > 0) pnlPct = ((currentValue - finalBasis) / finalBasis) * 100
-        }
+        val = await estimateExitValue(dp.poolPubkey, ownerStr, dp.positionPubkey)
+        currentValue = val?.estimatedExitSol || 0
+        finalBasis = await getDiscoveryBasis(dp.poolPubkey, ownerStr, dp.positionPubkey)
       } catch {
-        // valuation failed, use 0
+        // Position remains discoverable; monitoring retries on-chain valuation.
       }
 
-      const finalConfidence: BasisConfidence = 'medium'
+      const finalConfidence: BasisConfidence = finalBasis > 0 ? 'medium' : 'low'
 
       const finalTokenXSymbol = tokenXSymbol || tokenXMint.slice(0, 4)
       const finalTokenYSymbol = tokenYSymbol || tokenYMint.slice(0, 4)
@@ -226,24 +228,7 @@ async function discoverInitialPositions(connection: Connection, walletPubkey: Pu
         // LP Agent check failed, use defaults
       }
 
-      // --- Auto Flip Mode for new positions: single-side quote only ---
       let flipModeEnabled = false
-      let flipModeReason = ''
-      if (val) {
-        const txMintIsQuote = tokenXMint === SOL_MINT || tokenXMint === USDC_MINT
-        const tyMintIsQuote = tokenYMint === SOL_MINT || tokenYMint === USDC_MINT
-        if (txMintIsQuote) {
-          if (val.allTimeDepositTokenXAmount > 0 && val.allTimeDepositTokenYAmount === 0) {
-            flipModeEnabled = true
-            flipModeReason = 'auto: single-side quote'
-          }
-        } else if (tyMintIsQuote) {
-          if (val.allTimeDepositTokenYAmount > 0 && val.allTimeDepositTokenXAmount === 0) {
-            flipModeEnabled = true
-            flipModeReason = 'auto: single-side quote'
-          }
-        }
-      }
 
       upsertPosition({
         positionPubkey: dp.positionPubkey,
@@ -257,9 +242,9 @@ async function discoverInitialPositions(connection: Connection, walletPubkey: Pu
         basisConfidence: finalConfidence,
         tpPercent,
         slPercent,
-        status: 'monitoring',
+        status: finalBasis > 0 ? 'monitoring' : 'discovering',
         triggerConfirmations: 0,
-        peakPnlPercent: pnlPct > 0 ? pnlPct : 0,
+        peakPnlPercent: 0,
         trailingActivated: false,
         lastPnlPercent: null,
         lastEstimatedExitSol: null,
@@ -276,11 +261,11 @@ async function discoverInitialPositions(connection: Connection, walletPubkey: Pu
         val?.tokenXAmount, val?.tokenYAmount,
         val?.tokenXFees, val?.tokenYFees,
         strategy, slPercent, tpPercent,
-        flipModeEnabled, flipModeReason
+        flipModeEnabled
       ))
       const isDupeDiscovery = loadKnownPositions().some(p => p.tokenXMint === tokenXMint && p.positionPubkey !== dp.positionPubkey)
       const dupMarkerDisc = isDupeDiscovery ? ' [DUPE-TOKEN]' : ''
-      console.log(`[discovery] registered position ${dp.positionPubkey.slice(0, 8)}${dupMarkerDisc} strategy=${strategy} SL=${slPercent}% TP=${tpPercent}% basis=${finalBasis.toFixed(4)}${flipModeEnabled ? ' flip=ON(' + flipModeReason + ')' : ''}`)
+      console.log(`[discovery] registered position ${dp.positionPubkey.slice(0, 8)}${dupMarkerDisc} strategy=${strategy} SL=${slPercent}% TP=${tpPercent}% basis=${finalBasis.toFixed(6)} SOL${finalBasis > 0 ? '' : ' (pending)'}`)
     } catch (err) {
       console.log(`[discovery] failed on ${dp.positionPubkey.slice(0, 8)}: ${err instanceof Error ? err.message : 'unknown'}`)
     }
@@ -341,483 +326,403 @@ async function redetectStrategies(ownerStr: string): Promise<void> {
   }
 }
 
+async function monitorSinglePosition(
+  connection: Connection,
+  walletPubkey: PublicKey,
+  ownerStr: string,
+  pos: PositionRow,
+  tokenPositions: Map<string, number>,
+): Promise<void> {
+  if (pos.status === 'exiting') {
+    if (pos.positionPubkey) {
+      checkExitCooldown(pos.positionPubkey)
+    }
+    return
+  }
+
+  try {
+    const valuation = await estimateExitValue(pos.poolPubkey, ownerStr, pos.positionPubkey, pos.basisSol)
+    if (!valuation) {
+      const retryCount = (monitorRetries.get(pos.positionPubkey) || 0) + 1
+      if (retryCount >= MAX_MONITOR_RETRIES) {
+        monitorRetries.set(pos.positionPubkey, retryCount)
+        try {
+          const account = await withValuationFallback(connection => connection.getAccountInfo(new PublicKey(pos.positionPubkey)))
+          if (!account) {
+            updatePositionStatus(pos.positionPubkey, 'closed')
+            monitorRetries.delete(pos.positionPubkey)
+            lastProcessedValuationAt.delete(pos.positionPubkey)
+            console.log(`[monitor] ${pos.positionPubkey.slice(0, 8)} | position account absent on-chain — marked closed`)
+            return
+          }
+        } catch (err) {
+          console.log(`[monitor] ${pos.positionPubkey.slice(0, 8)} | on-chain presence check failed: ${err instanceof Error ? err.message : 'unknown'}`)
+        }
+        console.log(`[monitor] ${pos.positionPubkey.slice(0, 8)} | on-chain valuation unavailable ${retryCount}x — triggers paused`)
+      } else {
+        monitorRetries.set(pos.positionPubkey, retryCount)
+        console.log(`[monitor] ${pos.positionPubkey.slice(0, 8)} | on-chain valuation unavailable (${retryCount}/${MAX_MONITOR_RETRIES}) — triggers paused`)
+      }
+      return
+    }
+    monitorRetries.delete(pos.positionPubkey)
+
+    if (pos.basisSol <= 0) {
+      updatePositionPnl(pos.positionPubkey, 0, valuation.estimatedExitSol)
+      console.log(`[monitor] ${pos.positionPubkey.slice(0, 8)} | deposit basis pending — PnL triggers paused | Value: ${valuation.estimatedExitSol.toFixed(6)} SOL`)
+      return
+    }
+
+    const { pnlPercent, source: pnlSource } = pnlFromValuation(valuation, pos.basisSol)
+
+    updatePositionPnl(pos.positionPubkey, pnlPercent, valuation.estimatedExitSol)
+
+    // A cached quote must not satisfy multiple trigger confirmations.
+    const isNewValuation = lastProcessedValuationAt.get(pos.positionPubkey) !== valuation.observedAt
+    if (isNewValuation) lastProcessedValuationAt.set(pos.positionPubkey, valuation.observedAt)
+
+    // ── PnL log ──
+    const tokenLabel = `${pos.tokenXSymbol || pos.tokenXMint.slice(0, 4)}/${pos.tokenYSymbol || pos.tokenYMint.slice(0, 4)}`
+    const isDupe = (tokenPositions.get(pos.tokenXMint) || 0) > 1
+    const dupMarker = isDupe ? ' [DUPE-TOKEN]' : ''
+    const pnlSign = pnlPercent >= 0 ? '+' : ''
+    const triggerInfo = pos.triggerConfirmations > 0
+      ? `Conf: ${pos.triggerConfirmations}/${config.triggerConfirmations}`
+      : 'Conf: 0'
+    const effectiveTp = pos.drawdownTpOverrideActive
+      ? config.maxDrawdownTpOverride
+      : (pos.tpPercent ?? config.defaultTpPercent)
+    console.log(
+      `[monitor] ${tokenLabel}${dupMarker} | ${pos.status} | PnL: ${pnlSign}${pnlPercent.toFixed(2)}% (${pnlSource})` +
+      ` | Value: ${valuation.estimatedExitSol.toFixed(6)} SOL` +
+      ` | Withdrawn: ${valuation.allTimeWithdrawalSol.toFixed(6)} SOL` +
+      ` | Basis: ${pos.basisSol.toFixed(6)} SOL` +
+      ` | SL: ${pos.slPercent}% TP: +${effectiveTp}%${pos.drawdownTpOverrideActive ? ' (DD LOCK)' : ''}` +
+      ` | Peak: ${pos.peakPnlPercent.toFixed(2)}%` +
+      ` | ${triggerInfo}`
+    )
+
+    if (!isNewValuation) return
+
+    const now = Date.now()
+    const reshapeUnstable =
+      pos.precisionCurveBusy ||
+      (pos.precisionCurveRecoveryUntil ?? 0) > now ||
+      pos.flipModeBusy ||
+      pos.flipModePendingAdd ||
+      (pos.flipModeRecoveryUntil ?? 0) > now
+
+    // --- LP Agent Spike Guard ---
+    let canTrustPeak = true
+    if (pos.precisionCurveEnabled || pos.flipModeEnabled || pos.flipModePendingAdd) {
+      // reshaped positions: skip spike guard
+    } else if (pnlPercent > 0) {
+      const spikeFromPeak = pnlPercent > pos.peakPnlPercent + 5
+      const spikeFromLast = pos.lastPnlPercent !== null && (pnlPercent - pos.lastPnlPercent) > 5
+      const activationCross = pos.lastPnlPercent !== null &&
+        pos.lastPnlPercent < config.trailingActivationPct - 2 &&
+        pnlPercent >= config.trailingActivationPct
+      const suspiciousSpike = spikeFromPeak || spikeFromLast || activationCross
+
+      if (suspiciousSpike && config.lpAgentApiKey) {
+        const now = Date.now()
+        if (now - lastLpAgentGuardAt >= LP_AGENT_GUARD_MIN_INTERVAL_MS) {
+          lastLpAgentGuardAt = now
+          try {
+            const lpAgentPositions = await fetchLpAgentPositions(ownerStr)
+            if (lpAgentPositions) {
+              const lpPos = lpAgentPositions.get(pos.positionPubkey)
+              if (lpPos) {
+                const lpPnl = lpAgentPnl(lpPos)
+                const delta = Math.abs(pnlPercent - lpPnl)
+                if (delta > 3 && lpPnl < config.trailingActivationPct) {
+                  console.log(`[peak-guard] ${tokenLabel} | blocked spike: on-chain=${pnlPercent.toFixed(2)}% vs lpagent=${lpPnl.toFixed(2)}% (delta=${delta.toFixed(1)}%)`)
+                  canTrustPeak = false
+                }
+              }
+            }
+          } catch {
+            console.log(`[peak-guard] ${tokenLabel} | suspicious spike ${pnlPercent.toFixed(2)}% — LP Agent unavailable, peak frozen`)
+            canTrustPeak = false
+          }
+        } else {
+          console.log(`[peak-guard] ${tokenLabel} | suspicious spike ${pnlPercent.toFixed(2)}% — LP Agent budget exhausted, peak frozen`)
+          canTrustPeak = false
+        }
+      }
+    }
+
+    // Freeze peak during precision curve busy or recovery window
+    if (pos.precisionCurveEnabled) {
+      const recoveryUntil = pos.precisionCurveRecoveryUntil ?? 0
+      if (pos.precisionCurveBusy || Date.now() < recoveryUntil) {
+        canTrustPeak = false
+      }
+    }
+
+    if (pos.flipModeEnabled || pos.flipModePendingAdd) {
+      const recoveryUntil = pos.flipModeRecoveryUntil ?? 0
+      if (pos.flipModeBusy || pos.flipModePendingAdd || Date.now() < recoveryUntil) {
+        canTrustPeak = false
+      }
+    }
+
+    // --- Trailing stop: track peak PnL ---
+    let updatedPeak = pos.peakPnlPercent
+    let trailingActive = pos.trailingActivated
+    let peakOrTrailingChanged = false
+
+    if (canTrustPeak && !trailingActive && pnlPercent >= config.trailingActivationPct) {
+      trailingActive = true
+      peakOrTrailingChanged = true
+      console.log(`[trailing] activated for ${pos.positionPubkey.slice(0, 8)} at ${pnlPercent.toFixed(2)}%`)
+    }
+
+    if (canTrustPeak && pnlPercent > updatedPeak) {
+      updatedPeak = pnlPercent
+      peakOrTrailingChanged = true
+    }
+
+    if (canTrustPeak && pnlPercent <= 0) {
+      updatedPeak = 0
+      trailingActive = false
+      peakOrTrailingChanged = true
+    }
+
+    if (peakOrTrailingChanged) {
+      updatePeakPnl(pos.positionPubkey, updatedPeak, trailingActive)
+      pos.peakPnlPercent = updatedPeak
+      pos.trailingActivated = trailingActive
+    }
+    // --- end trailing ---
+
+    // --- Drawdown TP lock ---
+    if (!reshapeUnstable && !pos.drawdownTpOverrideActive && pnlPercent <= config.maxDrawdownThreshold) {
+      pos.drawdownTpOverrideActive = true
+      updateDrawdownTpOverride(pos.positionPubkey, true)
+      console.log(`[drawdown] ${tokenLabel} | TP LOCKED to ${config.maxDrawdownTpOverride}% (PnL ${pnlPercent.toFixed(2)}% <= ${config.maxDrawdownThreshold}%)`)
+    }
+
+    const binData: BinData = {
+      upperBinId: valuation.upperBinId,
+      poolActiveBinId: valuation.poolActiveBinId,
+    }
+
+    const flipHandled = await maybeRunFlipMode(pos, valuation.lowerBinId, valuation.upperBinId, valuation.poolActiveBinId)
+    if (flipHandled) {
+      pendingTriggers.delete(pos.positionPubkey)
+      if (pos.triggerConfirmations > 0) updatePositionConfirmations(pos.positionPubkey, 0)
+      return
+    }
+
+    const precisionHandled = await maybeRunPrecisionCurve(pos, valuation.lowerBinId, valuation.upperBinId, valuation.poolActiveBinId)
+    if (precisionHandled) {
+      pendingTriggers.delete(pos.positionPubkey)
+      if (pos.triggerConfirmations > 0) updatePositionConfirmations(pos.positionPubkey, 0)
+      return
+    }
+
+    if (reshapeUnstable) {
+      pendingTriggers.delete(pos.positionPubkey)
+      if (pos.triggerConfirmations > 0) updatePositionConfirmations(pos.positionPubkey, 0)
+      console.log(`[monitor] ${tokenLabel} | reshape busy/recovery — PnL exits paused`)
+      return
+    }
+
+    const decision = evaluateTrigger(pos, pnlPercent, binData)
+    if (decision.shouldTrigger && decision.triggerType) {
+      const triggerType = decision.triggerType
+      // LP Agent is diagnostic only; on-chain valuation remains authoritative.
+      let lpAgentAtTrigger: LpAgentPosition | null = null
+      try {
+        const lpAgentPositions = await fetchLpAgentPositions(ownerStr)
+        if (lpAgentPositions) {
+          const lpPos = lpAgentPositions.get(pos.positionPubkey)
+          if (lpPos) {
+            lpAgentAtTrigger = lpPos
+            const lpPnl = lpAgentPnl(lpPos)
+            const diff = Math.abs(pnlPercent - lpPnl)
+            if (diff > 3) {
+              console.log(`[recheck] ${tokenLabel} | LP Agent delta: on-chain=${pnlPercent.toFixed(2)}% vs lpagent=${lpPnl.toFixed(2)}% (diff=${diff.toFixed(1)}%)`)
+            }
+          }
+        }
+      } catch {
+        // Local trigger does not depend on LP Agent availability.
+      }
+
+      // --- Re-check with delay ---
+      const pending = pendingTriggers.get(pos.positionPubkey)
+
+      if (!pending) {
+        pendingTriggers.set(pos.positionPubkey, {
+          triggerType: decision.triggerType,
+          timestamp: Date.now(),
+          pnlAtTrigger: pnlPercent,
+        })
+        console.log(`[recheck] ${tokenLabel} | ${decision.triggerType} triggered at ${pnlPercent.toFixed(2)}% — waiting ${config.recheckDelayMs}ms for confirmation`)
+        return
+      }
+
+      const elapsed = Date.now() - pending.timestamp
+      if (elapsed < config.recheckDelayMs) {
+        return
+      }
+
+      console.log(`[recheck] ${tokenLabel} | ${decision.triggerType} re-check after ${(elapsed / 1000).toFixed(1)}s`)
+      let verifiedPnlPct = pnlPercent
+      let exitValuation = valuation
+      try {
+        clearPnlCache()
+        const freshValuation = await estimateExitValue(pos.poolPubkey, ownerStr, pos.positionPubkey, pos.basisSol)
+        if (!freshValuation) throw new Error('fresh on-chain valuation unavailable')
+
+        const freshPnlPct = pnlFromValuation(freshValuation, pos.basisSol).pnlPercent
+        let recheckLpAgent = lpAgentAtTrigger
+        if (!recheckLpAgent) {
+          try {
+            const freshLpPositions = await fetchLpAgentPositions(ownerStr)
+            if (freshLpPositions) recheckLpAgent = freshLpPositions.get(pos.positionPubkey) || null
+          } catch {
+            // Diagnostic source is optional.
+          }
+        }
+        if (recheckLpAgent) {
+          const lpPnl = lpAgentPnl(recheckLpAgent)
+          const delta = Math.abs(freshPnlPct - lpPnl)
+          if (delta > 3) {
+            console.log(`[recheck] ${tokenLabel} | DELTA ${delta.toFixed(1)}%: on-chain=${freshPnlPct.toFixed(2)}% vs lpagent=${lpPnl.toFixed(2)}%`)
+          }
+        }
+
+        const sl = pos.slPercent ?? config.defaultSlPercent
+        const tp = pos.drawdownTpOverrideActive ? config.maxDrawdownTpOverride : (pos.tpPercent ?? config.defaultTpPercent)
+
+        let stillTriggers = false
+        if (decision.triggerType === 'SL') {
+          stillTriggers = freshPnlPct <= sl
+        } else if (decision.triggerType === 'TP') {
+          stillTriggers = freshPnlPct >= tp
+        } else if (decision.triggerType === 'BIN_RANGE') {
+          if (freshValuation.upperBinId !== undefined && freshValuation.poolActiveBinId !== undefined) {
+            const dist = freshValuation.upperBinId - freshValuation.poolActiveBinId
+            stillTriggers = freshPnlPct > config.binRangePnlThreshold && dist >= 0 && dist <= config.binRangeMaxDistance
+          }
+        } else if (decision.triggerType === 'TRAILING_STOP') {
+          const dropFromPeak = pos.peakPnlPercent - freshPnlPct
+          stillTriggers = freshPnlPct > 0 && dropFromPeak >= config.trailingStopDropPct
+        }
+
+        if (!stillTriggers) {
+          console.log(`[recheck] ${tokenLabel} | fresh on-chain PnL: ${freshPnlPct.toFixed(2)}% — ${decision.triggerType} no longer valid (was ${pending.pnlAtTrigger.toFixed(2)}%) — skip exit`)
+          sendNotification(
+            `⚠️ <b>Exit Skipped — PnL Re-check</b>\n\n` +
+            `<b>${tokenLabel}</b>\n` +
+            `Fresh on-chain PnL: <b>${freshPnlPct.toFixed(2)}%</b>\n` +
+            `(was ${pending.pnlAtTrigger.toFixed(2)}% at trigger)\n` +
+            `${decision.triggerType} no longer valid. Position safe.`
+          )
+          pendingTriggers.delete(pos.positionPubkey)
+          updatePositionStatus(pos.positionPubkey, 'monitoring')
+          updatePositionConfirmations(pos.positionPubkey, 0)
+          return
+        }
+
+        console.log(`[recheck] ${tokenLabel} | fresh on-chain PnL: ${freshPnlPct.toFixed(2)}% — ${decision.triggerType} confirmed — proceeding with exit`)
+        verifiedPnlPct = freshPnlPct
+        exitValuation = freshValuation
+      } catch (err) {
+        console.log(`[recheck] ${tokenLabel} | re-check failed: ${err instanceof Error ? err.message : 'unknown'} — exit cancelled`)
+        pendingTriggers.delete(pos.positionPubkey)
+        updatePositionConfirmations(pos.positionPubkey, 0)
+        return
+      }
+      pendingTriggers.delete(pos.positionPubkey)
+
+      // --- Execute exit ---
+      const estimatedPnl = exitValuation.estimatedExitSol - pos.basisSol
+      sendNotification(
+        formatExitStarted(
+          pos.positionPubkey, decision.triggerType, verifiedPnlPct, estimatedPnl,
+          pos.basisSol, exitValuation.estimatedExitSol,
+          pos.tokenXMint.slice(0, 4),
+          pos.tokenYMint.slice(0, 4),
+          pos.poolPubkey, exitValuation.solUsdPrice
+        )
+      )
+
+      const result = await executeExit(
+        connection, getWallet(), pos.positionPubkey, pos.poolPubkey,
+        pos.tokenXMint, pos.tokenYMint,
+        triggerType, verifiedPnlPct,
+        pos.basisSol, exitValuation.estimatedExitSol
+      )
+
+      if (result.success) {
+        const received = result.solReceived
+        const adjReceived = received - result.rentRefundSol
+        const finalTotalReturn = adjReceived + exitValuation.allTimeWithdrawalSol
+        const finalPnl = pos.basisSol > 0
+          ? ((finalTotalReturn - pos.basisSol) / pos.basisSol) * 100
+          : 0
+        sendNotification(
+          formatExitSuccess(
+            pos.positionPubkey, received, finalPnl,
+            result.rentRefundSol,
+            pos.basisSol, result.removeLiqSig || '',
+            result.swapSig,
+            pos.tokenXMint.slice(0, 4), pos.tokenYMint.slice(0, 4),
+            pos.poolPubkey, exitValuation.solUsdPrice, ownerStr
+          )
+        )
+      } else {
+        sendNotification(
+          formatExitFailed(
+            pos.positionPubkey, result.error || 'unknown error',
+            pos.tokenXMint.slice(0, 4), pos.tokenYMint.slice(0, 4),
+            pos.poolPubkey
+          )
+        )
+        updatePositionStatus(pos.positionPubkey, 'monitoring')
+        updatePositionConfirmations(pos.positionPubkey, 0)
+      }
+    } else if (decision.triggerType && !decision.shouldTrigger && decision.reason?.includes('awaiting confirmation')) {
+      const count = (pos.triggerConfirmations || 0) + 1
+      updatePositionConfirmations(pos.positionPubkey, count)
+    } else {
+      if ((pos.triggerConfirmations || 0) > 0) {
+        updatePositionConfirmations(pos.positionPubkey, 0)
+      }
+    }
+  } catch (err) {
+    console.log(`[monitor] error on ${pos.positionPubkey.slice(0, 8)}: ${err instanceof Error ? err.message : 'unknown'}`)
+  }
+}
+
 async function monitorCycle(connection: Connection, walletPubkey: PublicKey, ownerStr: string): Promise<void> {
   const positions = loadActivePositions()
   if (positions.length === 0) return
 
-  // Build duplicate token map for logging
   const tokenPositions = new Map<string, number>()
   for (const p of positions) {
     tokenPositions.set(p.tokenXMint, (tokenPositions.get(p.tokenXMint) || 0) + 1)
   }
 
-  for (let i = 0; i < positions.length; i++) {
-    const pos = positions[i]
-    if (pos.status === 'exiting') {
-      if (pos.positionPubkey) {
-        checkExitCooldown(pos.positionPubkey)
-      }
-      continue
-    }
-
-      if (i > 0) await sleep(250)
-
-    try {
-      const valuation = await estimateExitValue(pos.poolPubkey, ownerStr, pos.positionPubkey)
-      if (!valuation || valuation.estimatedExitSol <= 0) {
-        const retryCount = (monitorRetries.get(pos.positionPubkey) || 0) + 1
-        if (retryCount >= MAX_MONITOR_RETRIES) {
-          console.log(`[monitor] ${pos.positionPubkey.slice(0, 8)} | PnL API failed ${retryCount}x — marking as closed`)
-          updatePositionStatus(pos.positionPubkey, 'closed')
-          monitorRetries.delete(pos.positionPubkey)
-        } else {
-          monitorRetries.set(pos.positionPubkey, retryCount)
-          console.log(`[monitor] ${pos.positionPubkey.slice(0, 8)} | PnL API failed (${retryCount}/${MAX_MONITOR_RETRIES}) — retrying`)
-        }
-        continue
-      }
-      // Reset retry counter on success
-      monitorRetries.delete(pos.positionPubkey)
-
-      // Update basis if still 0 (history missed it) — use deposit estimate from SDK
-      if (pos.basisSol <= 0 && valuation.depositEstimateSol > 0) {
-        const db = getDb()
-        db.prepare('UPDATE positions SET basis_sol = ?, basis_confidence = ?, updated_at = ? WHERE position_pubkey = ?')
-          .run(valuation.depositEstimateSol, 'medium', Date.now(), pos.positionPubkey)
-        pos.basisSol = valuation.depositEstimateSol
-        pos.basisConfidence = 'medium'
-        console.log(`[monitor] updated basis for ${pos.positionPubkey.slice(0, 8)}: ${valuation.depositEstimateSol.toFixed(4)} SOL (SDK estimate)`)
-      }
-
-      const quoteIsUsdc = pos.tokenXMint === USDC_MINT || pos.tokenYMint === USDC_MINT
-      const quoteIsSol = pos.tokenXMint === SOL_MINT || pos.tokenYMint === SOL_MINT
-
-      let pnlPercent: number
-      let pnlSource = 'basis'
-      const rawPnlSol = valuation.meteoraPnlSolPct
-      const rawPnlUsd = valuation.meteoraPnlPct
-      const hasReshape = valuation.allTimeWithdrawalSol > 0
-      const netDepositSol = hasReshape
-        ? valuation.allTimeDepositSol - valuation.allTimeWithdrawalSol
-        : 0
-
-      if (hasReshape && netDepositSol > 0 && typeof valuation.meteoraPnlSol === 'number') {
-        pnlPercent = (valuation.meteoraPnlSol / netDepositSol) * 100
-        pnlSource = 'meteora(net)'
-      } else if (quoteIsUsdc) {
-        // USDC-quoted pair — prefer USD PnL (includes SOL price movement vs USDC)
-        if (rawPnlUsd !== undefined && rawPnlUsd !== null && Number.isFinite(rawPnlUsd) && !Number.isNaN(rawPnlUsd)) {
-          pnlPercent = rawPnlUsd
-          pnlSource = 'meteora(usd)'
-        } else if (rawPnlSol !== undefined && rawPnlSol !== null && Number.isFinite(rawPnlSol) && !Number.isNaN(rawPnlSol)) {
-          pnlPercent = rawPnlSol
-          pnlSource = 'meteora(sol)'
-        } else if (pos.basisSol > 0) {
-          pnlPercent = ((valuation.estimatedExitSol - pos.basisSol) / pos.basisSol) * 100
-          pnlSource = 'basis'
-        } else {
-          pnlPercent = 0
-          pnlSource = 'zero'
-        }
-      } else {
-        // SOL-quoted (or unknown quote) pair — prefer SOL PnL (pure position perf)
-        if (rawPnlSol !== undefined && rawPnlSol !== null && Number.isFinite(rawPnlSol) && !Number.isNaN(rawPnlSol)) {
-          pnlPercent = rawPnlSol
-          pnlSource = 'meteora(sol)'
-        } else if (rawPnlUsd !== undefined && rawPnlUsd !== null && Number.isFinite(rawPnlUsd) && !Number.isNaN(rawPnlUsd)) {
-          pnlPercent = rawPnlUsd
-          pnlSource = 'meteora(usd)'
-        } else if (pos.basisSol > 0) {
-          pnlPercent = ((valuation.estimatedExitSol - pos.basisSol) / pos.basisSol) * 100
-          pnlSource = 'basis'
-        } else {
-          pnlPercent = 0
-          pnlSource = 'zero'
-        }
-      }
-
-      // Warn if API returned 0 PnL but valuation suggests profit/loss
-      if (pnlSource.startsWith('meteora') && pnlPercent === 0 && pos.basisSol > 0) {
-        const implied = ((valuation.estimatedExitSol - pos.basisSol) / pos.basisSol) * 100
-        if (Math.abs(implied) > 2) {
-          console.log(`[warn] ${pos.tokenXSymbol || pos.tokenXMint.slice(0, 4)}/${pos.tokenYSymbol || pos.tokenYMint.slice(0, 4)} | Meteora API returned PnL=0 but implied=${implied.toFixed(2)}% — possible API issue`)
-        }
-      }
-
-      updatePositionPnl(pos.positionPubkey, pnlPercent, valuation.estimatedExitSol)
-
-      // ── PnL log ──
-      const tokenLabel = `${pos.tokenXSymbol || pos.tokenXMint.slice(0, 4)}/${pos.tokenYSymbol || pos.tokenYMint.slice(0, 4)}`
-      const isDupe = (tokenPositions.get(pos.tokenXMint) || 0) > 1
-      const dupMarker = isDupe ? ' [DUPE-TOKEN]' : ''
-      const pnlSign = pnlPercent >= 0 ? '+' : ''
-      const triggerInfo = pos.triggerConfirmations > 0
-        ? `Conf: ${pos.triggerConfirmations}/${config.triggerConfirmations}`
-        : 'Conf: 0'
-      const effectiveTp = pos.drawdownTpOverrideActive
-        ? config.maxDrawdownTpOverride
-        : (pos.tpPercent ?? config.defaultTpPercent)
-      console.log(
-        `[monitor] ${tokenLabel}${dupMarker} | ${pos.status} | PnL: ${pnlSign}${pnlPercent.toFixed(2)}% (${pnlSource})` +
-        ` | Value: ${valuation.estimatedExitSol.toFixed(4)} SOL` +
-        ` | Basis: ${pos.basisSol.toFixed(4)} SOL` +
-        ` | SL: ${pos.slPercent}% TP: +${effectiveTp}%${pos.drawdownTpOverrideActive ? ' (DD LOCK)' : ''}` +
-        ` | Peak: ${pos.peakPnlPercent.toFixed(2)}%` +
-        ` | ${triggerInfo}`
+  const results = await Promise.allSettled(
+    positions.map(pos =>
+      monitorSinglePosition(
+        connection,
+        walletPubkey,
+        ownerStr,
+        pos,
+        tokenPositions,
       )
+    )
+  )
 
-      // --- LP Agent Spike Guard: prevent fake positive spikes from corrupting peak/trailing ---
-      let canTrustPeak = true
-      if (pos.precisionCurveEnabled || pos.flipModeEnabled || pos.flipModePendingAdd) {
-        // reshaped positions: LP Agent PnL can diverge from Meteora net basis, skip spike guard
-      } else if (pnlPercent > 0) {
-        const spikeFromPeak = pnlPercent > pos.peakPnlPercent + 5
-        const spikeFromLast = pos.lastPnlPercent !== null && (pnlPercent - pos.lastPnlPercent) > 5
-        const activationCross = pos.lastPnlPercent !== null &&
-          pos.lastPnlPercent < config.trailingActivationPct - 2 &&
-          pnlPercent >= config.trailingActivationPct
-        const suspiciousSpike = spikeFromPeak || spikeFromLast || activationCross
-
-        if (suspiciousSpike && config.lpAgentApiKey) {
-          const now = Date.now()
-          if (now - lastLpAgentGuardAt >= LP_AGENT_GUARD_MIN_INTERVAL_MS) {
-            lastLpAgentGuardAt = now
-            try {
-              const lpAgentPositions = await fetchLpAgentPositions(ownerStr)
-              if (lpAgentPositions) {
-                const lpPos = lpAgentPositions.get(pos.positionPubkey)
-                if (lpPos) {
-                  const lpPnl = lpPos.pnlPercentNative
-                  const delta = Math.abs(pnlPercent - lpPnl)
-                  if (delta > 3 && lpPnl < config.trailingActivationPct) {
-                    console.log(`[peak-guard] ${tokenLabel} | blocked spike: meteora=${pnlPercent.toFixed(2)}% vs lpagent=${lpPnl.toFixed(2)}% (delta=${delta.toFixed(1)}%)`)
-                    canTrustPeak = false
-                  }
-                }
-              }
-            } catch {
-              console.log(`[peak-guard] ${tokenLabel} | suspicious spike ${pnlPercent.toFixed(2)}% — LP Agent unavailable, peak frozen`)
-              canTrustPeak = false
-            }
-          } else {
-            console.log(`[peak-guard] ${tokenLabel} | suspicious spike ${pnlPercent.toFixed(2)}% — LP Agent budget exhausted, peak frozen`)
-            canTrustPeak = false
-          }
-        }
-      }
-
-      // Freeze peak during precision curve busy or recovery window (PnL may be glitchy)
-      if (pos.precisionCurveEnabled) {
-        const recoveryUntil = pos.precisionCurveRecoveryUntil ?? 0
-        if (pos.precisionCurveBusy || Date.now() < recoveryUntil) {
-          canTrustPeak = false
-        }
-      }
-
-      if (pos.flipModeEnabled || pos.flipModePendingAdd) {
-        const recoveryUntil = pos.flipModeRecoveryUntil ?? 0
-        if (pos.flipModeBusy || pos.flipModePendingAdd || Date.now() < recoveryUntil) {
-          canTrustPeak = false
-        }
-      }
-
-      // --- Trailing stop: track peak PnL ---
-      let updatedPeak = pos.peakPnlPercent
-      let trailingActive = pos.trailingActivated
-      let peakOrTrailingChanged = false
-
-      // Activate trailing tiap kali PnL >= threshold, terlepas dari peak update
-      if (canTrustPeak && !trailingActive && pnlPercent >= config.trailingActivationPct) {
-        trailingActive = true
-        peakOrTrailingChanged = true
-        console.log(`[trailing] activated for ${pos.positionPubkey.slice(0, 8)} at ${pnlPercent.toFixed(2)}%`)
-      }
-
-      if (canTrustPeak && pnlPercent > updatedPeak) {
-        updatedPeak = pnlPercent
-        peakOrTrailingChanged = true
-      }
-
-      if (pnlPercent <= 0) {
-        updatedPeak = 0
-        trailingActive = false
-        peakOrTrailingChanged = true
-      }
-
-      if (peakOrTrailingChanged) {
-        updatePeakPnl(pos.positionPubkey, updatedPeak, trailingActive)
-        pos.peakPnlPercent = updatedPeak
-        pos.trailingActivated = trailingActive
-      }
-      // --- end trailing ---
-
-      // --- Drawdown TP lock: sekali kena <= threshold, TP dikunci ke override selamanya ---
-      if (!pos.drawdownTpOverrideActive && pnlPercent <= config.maxDrawdownThreshold) {
-        pos.drawdownTpOverrideActive = true
-        updateDrawdownTpOverride(pos.positionPubkey, true)
-        console.log(`[drawdown] ${tokenLabel} | TP LOCKED to ${config.maxDrawdownTpOverride}% (PnL ${pnlPercent.toFixed(2)}% <= ${config.maxDrawdownThreshold}%)`)
-      }
-
-      const binData: BinData = {
-        upperBinId: valuation.upperBinId,
-        poolActiveBinId: valuation.poolActiveBinId,
-      }
-
-      const flipHandled = await maybeRunFlipMode(pos, valuation.lowerBinId, valuation.upperBinId, valuation.poolActiveBinId)
-      if (flipHandled) continue
-
-      const precisionHandled = await maybeRunPrecisionCurve(pos, valuation.lowerBinId, valuation.upperBinId, valuation.poolActiveBinId)
-      if (precisionHandled) continue
-
-      const decision = evaluateTrigger(pos, pnlPercent, binData)
-      if (decision.shouldTrigger && decision.triggerType) {
-        const tokenLabel = `${pos.tokenXSymbol || pos.tokenXMint.slice(0, 4)}/${pos.tokenYSymbol || pos.tokenYMint.slice(0, 4)}`
-
-        // Cross-check with LP Agent before setting pending trigger (1 API call per trigger)
-        let lpAgentAtTrigger: { pnlPercentNative: number } | null = null
-        try {
-          const lpAgentPositions = await fetchLpAgentPositions(ownerStr)
-          if (lpAgentPositions) {
-            const lpPos = lpAgentPositions.get(pos.positionPubkey)
-            if (lpPos) {
-              lpAgentAtTrigger = lpPos
-              const diff = Math.abs(pnlPercent - lpPos.pnlPercentNative)
-              if (diff > 3) {
-                console.log(`[recheck] ${tokenLabel} | LP Agent pre-check: meteora=${pnlPercent.toFixed(2)}% vs lpagent=${lpPos.pnlPercentNative.toFixed(2)}% (diff=${diff.toFixed(1)}% > 3%)`)
-              }
-            }
-          }
-        } catch {
-          // lpagent check failed, use meteora
-        }
-
-        // Validate trigger with LP Agent — only block if delta > 3% AND LP Agent itself doesn't trigger
-        if (pos.precisionCurveEnabled || pos.flipModeEnabled || pos.flipModePendingAdd) {
-          // reshaped position: LP Agent PnL also corrupted by remove/add cycles
-          // trust corrected Meteora PnL (net deposit basis)
-        } else if (lpAgentAtTrigger) {
-          const delta = Math.abs(pnlPercent - lpAgentAtTrigger.pnlPercentNative)
-          if (delta > 3) {
-            // Cek apakah LP Agent sendiri masih trigger condition
-            const sl = pos.slPercent ?? config.defaultSlPercent
-            const tp = pos.drawdownTpOverrideActive ? config.maxDrawdownTpOverride : (pos.tpPercent ?? config.defaultTpPercent)
-            const lpPnl = lpAgentAtTrigger.pnlPercentNative
-            let lpStillTriggers = false
-            if (decision.triggerType === 'SL') {
-              lpStillTriggers = lpPnl <= sl
-            } else if (decision.triggerType === 'TP') {
-              lpStillTriggers = lpPnl >= tp
-            } else if (decision.triggerType === 'TRAILING_STOP') {
-              lpStillTriggers = lpPnl > 0
-            } else if (decision.triggerType === 'BIN_RANGE') {
-              lpStillTriggers = lpPnl > config.binRangePnlThreshold
-            }
-
-            if (lpStillTriggers) {
-              console.log(`[recheck] ${tokenLabel} | ${decision.triggerType} delta ${delta.toFixed(1)}% (meteora=${pnlPercent.toFixed(2)}% vs lpagent=${lpPnl.toFixed(2)}%) — LP Agent confirms, proceed`)
-            } else {
-              console.log(`[recheck] ${tokenLabel} | ${decision.triggerType} BLOCKED: delta ${delta.toFixed(1)}% (meteora=${pnlPercent.toFixed(2)}% vs lpagent=${lpPnl.toFixed(2)}%) — LP Agent does not confirm, skip`)
-              continue
-            }
-          }
-        }
-
-        // --- Re-check dengan delay untuk handle glitch (SL/TP/TRAILING) ---
-        const pending = pendingTriggers.get(pos.positionPubkey)
-
-        if (!pending) {
-          pendingTriggers.set(pos.positionPubkey, {
-            triggerType: decision.triggerType,
-            timestamp: Date.now(),
-            pnlAtTrigger: pnlPercent,
-          })
-          console.log(`[recheck] ${tokenLabel} | ${decision.triggerType} triggered at ${pnlPercent.toFixed(2)}% — waiting ${config.recheckDelayMs}ms for confirmation`)
-          continue
-        }
-
-        const elapsed = Date.now() - pending.timestamp
-        if (elapsed < config.recheckDelayMs) {
-          continue
-        }
-
-        console.log(`[recheck] ${tokenLabel} | ${decision.triggerType} re-check after ${(elapsed / 1000).toFixed(1)}s`)
-        let verifiedPnlPct = pnlPercent
-        try {
-          clearPnlCache()
-          const freshValuation = await estimateExitValue(pos.poolPubkey, ownerStr, pos.positionPubkey)
-          if (freshValuation && freshValuation.estimatedExitSol > 0) {
-            let freshPnlPct = 0
-            const freshRawSol = freshValuation.meteoraPnlSolPct
-            const freshRawUsd = freshValuation.meteoraPnlPct
-            const freshHasReshape = freshValuation.allTimeWithdrawalSol > 0
-            const freshNetDepositSol = freshHasReshape
-              ? freshValuation.allTimeDepositSol - freshValuation.allTimeWithdrawalSol
-              : 0
-
-            if (freshHasReshape && freshNetDepositSol > 0 && typeof freshValuation.meteoraPnlSol === 'number') {
-              freshPnlPct = (freshValuation.meteoraPnlSol / freshNetDepositSol) * 100
-            } else if (quoteIsUsdc) {
-              if (freshRawUsd !== undefined && freshRawUsd !== null && Number.isFinite(freshRawUsd) && !Number.isNaN(freshRawUsd)) {
-                freshPnlPct = freshRawUsd
-              } else if (freshRawSol !== undefined && freshRawSol !== null && Number.isFinite(freshRawSol) && !Number.isNaN(freshRawSol)) {
-                freshPnlPct = freshRawSol
-              } else if (pos.basisSol > 0) {
-                freshPnlPct = ((freshValuation.estimatedExitSol - pos.basisSol) / pos.basisSol) * 100
-              }
-            } else {
-              if (freshRawSol !== undefined && freshRawSol !== null && Number.isFinite(freshRawSol) && !Number.isNaN(freshRawSol)) {
-                freshPnlPct = freshRawSol
-              } else if (freshRawUsd !== undefined && freshRawUsd !== null && Number.isFinite(freshRawUsd) && !Number.isNaN(freshRawUsd)) {
-                freshPnlPct = freshRawUsd
-              } else if (pos.basisSol > 0) {
-                freshPnlPct = ((freshValuation.estimatedExitSol - pos.basisSol) / pos.basisSol) * 100
-              }
-            }
-
-            // Retry LP Agent at recheck if unavailable at trigger time
-            let recheckLpAgent = lpAgentAtTrigger
-            if (!recheckLpAgent) {
-              try {
-                const freshLpPositions = await fetchLpAgentPositions(ownerStr)
-                if (freshLpPositions) {
-                  const freshLpPos = freshLpPositions.get(pos.positionPubkey)
-                  if (freshLpPos) recheckLpAgent = freshLpPos
-                }
-              } catch {
-                // still unavailable
-              }
-            }
-
-            // Cross-check: LP Agent independent PnL vs Meteora PnL
-            let usedPnlPct = freshPnlPct
-            let usedPnlSource = 'meteora'
-            if (!pos.precisionCurveEnabled && !pos.flipModeEnabled && !pos.flipModePendingAdd && recheckLpAgent) {
-              const delta = Math.abs(freshPnlPct - recheckLpAgent.pnlPercentNative)
-              if (delta > 3) {
-                console.log(`[recheck] ${tokenLabel} | DELTA ${delta.toFixed(1)}%: meteora=${freshPnlPct.toFixed(2)}% vs lpagent=${recheckLpAgent.pnlPercentNative.toFixed(2)}% — using lpagent`)
-                usedPnlPct = recheckLpAgent.pnlPercentNative
-                usedPnlSource = 'lpagent'
-              }
-            }
-
-            const sl = pos.slPercent ?? config.defaultSlPercent
-            const tp = pos.drawdownTpOverrideActive ? config.maxDrawdownTpOverride : (pos.tpPercent ?? config.defaultTpPercent)
-
-            let stillTriggers = false
-            if (decision.triggerType === 'SL') {
-              stillTriggers = usedPnlPct <= sl
-            } else if (decision.triggerType === 'TP') {
-              stillTriggers = usedPnlPct >= tp
-            } else if (decision.triggerType === 'BIN_RANGE') {
-              const freshUpper = freshValuation.upperBinId
-              const freshActive = freshValuation.poolActiveBinId
-              if (freshUpper !== undefined && freshActive !== undefined) {
-                const dist = freshUpper - freshActive
-                stillTriggers = usedPnlPct > config.binRangePnlThreshold && dist >= 0 && dist <= config.binRangeMaxDistance
-              }
-            } else if (decision.triggerType === 'TRAILING_STOP') {
-              const dropFromPeak = pos.peakPnlPercent - usedPnlPct
-              stillTriggers = usedPnlPct > 0 && dropFromPeak >= config.trailingStopDropPct
-            }
-
-            if (!stillTriggers) {
-              console.log(`[recheck] ${tokenLabel} | fresh PnL: ${usedPnlPct.toFixed(2)}% (${usedPnlSource}) — ${decision.triggerType} no longer valid (was ${pending.pnlAtTrigger.toFixed(2)}%) — skip exit`)
-              sendNotification(
-                `⚠️ <b>Exit Skipped — PnL Re-check</b>\n\n` +
-                `<b>${tokenLabel}</b>\n` +
-                `Fresh PnL: <b>${usedPnlPct.toFixed(2)}%</b> (${usedPnlSource})\n` +
-                `(was ${pending.pnlAtTrigger.toFixed(2)}% at trigger)\n` +
-                `${decision.triggerType} no longer valid. Position safe.`
-              )
-              pendingTriggers.delete(pos.positionPubkey)
-              updatePositionStatus(pos.positionPubkey, 'monitoring')
-              updatePositionConfirmations(pos.positionPubkey, 0)
-              continue
-            }
-
-            console.log(`[recheck] ${tokenLabel} | fresh PnL: ${usedPnlPct.toFixed(2)}% (${usedPnlSource}) — ${decision.triggerType} confirmed — proceeding with exit`)
-            verifiedPnlPct = usedPnlPct
-          }
-        } catch (err) {
-          console.log(`[recheck] ${tokenLabel} | re-check failed: ${err instanceof Error ? err.message : 'unknown'} — proceeding with exit`)
-        }
-        pendingTriggers.delete(pos.positionPubkey)
-
-        // --- Kirim notifikasi + execute exit ---
-        const meteoraPnlSol = typeof valuation.meteoraPnlSol === 'number' && Number.isFinite(valuation.meteoraPnlSol)
-          ? valuation.meteoraPnlSol
-          : (valuation.estimatedExitSol - pos.basisSol)
-        sendNotification(
-          formatExitStarted(
-            pos.positionPubkey, decision.triggerType, pnlPercent, meteoraPnlSol,
-            pos.basisSol, valuation.estimatedExitSol,
-            pos.tokenXMint.slice(0, 4),
-            pos.tokenYMint.slice(0, 4),
-            pos.poolPubkey, valuation.solUsdPrice
-          )
-        )
-
-        const result = await executeExit(
-          connection,
-          getWallet(),
-          pos.positionPubkey,
-          pos.poolPubkey,
-          pos.tokenXMint,
-          pos.tokenYMint,
-          decision.triggerType,
-          verifiedPnlPct,
-          pos.basisSol,
-          valuation.estimatedExitSol
-        )
-
-        if (result.success) {
-          const quoteIsUsdc = pos.tokenXMint === USDC_MINT || pos.tokenYMint === USDC_MINT
-          const received = quoteIsUsdc ? result.usdcReceived : result.solReceived
-          const adjReceived = received - (quoteIsUsdc ? 0 : result.rentRefundSol)
-          const basisForPnl = quoteIsUsdc ? pos.basisSol * valuation.solUsdPrice : pos.basisSol
-          const finalPnl = basisForPnl > 0
-            ? ((adjReceived - basisForPnl) / basisForPnl) * 100
-            : 0
-          sendNotification(
-            formatExitSuccess(
-              pos.positionPubkey,
-              received,
-              finalPnl,
-              quoteIsUsdc ? 0 : result.rentRefundSol,
-              basisForPnl,
-              result.removeLiqSig || '',
-              result.swapSig,
-              pos.tokenXMint.slice(0, 4),
-              pos.tokenYMint.slice(0, 4),
-              pos.poolPubkey,
-              valuation.solUsdPrice,
-              ownerStr,
-              quoteIsUsdc
-            )
-          )
-        } else {
-          sendNotification(
-            formatExitFailed(
-              pos.positionPubkey,
-              result.error || 'unknown error',
-              pos.tokenXMint.slice(0, 4),
-              pos.tokenYMint.slice(0, 4),
-              pos.poolPubkey
-            )
-          )
-          updatePositionStatus(pos.positionPubkey, 'monitoring')
-          updatePositionConfirmations(pos.positionPubkey, 0)
-        }
-      } else if (decision.triggerType && !decision.shouldTrigger && decision.reason?.includes('awaiting confirmation')) {
-        const count = (pos.triggerConfirmations || 0) + 1
-        updatePositionConfirmations(pos.positionPubkey, count)
-      } else {
-        if ((pos.triggerConfirmations || 0) > 0) {
-          updatePositionConfirmations(pos.positionPubkey, 0)
-        }
-      }
-    } catch (err) {
-      console.log(`[monitor] error on ${pos.positionPubkey.slice(0, 8)}: ${err instanceof Error ? err.message : 'unknown'}`)
+  for (const r of results) {
+    if (r.status === 'rejected') {
+      console.log(`[monitor] cycle position error: ${r.reason?.message || String(r.reason)}`)
     }
   }
 }
@@ -945,7 +850,6 @@ async function maybeRunFlipMode(
   }
 
   if (poolActiveBinId < lowerBinId || poolActiveBinId > upperBinId) {
-    console.log(`[flip] ${tokenLabel} | active bin ${poolActiveBinId} outside range ${lowerBinId}-${upperBinId} — skip`)
     return false
   }
 
@@ -1138,6 +1042,8 @@ async function maybeRunPrecisionCurve(
       updatePrecisionCurveBusy(pos.positionPubkey, false)
 
       if (result.removeSucceeded && result.addFailed) {
+        // Keep PnL exits disabled: part of this position's value is idle in the wallet.
+        updatePrecisionCurveRecoveryUntil(pos.positionPubkey, Number.MAX_SAFE_INTEGER)
         console.log(`[precision] ${tokenLabel} | CRITICAL: remove succeeded but add failed: ${result.error}`)
         sendNotification(
           `🚨 <b>Precision Curve CRITICAL</b>\n\n` +
