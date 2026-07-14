@@ -61,6 +61,8 @@ const MAX_MONITOR_RETRIES = 5
 const PRECISION_CURVE_COOLDOWN_MS = 5_000
 const FLIP_MODE_RECOVERY_MS = 10_000
 const LP_AGENT_GUARD_MIN_INTERVAL_MS = 12_500
+const TRAILING_FAST_POLL_MS = 1_000
+const TRAILING_RECHECK_DELAY_MS = 1_500
 let lastLpAgentGuardAt = 0
 const lastProcessedValuationAt = new Map<string, number>()
 
@@ -110,7 +112,8 @@ export async function startBot(): Promise<void> {
       }
 
       await monitorCycle(getConnection(), walletPubkey, ownerStr)
-      await sleep(config.pollIntervalMs) // pakai config biar fleksibel
+      const fastTrailingPosition = loadActivePositions().some(pos => pos.trailingActivated || pendingTriggers.has(pos.positionPubkey))
+      await sleep(fastTrailingPosition ? TRAILING_FAST_POLL_MS : config.pollIntervalMs)
     } catch (err) {
       console.log(`[loop] cycle error: ${err instanceof Error ? err.message : 'unknown'}`)
       if (err instanceof Error && err.stack) {
@@ -341,7 +344,8 @@ async function monitorSinglePosition(
   }
 
   try {
-    const valuation = await estimateExitValue(pos.poolPubkey, ownerStr, pos.positionPubkey, pos.basisSol)
+    const forceFreshValuation = pos.trailingActivated || pendingTriggers.has(pos.positionPubkey)
+    const valuation = await estimateExitValue(pos.poolPubkey, ownerStr, pos.positionPubkey, pos.basisSol, forceFreshValuation)
     if (!valuation) {
       const retryCount = (monitorRetries.get(pos.positionPubkey) || 0) + 1
       if (retryCount >= MAX_MONITOR_RETRIES) {
@@ -552,20 +556,25 @@ async function monitorSinglePosition(
       }
 
       // --- Re-check with delay ---
-      const pending = pendingTriggers.get(pos.positionPubkey)
+      const recheckDelayMs = triggerType === 'TRAILING_STOP'
+        ? TRAILING_RECHECK_DELAY_MS
+        : config.recheckDelayMs
+      let pending = pendingTriggers.get(pos.positionPubkey)
 
       if (!pending) {
-        pendingTriggers.set(pos.positionPubkey, {
+        pending = {
           triggerType: decision.triggerType,
           timestamp: Date.now(),
           pnlAtTrigger: pnlPercent,
-        })
-        console.log(`[recheck] ${tokenLabel} | ${decision.triggerType} triggered at ${pnlPercent.toFixed(2)}% — waiting ${config.recheckDelayMs}ms for confirmation`)
-        return
+        }
+        pendingTriggers.set(pos.positionPubkey, pending)
+        console.log(`[recheck] ${tokenLabel} | ${decision.triggerType} triggered at ${pnlPercent.toFixed(2)}% — waiting ${recheckDelayMs}ms for confirmation`)
+        if (triggerType !== 'TRAILING_STOP') return
+        await sleep(recheckDelayMs)
       }
 
       const elapsed = Date.now() - pending.timestamp
-      if (elapsed < config.recheckDelayMs) {
+      if (elapsed < recheckDelayMs) {
         return
       }
 
@@ -610,7 +619,7 @@ async function monitorSinglePosition(
           }
         } else if (decision.triggerType === 'TRAILING_STOP') {
           const dropFromPeak = pos.peakPnlPercent - freshPnlPct
-          stillTriggers = freshPnlPct > 0 && dropFromPeak >= config.trailingStopDropPct
+          stillTriggers = dropFromPeak >= config.trailingStopDropPct
         }
 
         if (!stillTriggers) {

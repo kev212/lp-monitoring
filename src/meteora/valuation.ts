@@ -131,10 +131,11 @@ export async function estimateExitValue(
   _walletAddress?: string,
   positionPubkey?: string,
   basisSol = 0,
+  forceFresh = false,
 ): Promise<ValuationResult | null> {
   if (!positionPubkey) return null
   const cached = cache.get(positionPubkey)
-  if (cached && Date.now() - cached.ts < CACHE_TTL_MS) return withBasis(cached.data, basisSol)
+  if (!forceFresh && cached && Date.now() - cached.ts < CACHE_TTL_MS) return withBasis(cached.data, basisSol)
 
   try {
     const onchainPosition = await withValuationFallback(async connection => {
