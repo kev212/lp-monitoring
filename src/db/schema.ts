@@ -11,6 +11,8 @@ export function initSchema(db: Database.Database): void {
       token_y_symbol TEXT NOT NULL DEFAULT '',
       owner TEXT NOT NULL,
       basis_sol REAL NOT NULL DEFAULT 0,
+      quote_currency TEXT NOT NULL DEFAULT 'SOL',
+      basis_quote REAL NOT NULL DEFAULT 0,
       basis_confidence TEXT NOT NULL DEFAULT 'low',
       tp_percent REAL NOT NULL DEFAULT 5,
       sl_percent REAL NOT NULL DEFAULT -15,
@@ -18,6 +20,7 @@ export function initSchema(db: Database.Database): void {
       trigger_confirmations INTEGER NOT NULL DEFAULT 0,
       last_pnl_percent REAL,
       last_estimated_exit_sol REAL,
+      last_estimated_exit_quote REAL,
       last_seen_at INTEGER NOT NULL,
       peak_pnl_percent REAL NOT NULL DEFAULT 0,
       trailing_activated INTEGER NOT NULL DEFAULT 0,
@@ -70,10 +73,14 @@ export function initSchema(db: Database.Database): void {
       trigger_type TEXT NOT NULL,
       trigger_pnl_percent REAL NOT NULL,
       basis_sol REAL NOT NULL,
+      quote_currency TEXT NOT NULL DEFAULT 'SOL',
+      basis_quote REAL NOT NULL DEFAULT 0,
       estimated_exit_sol REAL NOT NULL,
+      estimated_exit_quote REAL NOT NULL DEFAULT 0,
       remove_liq_sig TEXT,
       swap_sig TEXT,
       final_sol_received REAL,
+      final_quote_received REAL,
       status TEXT NOT NULL DEFAULT 'pending_remove',
       error_message TEXT,
       created_at INTEGER NOT NULL,
@@ -98,6 +105,63 @@ export function initSchema(db: Database.Database): void {
     db.exec("ALTER TABLE positions ADD COLUMN token_x_symbol TEXT NOT NULL DEFAULT ''")
     db.exec("ALTER TABLE positions ADD COLUMN token_y_symbol TEXT NOT NULL DEFAULT ''")
   }
+  const hasQuoteCurrency = cols.some((c: any) => c.name === 'quote_currency')
+  const hasBasisQuote = cols.some((c: any) => c.name === 'basis_quote')
+  const hasLastEstimatedExitQuote = cols.some((c: any) => c.name === 'last_estimated_exit_quote')
+  if (!hasQuoteCurrency) {
+    db.exec("ALTER TABLE positions ADD COLUMN quote_currency TEXT NOT NULL DEFAULT 'SOL'")
+  }
+  if (!hasBasisQuote) {
+    db.exec("ALTER TABLE positions ADD COLUMN basis_quote REAL NOT NULL DEFAULT 0")
+  }
+  if (!hasLastEstimatedExitQuote) {
+    db.exec("ALTER TABLE positions ADD COLUMN last_estimated_exit_quote REAL")
+  }
+  if (!hasQuoteCurrency || !hasBasisQuote || !hasLastEstimatedExitQuote) {
+    db.exec(`
+      UPDATE positions
+      SET quote_currency = COALESCE(NULLIF(quote_currency, ''), 'SOL'),
+          basis_quote = CASE WHEN basis_quote = 0 THEN basis_sol ELSE basis_quote END,
+          last_estimated_exit_quote = COALESCE(last_estimated_exit_quote, last_estimated_exit_sol)
+    `)
+  }
+
+  const executionCols = db.prepare("PRAGMA table_info('executions')").all() as any[]
+  const hasExecutionQuoteCurrency = executionCols.some((c: any) => c.name === 'quote_currency')
+  const hasExecutionBasisQuote = executionCols.some((c: any) => c.name === 'basis_quote')
+  const hasExecutionEstimatedExitQuote = executionCols.some((c: any) => c.name === 'estimated_exit_quote')
+  const hasExecutionFinalQuoteReceived = executionCols.some((c: any) => c.name === 'final_quote_received')
+  if (!hasExecutionQuoteCurrency) {
+    db.exec("ALTER TABLE executions ADD COLUMN quote_currency TEXT NOT NULL DEFAULT 'SOL'")
+  }
+  if (!hasExecutionBasisQuote) {
+    db.exec("ALTER TABLE executions ADD COLUMN basis_quote REAL NOT NULL DEFAULT 0")
+  }
+  if (!hasExecutionEstimatedExitQuote) {
+    db.exec("ALTER TABLE executions ADD COLUMN estimated_exit_quote REAL NOT NULL DEFAULT 0")
+  }
+  if (!hasExecutionFinalQuoteReceived) {
+    db.exec("ALTER TABLE executions ADD COLUMN final_quote_received REAL")
+  }
+  if (!hasExecutionQuoteCurrency || !hasExecutionBasisQuote || !hasExecutionEstimatedExitQuote || !hasExecutionFinalQuoteReceived) {
+    db.exec(`
+      UPDATE executions
+      SET quote_currency = COALESCE(NULLIF(quote_currency, ''), 'SOL'),
+          basis_quote = CASE WHEN basis_quote = 0 THEN basis_sol ELSE basis_quote END,
+          estimated_exit_quote = CASE WHEN estimated_exit_quote = 0 THEN estimated_exit_sol ELSE estimated_exit_quote END,
+          final_quote_received = CASE
+            WHEN final_quote_received IS NULL AND quote_currency = 'SOL' THEN final_sol_received
+            ELSE final_quote_received
+          END
+    `)
+  }
+  db.exec(`
+    UPDATE executions
+    SET final_quote_received = final_sol_received
+    WHERE final_quote_received IS NULL
+      AND quote_currency = 'SOL'
+      AND final_sol_received IS NOT NULL
+  `)
   const hasStrategy = cols.some((c: any) => c.name === 'strategy')
   if (!hasStrategy) {
     db.exec("ALTER TABLE positions ADD COLUMN strategy TEXT NOT NULL DEFAULT 'unknown'")

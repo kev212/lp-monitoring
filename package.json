@@ -6,7 +6,8 @@
     "build": "tsc",
     "start": "tsx src/index.ts",
     "dev": "tsx watch src/index.ts",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "test": "tsx --test test/valuation.test.ts"
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.29.0",

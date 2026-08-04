@@ -1,6 +1,6 @@
 import { Connection, PublicKey } from '@solana/web3.js'
 import { getDb } from '../db/client.js'
-import type { PositionRow, BasisConfidence, StrategyType, TokenSide } from '../types.js'
+import type { PositionRow, BasisConfidence, QuoteCurrency, StrategyType, TokenSide } from '../types.js'
 
 const DLMM_PROGRAM_ID = new PublicKey('LBUZKhbPFn5XX4kz4LZ7Qd8hLEjNvF7M7bQeFqF7gYx')
 
@@ -17,6 +17,7 @@ export interface DiscoveredPosition {
 }
 
 function rowToPosition(row: any): PositionRow {
+  const quoteCurrency: QuoteCurrency = row.quote_currency === 'USDC' ? 'USDC' : 'SOL'
   return {
     positionPubkey: row.position_pubkey,
     poolPubkey: row.pool_pubkey,
@@ -25,7 +26,8 @@ function rowToPosition(row: any): PositionRow {
     tokenXSymbol: row.token_x_symbol || '',
     tokenYSymbol: row.token_y_symbol || '',
     owner: row.owner,
-    basisSol: row.basis_sol,
+    quoteCurrency,
+    basisQuote: row.basis_quote ?? row.basis_sol ?? 0,
     basisConfidence: row.basis_confidence,
     tpPercent: row.tp_percent,
     slPercent: row.sl_percent,
@@ -34,7 +36,7 @@ function rowToPosition(row: any): PositionRow {
     peakPnlPercent: row.peak_pnl_percent ?? 0,
     trailingActivated: row.trailing_activated === 1,
     lastPnlPercent: row.last_pnl_percent,
-    lastEstimatedExitSol: row.last_estimated_exit_sol,
+    lastEstimatedExitQuote: row.last_estimated_exit_quote ?? row.last_estimated_exit_sol,
     lastSeenAt: row.last_seen_at,
     strategy: row.strategy || 'unknown',
     precisionCurveEnabled: row.precision_curve_enabled === 1,
@@ -86,7 +88,9 @@ export function upsertPosition(row: {
   tokenXSymbol: string
   tokenYSymbol: string
   owner: string
-  basisSol: number
+  quoteCurrency: QuoteCurrency
+  basisQuote: number
+  basisSolLegacy: number
   basisConfidence: BasisConfidence
   tpPercent: number
   slPercent: number
@@ -95,7 +99,8 @@ export function upsertPosition(row: {
   peakPnlPercent: number
   trailingActivated: boolean
   lastPnlPercent: number | null
-  lastEstimatedExitSol: number | null
+  lastEstimatedExitQuote: number | null
+  lastEstimatedExitSolLegacy: number | null
   lastSeenAt: number
   strategy: StrategyType
   flipModeEnabled?: boolean
@@ -104,18 +109,20 @@ export function upsertPosition(row: {
   const now = Date.now()
   db.prepare(`
     INSERT INTO positions (position_pubkey, pool_pubkey, token_x_mint, token_y_mint, token_x_symbol, token_y_symbol, owner,
-      basis_sol, basis_confidence, tp_percent, sl_percent, status, trigger_confirmations,
+      basis_sol, quote_currency, basis_quote, basis_confidence, tp_percent, sl_percent, status, trigger_confirmations,
       peak_pnl_percent, trailing_activated, strategy,
       flip_mode_enabled,
-      last_pnl_percent, last_estimated_exit_sol, last_seen_at, created_at, updated_at)
+      last_pnl_percent, last_estimated_exit_sol, last_estimated_exit_quote, last_seen_at, created_at, updated_at)
     VALUES (@positionPubkey, @poolPubkey, @tokenXMint, @tokenYMint, @tokenXSymbol, @tokenYSymbol, @owner,
-      @basisSol, @basisConfidence, @tpPercent, @slPercent, @status, @triggerConfirmations,
+      @basisSolLegacy, @quoteCurrency, @basisQuote, @basisConfidence, @tpPercent, @slPercent, @status, @triggerConfirmations,
       @peakPnlPercent, @trailingActivated, @strategy,
       @flipModeEnabled,
-      @lastPnlPercent, @lastEstimatedExitSol, @lastSeenAt, @createdAt, @updatedAt)
+      @lastPnlPercent, @lastEstimatedExitSolLegacy, @lastEstimatedExitQuote, @lastSeenAt, @createdAt, @updatedAt)
     ON CONFLICT(position_pubkey) DO UPDATE SET
       status = @status,
-      basis_sol = @basisSol,
+      basis_sol = @basisSolLegacy,
+      quote_currency = @quoteCurrency,
+      basis_quote = @basisQuote,
       basis_confidence = @basisConfidence,
       token_x_symbol = @tokenXSymbol,
       token_y_symbol = @tokenYSymbol,
@@ -124,7 +131,8 @@ export function upsertPosition(row: {
       trailing_activated = COALESCE(@trailingActivated, trailing_activated),
       strategy = @strategy,
       last_pnl_percent = @lastPnlPercent,
-      last_estimated_exit_sol = @lastEstimatedExitSol,
+      last_estimated_exit_sol = @lastEstimatedExitSolLegacy,
+      last_estimated_exit_quote = @lastEstimatedExitQuote,
       last_seen_at = @lastSeenAt,
       updated_at = @updatedAt
   `).run({
@@ -140,10 +148,53 @@ export function updatePositionStatus(pubkey: string, status: PositionRow['status
   getDb().prepare('UPDATE positions SET status = ?, updated_at = ? WHERE position_pubkey = ?').run(status, Date.now(), pubkey)
 }
 
-export function updatePositionPnl(pubkey: string, pnlPercent: number, estimatedExitSol: number): void {
+export function isBasisIncrease(currentBasis: number, candidateBasis: number): boolean {
+  return Number.isFinite(currentBasis) && Number.isFinite(candidateBasis) && candidateBasis > currentBasis + 1e-9
+}
+
+/** Keep gross deposits monotonic; withdrawals are tracked separately by Meteora. */
+export function updatePositionBasisIfHigher(
+  pubkey: string,
+  quoteCurrency: QuoteCurrency,
+  candidateBasis: number,
+): boolean {
+  if (!Number.isFinite(candidateBasis) || candidateBasis <= 0) return false
+
+  const db = getDb()
+  const current = db.prepare(
+    'SELECT quote_currency, basis_quote, status FROM positions WHERE position_pubkey = ?'
+  ).get(pubkey) as { quote_currency: string; basis_quote: number; status: PositionRow['status'] } | undefined
+  if (!current || !['discovering', 'monitoring'].includes(current.status)) return false
+  if (current.quote_currency !== quoteCurrency || !isBasisIncrease(Number(current.basis_quote || 0), candidateBasis)) {
+    return false
+  }
+
+  const legacyBasis = quoteCurrency === 'SOL' ? candidateBasis : 0
+  const result = db.prepare(`
+    UPDATE positions
+    SET basis_quote = ?,
+        basis_sol = ?,
+        basis_confidence = CASE WHEN basis_confidence = 'high' THEN basis_confidence ELSE 'medium' END,
+        updated_at = ?
+    WHERE position_pubkey = ?
+      AND quote_currency = ?
+      AND status IN ('discovering', 'monitoring')
+      AND basis_quote < ?
+  `).run(candidateBasis, legacyBasis, Date.now(), pubkey, quoteCurrency, candidateBasis)
+
+  return result.changes > 0
+}
+
+export function updatePositionPnl(
+  pubkey: string,
+  pnlPercent: number,
+  estimatedExitQuote: number,
+  quoteCurrency: QuoteCurrency,
+): void {
+  const estimatedExitSol = quoteCurrency === 'SOL' ? estimatedExitQuote : 0
   getDb().prepare(
-    'UPDATE positions SET last_pnl_percent = ?, last_estimated_exit_sol = ?, last_seen_at = ?, updated_at = ? WHERE position_pubkey = ?'
-  ).run(pnlPercent, estimatedExitSol, Date.now(), Date.now(), pubkey)
+    'UPDATE positions SET last_pnl_percent = ?, last_estimated_exit_sol = ?, last_estimated_exit_quote = ?, last_seen_at = ?, updated_at = ? WHERE position_pubkey = ?'
+  ).run(pnlPercent, estimatedExitSol, estimatedExitQuote, Date.now(), Date.now(), pubkey)
 }
 
 export function updatePositionConfirmations(pubkey: string, count: number): void {

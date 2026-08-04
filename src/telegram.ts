@@ -2,6 +2,7 @@ import TelegramBot from 'node-telegram-bot-api'
 import { config } from './config.js'
 import { loadActivePositions, updateFlipModeEnabled, updatePrecisionCurveEnabled, updatePrecisionCurveThreshold } from './meteora/discovery.js'
 import { getDb } from './db/client.js'
+import type { QuoteCurrency } from './types.js'
 
 let _bot: TelegramBot | null = null
 
@@ -159,12 +160,12 @@ function sendStatusMenu(bot: TelegramBot, chatId: number | string): void {
       const pnl = p.lastPnlPercent ?? 0
       const sign = pnl >= 0 ? '+' : ''
       const emoji = pnl >= 5 ? '🟢' : pnl >= 0 ? '📘' : pnl >= -5 ? '📙' : '🔴'
-      const value = p.lastEstimatedExitSol ?? 0
+      const value = p.lastEstimatedExitQuote ?? 0
       const peak = p.peakPnlPercent ?? 0
       const trail = p.trailingActivated ? ' 🔻' : ''
       const modes = `${p.precisionCurveEnabled ? ' Precision' : ''}${p.flipModeEnabled ? ' Flip' : ''}${p.flipModePendingAdd ? ' FlipPending' : ''}`
       return `${idx + 1}. ${emoji} <b>${label}</b> <code>${shortAddr(p.positionPubkey)}</code>\n` +
-        `   PnL: <b>${sign}${pnl.toFixed(2)}%</b> | Value: <b>${value.toFixed(4)} SOL</b>\n` +
+        `   PnL: <b>${sign}${pnl.toFixed(2)}%</b> | Value: <b>${formatQuoteValue(value, p.quoteCurrency)}</b>\n` +
         `   SL: <b>${p.slPercent}%</b> TP: <b>+${p.tpPercent}%</b> | Peak: <b>${peak.toFixed(2)}%</b>${trail}${modes}`
     }),
   ]
@@ -332,17 +333,25 @@ function fmtDollar(val: number, solPrice: number): string {
   return `<b>$${(val * solPrice).toFixed(2)}</b>`
 }
 
-/** Format PnL: emoji + SOL + % + USD (SOL basis prioritized) */
-function fmtPnl(pct: number, diff: number, solPrice: number, isUsdc = false): string {
+function formatQuoteValue(value: number, quoteCurrency: QuoteCurrency): string {
+  return quoteCurrency === 'USDC'
+    ? `$${value.toFixed(2)} USDC`
+    : `${value.toFixed(4)} SOL`
+}
+
+/** Format PnL in the position's quote currency. */
+function fmtPnl(pct: number, diff: number, quoteCurrency: QuoteCurrency, solPrice: number): string {
   const sign = pct >= 0 ? '+' : ''
   const emoji = pct >= 15 ? '🟢' : pct >= 5 ? '📗' : pct >= 0 ? '📘' : pct >= -5 ? '📙' : pct >= -15 ? '🟠' : '🔴'
-  if (isUsdc) {
+  if (quoteCurrency === 'USDC') {
     const usdStr = diff >= 0 ? `<b>+$${diff.toFixed(2)}</b>` : `<b>-$${Math.abs(diff).toFixed(2)}</b>`
     return `${emoji} ${usdStr} (${sign}${pct.toFixed(2)}%)`
   }
   const solStr = diff >= 0 ? `<b>+${diff.toFixed(4)} SOL</b>` : `<b>${diff.toFixed(4)} SOL</b>`
-  const usdStr = diff >= 0 ? `<b>+$${(diff * solPrice).toFixed(2)}</b>` : `<b>-$${Math.abs(diff * solPrice).toFixed(2)}</b>`
-  return `${emoji} ${solStr} (${sign}${pct.toFixed(2)}% / ${usdStr})`
+  const usdStr = solPrice > 0
+    ? (diff >= 0 ? `<b>+$${(diff * solPrice).toFixed(2)}</b>` : `<b>-$${Math.abs(diff * solPrice).toFixed(2)}</b>`)
+    : ''
+  return `${emoji} ${solStr} (${sign}${pct.toFixed(2)}%${usdStr ? ` / ${usdStr}` : ''})`
 }
 
 // ─── Separator ──────────────────────────────────────────────────────
@@ -374,12 +383,14 @@ export function formatBotStop(): string {
 export function formatPositionDiscovered(
   pubkey: string,
   pool: string,
-  depositSol: number,
+  depositQuote: number,
   confidence: string,
   tokenX: string,
   tokenY: string,
-  valueSol: number,
+  valueQuote: number,
   pnlPct: number,
+  pnlQuote: number,
+  quoteCurrency: QuoteCurrency,
   solUsdPrice: number,
   wallet: string,
   /** Token X amount (actual units, not SOL) */
@@ -401,7 +412,6 @@ export function formatPositionDiscovered(
   flipModeReason?: string,
 ): string {
   const confidenceEmoji = confidence === 'high' ? '🟢' : confidence === 'medium' ? '🟡' : '⚪'
-  const profitSol = valueSol - depositSol
 
   // Build "Your Liquidity" with token breakdown
   let liquidityStr: string
@@ -409,9 +419,9 @@ export function formatPositionDiscovered(
     const parts: string[] = []
     if (tokenXAmount > 0.0001) parts.push(`<b>${tokenXAmount.toFixed(2)} ${tokenX}</b>`)
     if (tokenYAmount > 0.0001) parts.push(`<b>${tokenYAmount.toFixed(3)} ${tokenY}</b>`)
-    liquidityStr = parts.join(' + ') + ` (${fmtDollar(valueSol, solUsdPrice)})`
+    liquidityStr = parts.join(' + ') + ` (${formatQuoteValue(valueQuote, quoteCurrency)})`
   } else {
-    liquidityStr = `${fmtSol(valueSol)} (${fmtDollar(valueSol, solUsdPrice)})`
+    liquidityStr = formatQuoteValue(valueQuote, quoteCurrency)
   }
 
   // Build "Fees" line
@@ -432,8 +442,8 @@ export function formatPositionDiscovered(
     `Position: <code>${shortAddr(pubkey)}</code>`,
     `Pool: ${meteoraPool(pool)}`,
     sep(),
-    `PnL: ${fmtPnl(pnlPct, profitSol, solUsdPrice)}`,
-    `Deposit: ${fmtSol(depositSol)} (${fmtDollar(depositSol, solUsdPrice)})`,
+    `PnL: ${fmtPnl(pnlPct, pnlQuote, quoteCurrency, solUsdPrice)}`,
+    `Deposit: ${formatQuoteValue(depositQuote, quoteCurrency)}`,
     `Your Liquidity: ${liquidityStr}`,
     `Fees: ${feesStr}`,
     `Confidence: ${confidenceEmoji} <b>${confidence}</b>`,
@@ -453,13 +463,14 @@ export function formatExitStarted(
   pubkey: string,
   triggerType: string,
   pnlPercent: number,
-  pnlSol: number,
-  depositSol: number,
-  valueSol: number,
+  pnlQuote: number,
+  depositQuote: number,
+  valueQuote: number,
   tokenX: string,
   tokenY: string,
   pool: string,
-  solUsdPrice: number
+  solUsdPrice: number,
+  quoteCurrency: QuoteCurrency,
 ): string {
   const emoji = triggerType === 'TP' ? '🎯' : triggerType === 'TRAILING_STOP' ? '🔻' : '🛡️'
   return [
@@ -469,11 +480,11 @@ export function formatExitStarted(
     `Position: <code>${shortAddr(pubkey)}</code>`,
     `Pool: ${meteoraPool(pool)}`,
     sep(),
-    `PnL: ${fmtPnl(pnlPercent, pnlSol, solUsdPrice)}`,
-    `Deposit: ${fmtSol(depositSol)} (${fmtDollar(depositSol, solUsdPrice)})`,
-    `Your Liquidity: ${fmtSol(valueSol)} (${fmtDollar(valueSol, solUsdPrice)})`,
+    `PnL: ${fmtPnl(pnlPercent, pnlQuote, quoteCurrency, solUsdPrice)}`,
+    `Deposit: ${formatQuoteValue(depositQuote, quoteCurrency)}`,
+    `Your Liquidity: ${formatQuoteValue(valueQuote, quoteCurrency)}`,
     sep(),
-    `<i>Removing liquidity & swapping to SOL...</i>`,
+    `<i>Removing liquidity & swapping to ${quoteCurrency}...</i>`,
   ].join('\n')
 }
 
@@ -483,8 +494,9 @@ export function formatExitSuccess(
   pubkey: string,
   received: number,
   pnlPercent: number,
-  rentRefundSol: number,
-  depositSol: number,
+  pnlQuote: number,
+  rentRefundQuote: number,
+  depositQuote: number,
   removeSig: string,
   swapSig: string | null,
   tokenX: string,
@@ -492,15 +504,10 @@ export function formatExitSuccess(
   pool: string,
   solPrice: number,
   wallet: string,
-  isUsdc: boolean = false
+  quoteCurrency: QuoteCurrency,
 ): string {
-  const adjReceived = received - rentRefundSol
-  const profitSol = adjReceived - depositSol
-  const receivedLabel = isUsdc ? `<b>$${received.toFixed(2)} USDC</b>` : fmtSol(received)
-  const depositLabel = isUsdc ? `<b>$${depositSol.toFixed(2)} USDC equiv</b>` : fmtSol(depositSol)
-  const profitLabel = isUsdc
-    ? (profitSol >= 0 ? `<b>+$${profitSol.toFixed(2)}</b>` : `<b>-$${Math.abs(profitSol).toFixed(2)}</b>`)
-    : fmtSol(profitSol)
+  const receivedLabel = formatQuoteValue(received, quoteCurrency)
+  const depositLabel = formatQuoteValue(depositQuote, quoteCurrency)
   return [
     `✅ <b>Exit Complete</b>`,
     sep(),
@@ -508,15 +515,16 @@ export function formatExitSuccess(
     `Position: <code>${shortAddr(pubkey)}</code>`,
     `Pool: ${meteoraPool(pool)}`,
     sep(),
-    `PnL: ${fmtPnl(pnlPercent, profitSol, solPrice, isUsdc)}`,
+    `PnL: ${fmtPnl(pnlPercent, pnlQuote, quoteCurrency, solPrice)}`,
     `Deposit: ${depositLabel}`,
     `Received: ${receivedLabel}`,
+    rentRefundQuote > 0 ? `Rent refund: ${formatQuoteValue(rentRefundQuote, quoteCurrency)}` : null,
     sep(),
     `Remove: ${solscanTx(removeSig)}`,
-    swapSig ? `Swap: ${solscanTx(swapSig)}` : 'Swap: <i>none (SOL-only)</i>',
+    swapSig ? `Swap: ${solscanTx(swapSig)}` : 'Swap: <i>none (quote-only)</i>',
     sep(),
     `Wallet: ${solscanAddr(wallet)} · ${gmgnWallet(wallet)}`,
-  ].join('\n')
+  ].filter(Boolean).join('\n')
 }
 
 // ─── Exit Failed ────────────────────────────────────────────────────
@@ -562,7 +570,7 @@ export function formatPnlAlert(
     `Position: <code>${shortAddr(pubkey)}</code>`,
     `Pool: ${meteoraPool(pool)}`,
     sep(),
-    `PnL: ${fmtPnl(pnlPercent, profitSol, solPrice)}`,
+    `PnL: ${fmtPnl(pnlPercent, profitSol, 'SOL', solPrice)}`,
     `Deposit: ${fmtSol(depositSol)} (${fmtDollar(depositSol, solPrice)})`,
     `Your Liquidity: ${fmtSol(valueSol)} (${fmtDollar(valueSol, solPrice)})`,
   ].join('\n')

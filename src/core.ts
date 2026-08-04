@@ -8,6 +8,7 @@ import {
   loadActivePositions,
   upsertPosition,
   updatePositionStatus,
+  updatePositionBasisIfHigher,
   updatePositionPnl,
   updatePositionConfirmations,
   updatePeakPnl,
@@ -31,7 +32,7 @@ import {
   getPool,
   getPoolInfo,
 } from './meteora/positions.js'
-import { clearPnlCache, estimateExitValue, getDiscoveryBasis, type ValuationResult } from './meteora/valuation.js'
+import { clearPnlCache, estimateExitValue, getQuoteCurrency, type ValuationResult } from './meteora/valuation.js'
 import { fetchLpAgentPositions, type LpAgentPosition } from './lpagent.js'
 import { executeExit } from './meteora/exit.js'
 import { executeDirectionalPrecisionCurve, THRESHOLD_RATIO, THRESHOLD_MIN, RECOVERY_MS } from './meteora/precisionCurve.js'
@@ -46,7 +47,7 @@ import {
   formatBotStart,
   formatBotStop,
 } from './telegram.js'
-import type { PositionRow, BasisConfidence, TriggerType, StrategyType } from './types.js'
+import type { PositionRow, BasisConfidence, QuoteCurrency, TriggerType, StrategyType } from './types.js'
 
 const SOL_MINT = 'So11111111111111111111111111111111111111112'
 const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
@@ -70,11 +71,17 @@ function lpAgentPnl(position: LpAgentPosition): number {
   return position.pnlPercentNative
 }
 
-function pnlFromValuation(valuation: ValuationResult, basisSol: number): { pnlPercent: number; source: string } {
+function pnlFromValuation(valuation: ValuationResult): { pnlPercent: number; source: string } {
   return {
-    pnlPercent: basisSol > 0 ? valuation.onchainPnlPercent : 0,
+    pnlPercent: valuation.pnlPercent,
     source: valuation.source,
   }
+}
+
+function formatQuoteLog(value: number, quoteCurrency: QuoteCurrency): string {
+  return quoteCurrency === 'USDC'
+    ? `${value.toFixed(2)} USDC`
+    : `${value.toFixed(6)} SOL`
 }
 
 export async function startBot(): Promise<void> {
@@ -159,16 +166,23 @@ async function discoverInitialPositions(connection: Connection, walletPubkey: Pu
         }
       }
 
+      const quoteCurrency = getQuoteCurrency(tokenXMint, tokenYMint)
+      if (!quoteCurrency) {
+        console.log(`[discovery] ${dp.positionPubkey.slice(0, 8)} — unsupported quote, expected SOL or USDC`)
+        continue
+      }
+
       let currentValue = 0
       let finalBasis = 0
       let pnlPct = 0
       let val: Awaited<ReturnType<typeof estimateExitValue>> = null
       try {
-        val = await estimateExitValue(dp.poolPubkey, ownerStr, dp.positionPubkey)
-        currentValue = val?.estimatedExitSol || 0
-        finalBasis = await getDiscoveryBasis(dp.poolPubkey, ownerStr, dp.positionPubkey)
+        val = await estimateExitValue(dp.poolPubkey, ownerStr, dp.positionPubkey, quoteCurrency)
+        currentValue = val?.estimatedExitQuote || 0
+        finalBasis = val?.depositQuote || 0
+        pnlPct = val?.pnlPercent || 0
       } catch {
-        // Position remains discoverable; monitoring retries on-chain valuation.
+        // Position remains discoverable; monitoring retries Meteora valuation.
       }
 
       const finalConfidence: BasisConfidence = finalBasis > 0 ? 'medium' : 'low'
@@ -241,7 +255,9 @@ async function discoverInitialPositions(connection: Connection, walletPubkey: Pu
         tokenXSymbol: finalTokenXSymbol,
         tokenYSymbol: finalTokenYSymbol,
         owner: ownerStr,
-        basisSol: finalBasis,
+        quoteCurrency,
+        basisQuote: finalBasis,
+        basisSolLegacy: val?.depositSol || 0,
         basisConfidence: finalConfidence,
         tpPercent,
         slPercent,
@@ -250,7 +266,8 @@ async function discoverInitialPositions(connection: Connection, walletPubkey: Pu
         peakPnlPercent: 0,
         trailingActivated: false,
         lastPnlPercent: null,
-        lastEstimatedExitSol: null,
+        lastEstimatedExitQuote: null,
+        lastEstimatedExitSolLegacy: null,
         lastSeenAt: Date.now(),
         strategy,
         flipModeEnabled,
@@ -260,7 +277,7 @@ async function discoverInitialPositions(connection: Connection, walletPubkey: Pu
         dp.positionPubkey, dp.poolPubkey, finalBasis, finalConfidence,
         finalTokenXSymbol,
         finalTokenYSymbol,
-        currentValue, pnlPct, val?.solUsdPrice || 0, ownerStr,
+        currentValue, pnlPct, val?.pnlQuote || 0, quoteCurrency, val?.solUsdPrice || 0, ownerStr,
         val?.tokenXAmount, val?.tokenYAmount,
         val?.tokenXFees, val?.tokenYFees,
         strategy, slPercent, tpPercent,
@@ -268,7 +285,7 @@ async function discoverInitialPositions(connection: Connection, walletPubkey: Pu
       ))
       const isDupeDiscovery = loadKnownPositions().some(p => p.tokenXMint === tokenXMint && p.positionPubkey !== dp.positionPubkey)
       const dupMarkerDisc = isDupeDiscovery ? ' [DUPE-TOKEN]' : ''
-      console.log(`[discovery] registered position ${dp.positionPubkey.slice(0, 8)}${dupMarkerDisc} strategy=${strategy} SL=${slPercent}% TP=${tpPercent}% basis=${finalBasis.toFixed(6)} SOL${finalBasis > 0 ? '' : ' (pending)'}`)
+      console.log(`[discovery] registered position ${dp.positionPubkey.slice(0, 8)}${dupMarkerDisc} strategy=${strategy} quote=${quoteCurrency} SL=${slPercent}% TP=${tpPercent}% basis=${formatQuoteLog(finalBasis, quoteCurrency)}${finalBasis > 0 ? '' : ' (pending)'}`)
     } catch (err) {
       console.log(`[discovery] failed on ${dp.positionPubkey.slice(0, 8)}: ${err instanceof Error ? err.message : 'unknown'}`)
     }
@@ -345,7 +362,7 @@ async function monitorSinglePosition(
 
   try {
     const forceFreshValuation = pos.trailingActivated || pendingTriggers.has(pos.positionPubkey)
-    const valuation = await estimateExitValue(pos.poolPubkey, ownerStr, pos.positionPubkey, pos.basisSol, forceFreshValuation)
+    const valuation = await estimateExitValue(pos.poolPubkey, ownerStr, pos.positionPubkey, pos.quoteCurrency, forceFreshValuation)
     if (!valuation) {
       const retryCount = (monitorRetries.get(pos.positionPubkey) || 0) + 1
       if (retryCount >= MAX_MONITOR_RETRIES) {
@@ -371,15 +388,22 @@ async function monitorSinglePosition(
     }
     monitorRetries.delete(pos.positionPubkey)
 
-    if (pos.basisSol <= 0) {
-      updatePositionPnl(pos.positionPubkey, 0, valuation.estimatedExitSol)
-      console.log(`[monitor] ${pos.positionPubkey.slice(0, 8)} | deposit basis pending — PnL triggers paused | Value: ${valuation.estimatedExitSol.toFixed(6)} SOL`)
+    const previousBasis = pos.basisQuote
+    if (updatePositionBasisIfHigher(pos.positionPubkey, pos.quoteCurrency, valuation.depositQuote)) {
+      pos.basisQuote = valuation.depositQuote
+      if (pos.basisConfidence !== 'high') pos.basisConfidence = 'medium'
+      console.log(`[basis] ${pos.positionPubkey.slice(0, 8)} | ${formatQuoteLog(previousBasis, pos.quoteCurrency)} -> ${formatQuoteLog(pos.basisQuote, pos.quoteCurrency)} from Meteora all-time deposits`)
+    }
+
+    if (pos.basisQuote <= 0) {
+      updatePositionPnl(pos.positionPubkey, 0, valuation.estimatedExitQuote, pos.quoteCurrency)
+      console.log(`[monitor] ${pos.positionPubkey.slice(0, 8)} | deposit basis pending — PnL triggers paused | Value: ${formatQuoteLog(valuation.estimatedExitQuote, pos.quoteCurrency)}`)
       return
     }
 
-    const { pnlPercent, source: pnlSource } = pnlFromValuation(valuation, pos.basisSol)
+    const { pnlPercent, source: pnlSource } = pnlFromValuation(valuation)
 
-    updatePositionPnl(pos.positionPubkey, pnlPercent, valuation.estimatedExitSol)
+    updatePositionPnl(pos.positionPubkey, pnlPercent, valuation.estimatedExitQuote, pos.quoteCurrency)
 
     // A cached quote must not satisfy multiple trigger confirmations.
     const isNewValuation = lastProcessedValuationAt.get(pos.positionPubkey) !== valuation.observedAt
@@ -398,9 +422,9 @@ async function monitorSinglePosition(
       : (pos.tpPercent ?? config.defaultTpPercent)
     console.log(
       `[monitor] ${tokenLabel}${dupMarker} | ${pos.status} | PnL: ${pnlSign}${pnlPercent.toFixed(2)}% (${pnlSource})` +
-      ` | Value: ${valuation.estimatedExitSol.toFixed(6)} SOL` +
-      ` | Withdrawn: ${valuation.allTimeWithdrawalSol.toFixed(6)} SOL` +
-      ` | Basis: ${pos.basisSol.toFixed(6)} SOL` +
+      ` | Value: ${formatQuoteLog(valuation.estimatedExitQuote, pos.quoteCurrency)}` +
+      ` | Withdrawn: ${formatQuoteLog(valuation.withdrawalQuote, pos.quoteCurrency)}` +
+      ` | Basis: ${formatQuoteLog(pos.basisQuote, pos.quoteCurrency)}` +
       ` | SL: ${pos.slPercent}% TP: +${effectiveTp}%${pos.drawdownTpOverrideActive ? ' (DD LOCK)' : ''}` +
       ` | Peak: ${pos.peakPnlPercent.toFixed(2)}%` +
       ` | ${triggerInfo}`
@@ -583,10 +607,10 @@ async function monitorSinglePosition(
       let exitValuation = valuation
       try {
         clearPnlCache()
-        const freshValuation = await estimateExitValue(pos.poolPubkey, ownerStr, pos.positionPubkey, pos.basisSol)
-        if (!freshValuation) throw new Error('fresh on-chain valuation unavailable')
+        const freshValuation = await estimateExitValue(pos.poolPubkey, ownerStr, pos.positionPubkey, pos.quoteCurrency, true)
+        if (!freshValuation) throw new Error('fresh Meteora valuation unavailable')
 
-        const freshPnlPct = pnlFromValuation(freshValuation, pos.basisSol).pnlPercent
+        const freshPnlPct = pnlFromValuation(freshValuation).pnlPercent
         let recheckLpAgent = lpAgentAtTrigger
         if (!recheckLpAgent) {
           try {
@@ -623,11 +647,11 @@ async function monitorSinglePosition(
         }
 
         if (!stillTriggers) {
-          console.log(`[recheck] ${tokenLabel} | fresh on-chain PnL: ${freshPnlPct.toFixed(2)}% — ${decision.triggerType} no longer valid (was ${pending.pnlAtTrigger.toFixed(2)}%) — skip exit`)
+          console.log(`[recheck] ${tokenLabel} | fresh Meteora PnL: ${freshPnlPct.toFixed(2)}% — ${decision.triggerType} no longer valid (was ${pending.pnlAtTrigger.toFixed(2)}%) — skip exit`)
           sendNotification(
             `⚠️ <b>Exit Skipped — PnL Re-check</b>\n\n` +
             `<b>${tokenLabel}</b>\n` +
-            `Fresh on-chain PnL: <b>${freshPnlPct.toFixed(2)}%</b>\n` +
+            `Fresh Meteora PnL: <b>${freshPnlPct.toFixed(2)}%</b>\n` +
             `(was ${pending.pnlAtTrigger.toFixed(2)}% at trigger)\n` +
             `${decision.triggerType} no longer valid. Position safe.`
           )
@@ -637,7 +661,7 @@ async function monitorSinglePosition(
           return
         }
 
-        console.log(`[recheck] ${tokenLabel} | fresh on-chain PnL: ${freshPnlPct.toFixed(2)}% — ${decision.triggerType} confirmed — proceeding with exit`)
+        console.log(`[recheck] ${tokenLabel} | fresh Meteora PnL: ${freshPnlPct.toFixed(2)}% — ${decision.triggerType} confirmed — proceeding with exit`)
         verifiedPnlPct = freshPnlPct
         exitValuation = freshValuation
       } catch (err) {
@@ -649,14 +673,14 @@ async function monitorSinglePosition(
       pendingTriggers.delete(pos.positionPubkey)
 
       // --- Execute exit ---
-      const estimatedPnl = exitValuation.estimatedExitSol - pos.basisSol
+      const estimatedPnl = exitValuation.pnlQuote
       sendNotification(
         formatExitStarted(
           pos.positionPubkey, decision.triggerType, verifiedPnlPct, estimatedPnl,
-          pos.basisSol, exitValuation.estimatedExitSol,
+          pos.basisQuote, exitValuation.estimatedExitQuote,
           pos.tokenXMint.slice(0, 4),
           pos.tokenYMint.slice(0, 4),
-          pos.poolPubkey, exitValuation.solUsdPrice
+          pos.poolPubkey, exitValuation.solUsdPrice, pos.quoteCurrency
         )
       )
 
@@ -664,24 +688,26 @@ async function monitorSinglePosition(
         connection, getWallet(), pos.positionPubkey, pos.poolPubkey,
         pos.tokenXMint, pos.tokenYMint,
         triggerType, verifiedPnlPct,
-        pos.basisSol, exitValuation.estimatedExitSol
+        pos.quoteCurrency, pos.basisQuote, exitValuation.estimatedExitQuote
       )
 
       if (result.success) {
-        const received = result.solReceived
-        const adjReceived = received - result.rentRefundSol
-        const finalTotalReturn = adjReceived + exitValuation.allTimeWithdrawalSol
-        const finalPnl = pos.basisSol > 0
-          ? ((finalTotalReturn - pos.basisSol) / pos.basisSol) * 100
+        const received = pos.quoteCurrency === 'USDC' ? result.usdcReceived : result.solReceived
+        const rentRefund = pos.quoteCurrency === 'SOL' ? result.rentRefundSol : 0
+        const adjReceived = received - rentRefund
+        const finalTotalReturn = adjReceived + exitValuation.withdrawalQuote
+        const finalPnlValue = finalTotalReturn - pos.basisQuote
+        const finalPnl = pos.basisQuote > 0
+          ? (finalPnlValue / pos.basisQuote) * 100
           : 0
         sendNotification(
           formatExitSuccess(
-            pos.positionPubkey, received, finalPnl,
-            result.rentRefundSol,
-            pos.basisSol, result.removeLiqSig || '',
+            pos.positionPubkey, received, finalPnl, finalPnlValue,
+            rentRefund,
+            pos.basisQuote, result.removeLiqSig || '',
             result.swapSig,
             pos.tokenXMint.slice(0, 4), pos.tokenYMint.slice(0, 4),
-            pos.poolPubkey, exitValuation.solUsdPrice, ownerStr
+            pos.poolPubkey, exitValuation.solUsdPrice, ownerStr, pos.quoteCurrency
           )
         )
       } else {

@@ -5,6 +5,7 @@ export type TokenSide = 'X' | 'Y'
 export type EventType = 'POSITION_INIT' | 'ADD_LIQUIDITY' | 'REMOVE_LIQUIDITY' | 'CLAIM_FEE' | 'CLAIM_REWARD' | 'CLOSE_POSITION' | 'UNKNOWN'
 export type TriggerType = 'TP' | 'SL' | 'TRAILING_STOP' | 'BIN_RANGE'
 export type ExitStatus = 'pending_remove' | 'removed' | 'swap_pending' | 'completed' | 'failed'
+export type QuoteCurrency = 'SOL' | 'USDC'
 
 export interface PositionRow {
   positionPubkey: string
@@ -14,7 +15,8 @@ export interface PositionRow {
   tokenXSymbol: string
   tokenYSymbol: string
   owner: string
-  basisSol: number
+  quoteCurrency: QuoteCurrency
+  basisQuote: number
   basisConfidence: BasisConfidence
   tpPercent: number
   slPercent: number
@@ -23,7 +25,7 @@ export interface PositionRow {
   peakPnlPercent: number
   trailingActivated: boolean
   lastPnlPercent: number | null
-  lastEstimatedExitSol: number | null
+  lastEstimatedExitQuote: number | null
   lastSeenAt: number
   strategy: StrategyType
   precisionCurveEnabled: boolean
@@ -72,11 +74,13 @@ export interface ExecutionRow {
   positionPubkey: string
   triggerType: TriggerType
   triggerPnlPercent: number
-  basisSol: number
-  estimatedExitSol: number
+  quoteCurrency: QuoteCurrency
+  basisQuote: number
+  estimatedExitQuote: number
   removeLiqSig: string | null
   swapSig: string | null
-  finalSolReceived: number | null
+  finalQuoteReceived: number | null
+  finalSolReceived?: number | null
   status: ExitStatus
   errorMessage: string | null
   createdAt: number

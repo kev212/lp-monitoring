@@ -3,7 +3,7 @@ import { BN } from '@coral-xyz/anchor'
 import { getPool } from './positions.js'
 import { getDb } from '../db/client.js'
 import { swapTokensToSol } from '../swap.js'
-import type { ExecutionRow, ExitStatus, TriggerType } from '../types.js'
+import type { ExecutionRow, ExitStatus, QuoteCurrency, TriggerType } from '../types.js'
 import { updatePositionStatus } from './discovery.js'
 
 const SOL_MINTS = new Set([
@@ -17,11 +17,28 @@ export function saveExecution(row: ExecutionRow): void {
   const now = Date.now()
   db.prepare(`
     INSERT INTO executions (position_pubkey, trigger_type, trigger_pnl_percent, basis_sol,
-      estimated_exit_sol, remove_liq_sig, swap_sig, final_sol_received, status, error_message, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(row.positionPubkey, row.triggerType, row.triggerPnlPercent, row.basisSol,
-    row.estimatedExitSol, row.removeLiqSig, row.swapSig, row.finalSolReceived,
-    row.status, row.errorMessage, now, now)
+      quote_currency, basis_quote, estimated_exit_sol, estimated_exit_quote,
+      remove_liq_sig, swap_sig, final_sol_received, final_quote_received,
+      status, error_message, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    row.positionPubkey,
+    row.triggerType,
+    row.triggerPnlPercent,
+    row.quoteCurrency === 'SOL' ? row.basisQuote : 0,
+    row.quoteCurrency,
+    row.basisQuote,
+    row.quoteCurrency === 'SOL' ? row.estimatedExitQuote : 0,
+    row.estimatedExitQuote,
+    row.removeLiqSig,
+    row.swapSig,
+    row.finalSolReceived ?? null,
+    row.finalQuoteReceived,
+    row.status,
+    row.errorMessage,
+    now,
+    now,
+  )
 }
 
 export function updateExecution(pubkey: string, status: ExitStatus, fields: Partial<ExecutionRow>): void {
@@ -31,6 +48,7 @@ export function updateExecution(pubkey: string, status: ExitStatus, fields: Part
   if (fields.removeLiqSig !== undefined) { sets.push('remove_liq_sig = ?'); vals.push(fields.removeLiqSig) }
   if (fields.swapSig !== undefined) { sets.push('swap_sig = ?'); vals.push(fields.swapSig) }
   if (fields.finalSolReceived !== undefined) { sets.push('final_sol_received = ?'); vals.push(fields.finalSolReceived) }
+  if (fields.finalQuoteReceived !== undefined) { sets.push('final_quote_received = ?'); vals.push(fields.finalQuoteReceived) }
   if (fields.errorMessage !== undefined) { sets.push('error_message = ?'); vals.push(fields.errorMessage) }
   vals.push(pubkey)
   db.prepare(`UPDATE executions SET ${sets.join(', ')} WHERE position_pubkey = ? AND status != 'completed'`).run(...vals)
@@ -55,8 +73,9 @@ export async function executeExit(
   tokenYMint: string,
   triggerType: TriggerType,
   pnlPercent: number,
-  basisSol: number,
-  estimatedExitSol: number
+  quoteCurrency: QuoteCurrency,
+  basisQuote: number,
+  estimatedExitQuote: number,
 ): Promise<ExitResult> {
   console.log(`[exit] executing ${triggerType} for ${positionPubkey.slice(0, 8)}...`)
 
@@ -73,11 +92,12 @@ export async function executeExit(
     positionPubkey,
     triggerType,
     triggerPnlPercent: pnlPercent,
-    basisSol,
-    estimatedExitSol,
+    quoteCurrency,
+    basisQuote,
+    estimatedExitQuote,
     removeLiqSig: null,
     swapSig: null,
-    finalSolReceived: null,
+    finalQuoteReceived: null,
     status: 'pending_remove',
     errorMessage: null,
     createdAt: Date.now(),
@@ -86,7 +106,7 @@ export async function executeExit(
 
   updatePositionStatus(positionPubkey, 'exiting')
 
-  const quoteIsUsdc = tokenXMint === USDC_MINT || tokenYMint === USDC_MINT
+  const quoteIsUsdc = quoteCurrency === 'USDC'
 
   // Capture pre-exit SOL balance for accurate solReceived calculation
   let preSolBalance = 0
@@ -230,11 +250,13 @@ export async function executeExit(
       const netUsdc = postUsdcBalance > preUsdcBalance ? postUsdcBalance - preUsdcBalance : 0n
       result.usdcReceived = Number(netUsdc) / 1e6
     }
+    const quoteReceived = quoteIsUsdc ? result.usdcReceived : result.solReceived
 
     if (hasUnswappableTokens) {
       updateExecution(positionPubkey, 'failed', {
         swapSig: result.swapSig || null,
         finalSolReceived: result.solReceived,
+        finalQuoteReceived: quoteReceived,
         errorMessage: result.error || 'partial swap — tokens remain unswappable',
       })
       result.success = false
@@ -242,6 +264,7 @@ export async function executeExit(
       updateExecution(positionPubkey, 'completed', {
         swapSig: result.swapSig!,
         finalSolReceived: result.solReceived,
+        finalQuoteReceived: quoteReceived,
       })
       updatePositionStatus(positionPubkey, 'closed')
       result.success = true

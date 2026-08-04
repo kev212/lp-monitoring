@@ -1,27 +1,35 @@
-import DLMM from '@meteora-ag/dlmm'
-import { PublicKey } from '@solana/web3.js'
-import { config } from '../config.js'
-import { withValuationFallback } from '../solana/connection.js'
+import type { QuoteCurrency } from '../types.js'
 
 const PNL_API_BASE = 'https://dlmm.datapi.meteora.ag/positions'
 const CACHE_TTL_MS = 5_000
 const WSOL_MINT = 'So11111111111111111111111111111111111111112'
+const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
 
-interface PnlPositionData {
-  allTimeDeposits?: {
-    total?: { sol?: string | number; usd?: string | number }
-  }
+export interface MeteoraPnlPosition {
+  [key: string]: any
 }
 
 export interface ValuationResult {
+  quoteCurrency: QuoteCurrency
+  estimatedExitQuote: number
+  pnlQuote: number
+  pnlPercent: number
+  depositQuote: number
+  withdrawalQuote: number
   estimatedExitSol: number
+  estimatedExitUsd: number
+  depositSol: number
+  depositUsd: number
+  withdrawalSol: number
+  withdrawalUsd: number
+  tokenXValueQuote: number
+  tokenYValueQuote: number
   tokenXValueSol: number
   tokenYValueSol: number
-  depositEstimateSol: number
-  allTimeDepositSol: number
+  tokenXValueUsd: number
+  tokenYValueUsd: number
   allTimeDepositTokenXAmount: number
   allTimeDepositTokenYAmount: number
-  allTimeWithdrawalSol: number
   tokenXAmount: number
   tokenYAmount: number
   tokenXFees: number
@@ -29,8 +37,7 @@ export interface ValuationResult {
   tokenXPriceSol: number
   tokenYPriceSol: number
   solUsdPrice: number
-  onchainPnlPercent: number
-  source: 'on-chain'
+  source: 'meteora-api'
   observedAt: number
   /** Bin position data for range-based triggers */
   lowerBinId?: number
@@ -38,15 +45,75 @@ export interface ValuationResult {
   poolActiveBinId?: number
 }
 
-const cache = new Map<string, { ts: number; data: ValuationResult }>()
+const apiCache = new Map<string, { ts: number; positions: Map<string, MeteoraPnlPosition> }>()
+const valuationCache = new Map<string, { ts: number; data: ValuationResult }>()
 
-async function fetchDiscoveryBasis(
+function readNumber(value: unknown): number | null {
+  if (value === null || value === undefined || value === '') return null
+
+  if (typeof value === 'object') {
+    const object = value as Record<string, unknown>
+    for (const key of ['value', 'amount', 'total', 'sol', 'usd']) {
+      const nested = readNumber(object[key])
+      if (nested !== null) return nested
+    }
+    return null
+  }
+
+  const stringValue = typeof value === 'string' && value.endsWith('%')
+    ? value.slice(0, -1)
+    : value
+  const number = Number(stringValue)
+  return Number.isFinite(number) ? number : null
+}
+
+function firstNumber(...values: unknown[]): number | null {
+  for (const value of values) {
+    const number = readNumber(value)
+    if (number !== null) return number
+  }
+  return null
+}
+
+function amountValue(value: unknown): number {
+  return firstNumber(value) ?? 0
+}
+
+function optionalNumber(value: unknown): number | undefined {
+  return readNumber(value) ?? undefined
+}
+
+function apiCacheKey(poolAddress: string, walletAddress: string): string {
+  return `${walletAddress}:${poolAddress}`
+}
+
+function valuationCacheKey(
   poolAddress: string,
   walletAddress: string,
-  positionPubkey?: string,
-): Promise<PnlPositionData | null> {
+  positionPubkey: string,
+  quoteCurrency: QuoteCurrency,
+): string {
+  return `${walletAddress}:${poolAddress}:${positionPubkey}:${quoteCurrency}`
+}
+
+async function fetchPnlPositions(
+  poolAddress: string,
+  walletAddress: string,
+  forceFresh = false,
+): Promise<Map<string, MeteoraPnlPosition> | null> {
+  const key = apiCacheKey(poolAddress, walletAddress)
+  const cached = apiCache.get(key)
+  if (!forceFresh && cached && Date.now() - cached.ts < CACHE_TTL_MS) {
+    return cached.positions
+  }
+
   try {
-    const url = `${PNL_API_BASE}/${poolAddress}/pnl?user=${walletAddress}&status=open&pageSize=100&page=1`
+    const url = new URL(`${PNL_API_BASE}/${poolAddress}/pnl`)
+    url.searchParams.set('user', walletAddress)
+    url.searchParams.set('status', 'open')
+    url.searchParams.set('page_size', '100')
+    url.searchParams.set('page', '1')
+
     const res = await fetch(url, {
       headers: { 'User-Agent': 'Mozilla/5.0' },
       signal: AbortSignal.timeout(8_000),
@@ -55,142 +122,194 @@ async function fetchDiscoveryBasis(
       console.log(`[pnl_api] HTTP ${res.status} for pool ${poolAddress.slice(0, 8)}`)
       return null
     }
-    const data = await res.json()
-    const positions: any[] = data.positions || []
-    if (positions.length === 0) {
-      return null
+
+    const body = await res.json() as any
+    const positions = Array.isArray(body?.positions)
+      ? body.positions
+      : Array.isArray(body?.data?.positions)
+        ? body.data.positions
+        : []
+    const mapped = new Map<string, MeteoraPnlPosition>()
+    for (const position of positions) {
+      if (position?.positionAddress) mapped.set(String(position.positionAddress), position)
     }
-    // Match by positionPubkey; return null if not found (closed on-chain)
-    const p = positionPubkey
-      ? positions.find((pos: any) => pos.positionAddress === positionPubkey)
-      : positions[0]
-    if (!p) {
-      return null
-    }
-    const result: PnlPositionData = {
-      allTimeDeposits: p.allTimeDeposits,
-    }
-    return result
+
+    apiCache.set(key, { ts: Date.now(), positions: mapped })
+    return mapped
   } catch (err) {
     console.log(`[pnl_api] error for pool ${poolAddress.slice(0, 8)}: ${err instanceof Error ? err.message : 'unknown'}`)
     return null
   }
 }
 
-/** Meteora is retained only to establish a discovery-time deposit basis. */
+async function fetchPnlPosition(
+  poolAddress: string,
+  walletAddress: string,
+  positionPubkey: string,
+  forceFresh = false,
+): Promise<MeteoraPnlPosition | null> {
+  const positions = await fetchPnlPositions(poolAddress, walletAddress, forceFresh)
+  return positions?.get(positionPubkey) || null
+}
+
+export function getQuoteCurrency(tokenXMint: string, tokenYMint: string): QuoteCurrency | null {
+  if (tokenXMint === WSOL_MINT || tokenYMint === WSOL_MINT) return 'SOL'
+  if (tokenXMint === USDC_MINT || tokenYMint === USDC_MINT) return 'USDC'
+  return null
+}
+
+function selectedValue(quoteCurrency: QuoteCurrency, sol: number, usd: number): number {
+  return quoteCurrency === 'SOL' ? sol : usd
+}
+
+export function mapMeteoraPosition(
+  position: MeteoraPnlPosition,
+  quoteCurrency: QuoteCurrency,
+): ValuationResult | null {
+  const unrealized = position.unrealizedPnl || {}
+  const deposits = position.allTimeDeposits || {}
+  const withdrawals = position.allTimeWithdrawals || {}
+  const depositTotal = deposits.total || {}
+  const withdrawalTotal = withdrawals.total || {}
+  const pnl = position.pnl || {}
+
+  const currentSol = firstNumber(
+    unrealized.balancesSol,
+    unrealized.balanceSol,
+    position.balancesSol,
+  )
+  const currentUsd = firstNumber(
+    unrealized.balances,
+    unrealized.balancesUsd,
+    position.balancesUsd,
+  )
+  const currentValue = quoteCurrency === 'SOL' ? currentSol : currentUsd
+  if (currentValue === null) {
+    console.log(`[pnl_api] missing ${quoteCurrency} position value for ${position.positionAddress?.slice?.(0, 8) || 'position'}`)
+    return null
+  }
+  const solUsdPrice = firstNumber(position.solPrice, position.solPriceUsd) ?? (
+    currentSol !== null && currentUsd !== null && currentSol !== 0
+      ? currentUsd / currentSol
+      : 0
+  )
+  const estimatedExitSol = currentSol ?? (currentUsd !== null && solUsdPrice > 0 ? currentUsd / solUsdPrice : 0)
+  const estimatedExitUsd = currentUsd ?? estimatedExitSol * solUsdPrice
+  const estimatedExitQuote = selectedValue(quoteCurrency, estimatedExitSol, estimatedExitUsd)
+
+  const depositSol = firstNumber(depositTotal.sol) ?? (firstNumber(depositTotal.usd) !== null && solUsdPrice > 0
+    ? (firstNumber(depositTotal.usd) as number) / solUsdPrice
+    : 0)
+  const depositUsd = firstNumber(depositTotal.usd) ?? depositSol * solUsdPrice
+  const depositQuote = selectedValue(quoteCurrency, depositSol, depositUsd)
+
+  const withdrawalSol = firstNumber(withdrawalTotal.sol) ?? (firstNumber(withdrawalTotal.usd) !== null && solUsdPrice > 0
+    ? (firstNumber(withdrawalTotal.usd) as number) / solUsdPrice
+    : 0)
+  const withdrawalUsd = firstNumber(withdrawalTotal.usd) ?? withdrawalSol * solUsdPrice
+  const withdrawalQuote = selectedValue(quoteCurrency, withdrawalSol, withdrawalUsd)
+
+  const pnlSolPercent = firstNumber(position.pnlSolPctChange, pnl.solPctChange)
+  const pnlUsdPercent = firstNumber(position.pnlPctChange, pnl.usdPctChange)
+  const pnlPercent = quoteCurrency === 'SOL' ? pnlSolPercent : pnlUsdPercent
+  if (pnlPercent === null) {
+    console.log(`[pnl_api] missing ${quoteCurrency} PnL percentage for ${position.positionAddress?.slice?.(0, 8) || 'position'}`)
+    return null
+  }
+
+  const pnlSol = firstNumber(position.pnlSol, pnl.sol) ?? depositSol * pnlPercent / 100
+  const pnlUsd = firstNumber(position.pnlUsd, pnl.usd) ?? depositUsd * pnlPercent / 100
+  const pnlQuote = selectedValue(quoteCurrency, pnlSol, pnlUsd)
+
+  const balanceTokenX = unrealized.balanceTokenX || position.balanceTokenX || {}
+  const balanceTokenY = unrealized.balanceTokenY || position.balanceTokenY || {}
+  const tokenXValueSol = firstNumber(balanceTokenX.amountSol, balanceTokenX.valueSol) ?? 0
+  const tokenYValueSol = firstNumber(balanceTokenY.amountSol, balanceTokenY.valueSol) ?? 0
+  const tokenXValueUsd = firstNumber(balanceTokenX.amountUsd, balanceTokenX.valueUsd, balanceTokenX.usd) ?? tokenXValueSol * solUsdPrice
+  const tokenYValueUsd = firstNumber(balanceTokenY.amountUsd, balanceTokenY.valueUsd, balanceTokenY.usd) ?? tokenYValueSol * solUsdPrice
+
+  const tokenXAmount = amountValue(balanceTokenX.amount)
+  const tokenYAmount = amountValue(balanceTokenY.amount)
+  const tokenXFees = amountValue(position.unclaimedFeeTokenX?.amount ?? unrealized.unclaimedFeeTokenX?.amount)
+  const tokenYFees = amountValue(position.unclaimedFeeTokenY?.amount ?? unrealized.unclaimedFeeTokenY?.amount)
+  const depositTokenX = amountValue(deposits.tokenX?.amount)
+  const depositTokenY = amountValue(deposits.tokenY?.amount)
+  const tokenXPriceUsd = firstNumber(position.tokenXPrice, position.tokenXPriceUsd) ?? 0
+  const tokenYPriceUsd = firstNumber(position.tokenYPrice, position.tokenYPriceUsd) ?? 0
+
+  return {
+    quoteCurrency,
+    estimatedExitQuote,
+    pnlQuote,
+    pnlPercent,
+    depositQuote,
+    withdrawalQuote,
+    estimatedExitSol,
+    estimatedExitUsd,
+    depositSol,
+    depositUsd,
+    withdrawalSol,
+    withdrawalUsd,
+    tokenXValueQuote: selectedValue(quoteCurrency, tokenXValueSol, tokenXValueUsd),
+    tokenYValueQuote: selectedValue(quoteCurrency, tokenYValueSol, tokenYValueUsd),
+    tokenXValueSol,
+    tokenYValueSol,
+    tokenXValueUsd,
+    tokenYValueUsd,
+    allTimeDepositTokenXAmount: depositTokenX,
+    allTimeDepositTokenYAmount: depositTokenY,
+    tokenXAmount,
+    tokenYAmount,
+    tokenXFees,
+    tokenYFees,
+    tokenXPriceSol: tokenXPriceUsd > 0 && solUsdPrice > 0
+      ? tokenXPriceUsd / solUsdPrice
+      : tokenXAmount > 0 ? tokenXValueSol / tokenXAmount : 0,
+    tokenYPriceSol: tokenYPriceUsd > 0 && solUsdPrice > 0
+      ? tokenYPriceUsd / solUsdPrice
+      : tokenYAmount > 0 ? tokenYValueSol / tokenYAmount : 0,
+    solUsdPrice,
+    source: 'meteora-api',
+    observedAt: Date.now(),
+    lowerBinId: optionalNumber(position.lowerBinId),
+    upperBinId: optionalNumber(position.upperBinId),
+    poolActiveBinId: optionalNumber(position.poolActiveBinId),
+  }
+}
+
 export async function getDiscoveryBasis(
   poolAddress: string,
   walletAddress: string,
   positionPubkey: string,
 ): Promise<number> {
-  const data = await fetchDiscoveryBasis(poolAddress, walletAddress, positionPubkey)
-  return Number(data?.allTimeDeposits?.total?.sol || 0)
-}
-
-function rawAmount(value: unknown): string {
-  const amount = String(value ?? '0')
-  return /^\d+$/.test(amount) ? amount : '0'
-}
-
-function tokenAmount(positionData: any, side: 'X' | 'Y'): string {
-  const excluded = positionData[`total${side}AmountExcludeTransferFee`]
-  const liquidity = rawAmount(excluded ?? positionData[`total${side}Amount`])
-  const fee = rawAmount(positionData[`fee${side}ExcludeTransferFee`] ?? positionData[`fee${side}`])
-  return (BigInt(liquidity) + BigInt(fee)).toString()
-}
-
-function withBasis(valuation: ValuationResult, basisSol: number): ValuationResult {
-  return {
-    ...valuation,
-    depositEstimateSol: basisSol,
-    allTimeDepositSol: basisSol,
-    onchainPnlPercent: basisSol > 0 ? ((valuation.estimatedExitSol - basisSol) / basisSol) * 100 : 0,
-  }
-}
-
-async function quoteToSol(inputMint: string, amount: string): Promise<number | null> {
-  if (amount === '0') return 0
-  const quoteUrl = new URL(`${config.jupiterSwapBaseUrl.replace(/\/$/, '')}/quote`)
-  quoteUrl.searchParams.set('inputMint', inputMint)
-  quoteUrl.searchParams.set('outputMint', WSOL_MINT)
-  quoteUrl.searchParams.set('amount', amount)
-  quoteUrl.searchParams.set('slippageBps', String(config.maxSwapSlippageBps))
-  const headers: Record<string, string> = { Accept: 'application/json' }
-  if (config.jupiterApiKey) headers['x-api-key'] = config.jupiterApiKey
-
-  const res = await fetch(quoteUrl, { headers, signal: AbortSignal.timeout(8_000) })
-  if (!res.ok) throw new Error(`Jupiter quote HTTP ${res.status}`)
-  const quote = await res.json()
-  const outAmount = rawAmount(quote?.outAmount)
-  if (outAmount === '0') throw new Error('Jupiter returned no executable route')
-  return Number(BigInt(outAmount)) / 1e9
+  const position = await fetchPnlPosition(poolAddress, walletAddress, positionPubkey)
+  return firstNumber(position?.allTimeDeposits?.total?.sol) ?? 0
 }
 
 export async function estimateExitValue(
   poolPubkey: string,
-  _walletAddress?: string,
-  positionPubkey?: string,
-  basisSol = 0,
+  walletAddress: string,
+  positionPubkey: string,
+  quoteCurrency: QuoteCurrency,
   forceFresh = false,
 ): Promise<ValuationResult | null> {
-  if (!positionPubkey) return null
-  const cached = cache.get(positionPubkey)
-  if (!forceFresh && cached && Date.now() - cached.ts < CACHE_TTL_MS) return withBasis(cached.data, basisSol)
+  if (!walletAddress || !positionPubkey) return null
 
-  try {
-    const onchainPosition = await withValuationFallback(async connection => {
-      const pool = await DLMM.create(connection, new PublicKey(poolPubkey), { cluster: 'mainnet-beta' })
-      const position = await pool.getPosition(new PublicKey(positionPubkey))
-      return { pool, position }
-    })
-    const { pool, position } = onchainPosition
-    const xMint = pool.tokenX.publicKey.toBase58()
-    const yMint = pool.tokenY.publicKey.toBase58()
-    // This valuation deliberately supports SOL-quoted pairs only; USD quotes are not converted.
-    if (xMint !== WSOL_MINT && yMint !== WSOL_MINT) return null
+  const key = valuationCacheKey(poolPubkey, walletAddress, positionPubkey, quoteCurrency)
+  const cached = valuationCache.get(key)
+  if (!forceFresh && cached && Date.now() - cached.ts < CACHE_TTL_MS) return cached.data
 
-    if (!position) return null
-    const data: any = position.positionData
-    const xRaw = tokenAmount(data, 'X')
-    const yRaw = tokenAmount(data, 'Y')
-    const [xValue, yValue] = await Promise.all([
-      xMint === WSOL_MINT ? Promise.resolve(Number(BigInt(xRaw)) / 1e9) : quoteToSol(xMint, xRaw),
-      yMint === WSOL_MINT ? Promise.resolve(Number(BigInt(yRaw)) / 1e9) : quoteToSol(yMint, yRaw),
-    ])
-    if (xValue === null || yValue === null || !Number.isFinite(xValue + yValue)) return null
+  const position = await fetchPnlPosition(poolPubkey, walletAddress, positionPubkey, forceFresh)
+  if (!position) return null
 
-    const estimatedExitSol = xValue + yValue
-    const result: ValuationResult = {
-      estimatedExitSol,
-      tokenXValueSol: xValue,
-      tokenYValueSol: yValue,
-      depositEstimateSol: 0,
-      allTimeDepositSol: 0,
-      allTimeDepositTokenXAmount: 0,
-      allTimeDepositTokenYAmount: 0,
-      allTimeWithdrawalSol: 0,
-      tokenXAmount: Number(BigInt(rawAmount(data.totalXAmount))) / 10 ** pool.tokenX.mint.decimals,
-      tokenYAmount: Number(BigInt(rawAmount(data.totalYAmount))) / 10 ** pool.tokenY.mint.decimals,
-      tokenXFees: Number(BigInt(rawAmount(data.feeXExcludeTransferFee ?? data.feeX))) / 10 ** pool.tokenX.mint.decimals,
-      tokenYFees: Number(BigInt(rawAmount(data.feeYExcludeTransferFee ?? data.feeY))) / 10 ** pool.tokenY.mint.decimals,
-      tokenXPriceSol: 0,
-      tokenYPriceSol: 0,
-      solUsdPrice: 0,
-      onchainPnlPercent: 0,
-      source: 'on-chain',
-      observedAt: Date.now(),
-      lowerBinId: data.lowerBinId,
-      upperBinId: data.upperBinId,
-      poolActiveBinId: pool.lbPair.activeId,
-    }
-    cache.set(positionPubkey, { ts: Date.now(), data: result })
-    return withBasis(result, basisSol)
-  } catch (err) {
-    console.log(`[valuation] on-chain failed for ${positionPubkey.slice(0, 8)}: ${err instanceof Error ? err.message : 'unknown'}`)
-    return null
-  }
+  const result = mapMeteoraPosition(position, quoteCurrency)
+  if (!result) return null
+
+  valuationCache.set(key, { ts: Date.now(), data: result })
+  return result
 }
 
 export function clearPnlCache(): void {
-  cache.clear()
+  apiCache.clear()
+  valuationCache.clear()
 }
