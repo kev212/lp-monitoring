@@ -148,6 +148,13 @@ export function updatePositionStatus(pubkey: string, status: PositionRow['status
   getDb().prepare('UPDATE positions SET status = ?, updated_at = ? WHERE position_pubkey = ?').run(status, Date.now(), pubkey)
 }
 
+export function deleteOpeningPosition(pubkey: string): boolean {
+  const result = getDb().prepare(
+    "DELETE FROM positions WHERE position_pubkey = ? AND status = 'opening'"
+  ).run(pubkey)
+  return result.changes === 1
+}
+
 export function isBasisIncrease(currentBasis: number, candidateBasis: number): boolean {
   return Number.isFinite(currentBasis) && Number.isFinite(candidateBasis) && candidateBasis > currentBasis + 1e-9
 }

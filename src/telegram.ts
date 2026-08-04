@@ -3,11 +3,15 @@ import { config } from './config.js'
 import { loadActivePositions, updateFlipModeEnabled, updatePrecisionCurveEnabled, updatePrecisionCurveThreshold } from './meteora/discovery.js'
 import { getDb } from './db/client.js'
 import type { QuoteCurrency } from './types.js'
+import { setupTelegramControl } from './telegram/control.js'
 
 let _bot: TelegramBot | null = null
 
 const TELEGRAM_COMMANDS = [
-  { command: 'status', description: 'Show all active positions & PnL' },
+  { command: 'dashboard', description: 'Open the LP control dashboard' },
+  { command: 'status', description: 'Open the LP control dashboard' },
+  { command: 'open', description: 'Open a Meteora position' },
+  { command: 'close', description: 'Close a position from the dashboard' },
   { command: 'precision', description: 'Precision Curve settings menu' },
   { command: 'flip', description: 'Flip Mode settings menu' },
   { command: 'help', description: 'List all available commands' },
@@ -17,6 +21,9 @@ function getBot(): TelegramBot | null {
   if (!config.telegramBotToken || !config.telegramChatId) return null
   if (!_bot) {
     _bot = new TelegramBot(config.telegramBotToken, { polling: true })
+    if (!config.telegramUserId) {
+      console.log('[telegram] TELEGRAM_USER_ID is required when TELEGRAM_CHAT_ID is a group')
+    }
     setupCommandHandlers(_bot)
   }
   return _bot
@@ -34,8 +41,9 @@ export function sendNotification(message: string): void {
   })
 }
 
-function isAllowedChat(chatId: number | string): boolean {
+function isAllowedChat(chatId: number | string, userId: number | string | undefined): boolean {
   return String(chatId) === String(config.telegramChatId)
+    && String(userId ?? '') === String(config.telegramUserId)
 }
 
 function setupCommandHandlers(bot: TelegramBot): void {
@@ -73,23 +81,18 @@ function setupCommandHandlers(bot: TelegramBot): void {
       .catch(err => console.log(`[telegram] setMyCommands failed: ${err.message}`))
   }
 
-  bot.onText(/^\/status$/, msg => {
-    if (!msg.chat || !isAllowedChat(msg.chat.id)) return
-    sendStatusMenu(bot, msg.chat.id)
-  })
-
   bot.onText(/^\/precision(?:\s+(.+))?$/, msg => {
-    if (!msg.chat || !isAllowedChat(msg.chat.id)) return
+    if (!msg.chat || !isAllowedChat(msg.chat.id, msg.from?.id)) return
     sendPrecisionMenu(bot, msg.chat.id)
   })
 
   bot.onText(/^\/flip(?:\s+(.+))?$/, msg => {
-    if (!msg.chat || !isAllowedChat(msg.chat.id)) return
+    if (!msg.chat || !isAllowedChat(msg.chat.id, msg.from?.id)) return
     sendFlipMenu(bot, msg.chat.id)
   })
 
   bot.onText(/^\/help$/, msg => {
-    if (!msg.chat || !isAllowedChat(msg.chat.id)) return
+    if (!msg.chat || !isAllowedChat(msg.chat.id, msg.from?.id)) return
     bot.sendMessage(msg.chat.id,
       `📋 <b>Available Commands</b>\n\n` +
       TELEGRAM_COMMANDS.map(c => `/${c.command} — ${c.description}`).join('\n'),
@@ -99,7 +102,7 @@ function setupCommandHandlers(bot: TelegramBot): void {
 
   bot.on('callback_query', async query => {
     const chatId = query.message?.chat.id
-    if (!chatId || !isAllowedChat(chatId)) return
+    if (!chatId || !isAllowedChat(chatId, query.from.id)) return
     const data = query.data || ''
     if (!data.startsWith('pc:') && !data.startsWith('flip:')) return
 
@@ -142,6 +145,11 @@ function setupCommandHandlers(bot: TelegramBot): void {
     }
 
     sendFlipMenu(bot, chatId)
+  })
+
+  setupTelegramControl(bot, {
+    showPrecision: chatId => sendPrecisionMenu(bot, chatId),
+    showFlip: chatId => sendFlipMenu(bot, chatId),
   })
 }
 
@@ -545,7 +553,7 @@ export function formatExitFailed(
     sep(),
     `Error: <code>${reason}</code>`,
     sep(),
-    `<i>Retrying next cycle...</i>`,
+    `<i>Check the dashboard for the current recovery state.</i>`,
   ].join('\n')
 }
 

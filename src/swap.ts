@@ -1,11 +1,55 @@
 import { Connection, Keypair, PublicKey, VersionedTransaction } from '@solana/web3.js'
 import axios from 'axios'
+import bs58 from 'bs58'
 import { config } from './config.js'
 
 const WSOL_MINT = 'So11111111111111111111111111111111111111112'
-const MIN_SWAP_AMOUNT_SOL = 0.0005 // skip swap kalo di bawah ~$0.05
 
-async function getRawTokenBalance(connection: Connection, wallet: Keypair, mint: string): Promise<bigint> {
+export function normalizeRawSwapAmount(amount: string): string {
+  if (!/^\d+$/.test(amount)) throw new Error('Swap amount must be a raw integer')
+  return BigInt(amount).toString()
+}
+
+export function shouldRetrySwapError(sentSignature: string, message: string, retryCount: number): boolean {
+  if (sentSignature || retryCount >= 2) return false
+  return ['expired', 'block height', '429', 'timeout', 'not confirmed', 'confirm timeout']
+    .some(fragment => message.includes(fragment))
+}
+
+export interface SignedSwapAttempt {
+  signature: string
+  blockhash: string
+  lastValidBlockHeight: number
+  signedTransaction: string
+  inputMint: string
+  outputMint: string
+  rawAmount: string
+}
+
+export interface SwapResult {
+  signature: string
+  outputAmount: string
+  confirmed: boolean
+}
+
+export type SwapAttemptTracker = (attempt: SignedSwapAttempt) => void
+export type SwapAttemptSettlement = (signature: string, status: 'finalized' | 'failed') => void
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: NodeJS.Timeout | undefined
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`confirm timeout (${timeoutMs / 1000}s)`)), timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+async function getRawTokenBalance(connection: Connection, wallet: Keypair, mint: string): Promise<bigint | null> {
   try {
     const accounts = await connection.getTokenAccountsByOwner(
       wallet.publicKey,
@@ -19,33 +63,10 @@ async function getRawTokenBalance(connection: Connection, wallet: Keypair, mint:
       }
       return total
     }
-  } catch { /* fallthrough */ }
-  return 0n
-}
-
-/**
- * Estimate token value in SOL using Jupiter price
- */
-async function estimateTokenValueInSol(connection: Connection, mint: string, rawAmount: string): Promise<number> {
-  try {
-    const res = await axios.get(`https://api.jup.ag/price/v3?ids=${mint}`, {
-      headers: { 'Accept': 'application/json' },
-      timeout: 5_000,
-    })
-    const data = res.data?.data?.[mint]
-    if (data?.price) {
-      // price is in USD, need SOL price too
-      const solRes = await axios.get('https://api.jup.ag/price/v3?ids=So11111111111111111111111111111111111111112', {
-        headers: { 'Accept': 'application/json' },
-        timeout: 5_000,
-      })
-      const solPrice = solRes.data?.data?.['So11111111111111111111111111111111111111112']?.price
-      if (solPrice && Number(solPrice) > 0) {
-        return Number(data.price) / Number(solPrice) * Number(rawAmount) / 1e9
-      }
-    }
-  } catch { /* ignore */ }
-  return -1 // unknown
+    return 0n
+  } catch {
+    return null
+  }
 }
 
 /**
@@ -56,9 +77,14 @@ async function tryLegacySwap(
   wallet: Keypair,
   inputMint: string,
   amount: string,
-  outputMint: string = WSOL_MINT
-): Promise<{ signature: string; outputAmount: string } | null> {
+  outputMint: string = WSOL_MINT,
+  minimumRemainingBalance = 0n,
+  onSigned?: SwapAttemptTracker,
+  onSettled?: SwapAttemptSettlement,
+): Promise<SwapResult | null> {
+  let sentSig = ''
   try {
+    const rawAmount = normalizeRawSwapAmount(amount)
     const baseUrl = config.jupiterSwapBaseUrl.replace(/\/$/, '')
     const headers: Record<string, string> = {
       'Accept': 'application/json',
@@ -70,14 +96,16 @@ async function tryLegacySwap(
     const quoteUrl = new URL(`${baseUrl}/quote`)
     quoteUrl.searchParams.set('inputMint', inputMint)
     quoteUrl.searchParams.set('outputMint', outputMint)
-    quoteUrl.searchParams.set('amount', String(Math.floor(Number(amount))))
+    quoteUrl.searchParams.set('amount', rawAmount)
     quoteUrl.searchParams.set('slippageBps', String(config.maxSwapSlippageBps))
     quoteUrl.searchParams.set('onlyDirectRoutes', 'false')
 
     const quoteRes = await axios.get(quoteUrl.toString(), { headers, timeout: 15_000 })
     const quote = quoteRes.data
     if (quote?.error) throw new Error(`Quote error: ${quote.error}`)
-    if (!quote?.routes?.length) throw new Error('No routes found')
+    if (!quote?.outAmount || !Array.isArray(quote.routePlan) || quote.routePlan.length === 0) {
+      throw new Error('No routes found')
+    }
 
     // Build swap tx
     const swapBody = {
@@ -101,12 +129,36 @@ async function tryLegacySwap(
     tx.message.recentBlockhash = blockhash
     tx.sign([wallet])
 
+    sentSig = bs58.encode(tx.signatures[0])
+    onSigned?.({
+      signature: sentSig,
+      blockhash,
+      lastValidBlockHeight,
+      signedTransaction: Buffer.from(tx.serialize()).toString('base64'),
+      inputMint,
+      outputMint,
+      rawAmount,
+    })
     const sig = await connection.sendTransaction(tx, { skipPreflight: true, maxRetries: 3 })
-    await connection.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, 'confirmed')
+    if (sig !== sentSig) throw new Error('RPC returned a signature that does not match the signed swap transaction')
+    const confirmation = await withTimeout(
+      connection.confirmTransaction({ signature: sentSig, blockhash, lastValidBlockHeight }, 'finalized'),
+      20_000,
+    )
+    if (confirmation.value.err) throw new Error(`swap transaction failed on-chain: ${JSON.stringify(confirmation.value.err)}`)
+    onSettled?.(sentSig, 'finalized')
 
-    return { signature: sig, outputAmount: quote.outAmount || '0' }
+    return { signature: sentSig, outputAmount: quote.outAmount || '0', confirmed: true }
   } catch (err) {
     console.log(`[swap] legacy fallback failed: ${err instanceof Error ? err.message : 'unknown'}`)
+    if (sentSig && err instanceof Error && err.message.includes('failed on-chain')) onSettled?.(sentSig, 'failed')
+    if (sentSig && !(err instanceof Error && err.message.includes('failed on-chain'))) {
+      const balanceAfter = await getRawTokenBalance(connection, wallet, inputMint)
+      if (balanceAfter !== null && balanceAfter <= minimumRemainingBalance) {
+        console.log('[swap] legacy transaction spent the attributed input despite an ambiguous confirmation')
+      }
+      return { signature: sentSig, outputAmount: '0', confirmed: false }
+    }
     return null
   }
 }
@@ -121,16 +173,20 @@ async function attemptSwap(
   inputMint: string,
   amount: string,
   outputMint: string = WSOL_MINT,
-  retryCount: number = 0
-): Promise<{ signature: string; outputAmount: string } | null> {
-  const amountNum = Number(amount)
-  if (amountNum <= 0) return null
-
-  // Skip if amount is dust
-  if (amountNum < 1000) {
-    console.log(`[swap] skipping dust (${amountNum} raw)`)
+  retryCount: number = 0,
+  minimumRemainingBalance = 0n,
+  onSigned?: SwapAttemptTracker,
+  onSettled?: SwapAttemptSettlement,
+): Promise<SwapResult | null> {
+  let rawAmount: string
+  try {
+    rawAmount = normalizeRawSwapAmount(amount)
+  } catch (err) {
+    console.log(`[swap] invalid amount: ${err instanceof Error ? err.message : 'unknown'}`)
     return null
   }
+  const amountRaw = BigInt(rawAmount)
+  if (amountRaw <= 0n) return null
 
   let sentSig = ''
 
@@ -147,14 +203,14 @@ async function attemptSwap(
     const orderUrl = new URL(`${baseUrl}/order`)
     orderUrl.searchParams.set('inputMint', inputMint)
     orderUrl.searchParams.set('outputMint', outputMint)
-    orderUrl.searchParams.set('amount', String(Math.floor(amountNum)))
+    orderUrl.searchParams.set('amount', rawAmount)
     orderUrl.searchParams.set('taker', wallet.publicKey.toBase58())
     orderUrl.searchParams.set('slippageBps', String(config.maxSwapSlippageBps))
     orderUrl.searchParams.set('orderMode', 'ultra')
     orderUrl.searchParams.set('dynamicSlippage', 'true')
 
     const outputLabel = outputMint === WSOL_MINT ? 'SOL' : outputMint.slice(0, 8)
-    console.log(`[swap] GET /order (ultra) for ${Math.floor(amountNum)} ${inputMint.slice(0, 8)} → ${outputLabel}`)
+    console.log(`[swap] GET /order (ultra) for ${rawAmount} ${inputMint.slice(0, 8)} → ${outputLabel}`)
 
     const orderRes = await axios.get(orderUrl.toString(), { headers, timeout: 20_000 })
     const order = orderRes.data
@@ -162,14 +218,14 @@ async function attemptSwap(
     if (order?.error) {
       // Ultra failed — fallback to legacy
       console.log(`[swap] ultra failed (${order.error}), trying legacy...`)
-      return tryLegacySwap(connection, wallet, inputMint, amount, outputMint)
+      return tryLegacySwap(connection, wallet, inputMint, rawAmount, outputMint, minimumRemainingBalance, onSigned, onSettled)
     }
 
     // Field bisa "transaction" (v2 baru) atau "swapTransaction" (v2 lama)
     const rawTx = order.transaction || order.swapTransaction
     if (!rawTx) {
       console.log(`[swap] ultra: no transaction in response, trying legacy...`)
-      return tryLegacySwap(connection, wallet, inputMint, amount, outputMint)
+      return tryLegacySwap(connection, wallet, inputMint, rawAmount, outputMint, minimumRemainingBalance, onSigned, onSettled)
     }
 
     // Sign & send via RPC langsung (karena gak selalu ada requestId buat /execute)
@@ -178,41 +234,53 @@ async function attemptSwap(
     tx.message.recentBlockhash = blockhash
     tx.sign([wallet])
 
-    sentSig = await connection.sendTransaction(tx, { skipPreflight: true, maxRetries: 3 })
-    await Promise.race([
-      connection.confirmTransaction({ signature: sentSig, blockhash, lastValidBlockHeight }, 'confirmed'),
-      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('confirm timeout (10s)')), 10_000)),
-    ])
+    sentSig = bs58.encode(tx.signatures[0])
+    onSigned?.({
+      signature: sentSig,
+      blockhash,
+      lastValidBlockHeight,
+      signedTransaction: Buffer.from(tx.serialize()).toString('base64'),
+      inputMint,
+      outputMint,
+      rawAmount,
+    })
+    const rpcSignature = await connection.sendTransaction(tx, { skipPreflight: true, maxRetries: 3 })
+    if (rpcSignature !== sentSig) throw new Error('RPC returned a signature that does not match the signed swap transaction')
+    const confirmation = await withTimeout(
+      connection.confirmTransaction({ signature: sentSig, blockhash, lastValidBlockHeight }, 'finalized'),
+      20_000,
+    )
+    if (confirmation.value.err) throw new Error(`swap transaction failed on-chain: ${JSON.stringify(confirmation.value.err)}`)
+    onSettled?.(sentSig, 'finalized')
 
     console.log(`[swap] ultra success: ${sentSig}`)
     return {
       signature: sentSig,
       outputAmount: order.outAmount || '0',
+      confirmed: true,
     }
 
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'unknown'
     console.log(`[swap] attempt ${retryCount + 1} failed: ${msg}`)
+    if (sentSig && msg.includes('failed on-chain')) onSettled?.(sentSig, 'failed')
 
     // If confirmation timed out, the tx may have gone through — check balance
-    if (sentSig && (msg.includes('not confirmed') || msg.includes('confirm timeout'))) {
+    if (sentSig && !msg.includes('failed on-chain')) {
       await new Promise<void>(r => setTimeout(r, 5_000))
       const balanceAfter = await getRawTokenBalance(connection, wallet, inputMint)
-      if (balanceAfter === 0n) {
+      if (balanceAfter !== null && balanceAfter <= minimumRemainingBalance) {
         console.log(`[swap] tx succeeded despite RPC timeout`)
-        return { signature: sentSig, outputAmount: '0' }
       }
+      // Never broadcast the same attributed amount twice after an ambiguous send.
+      return { signature: sentSig, outputAmount: '0', confirmed: false }
     }
 
     // Retry on transient errors
-    if (
-      retryCount < 2 &&
-      (msg.includes('expired') || msg.includes('block height') || msg.includes('429') ||
-       msg.includes('timeout') || msg.includes('not confirmed') || msg.includes('confirm timeout'))
-    ) {
+    if (shouldRetrySwapError(sentSig, msg, retryCount)) {
       console.log(`[swap] retrying (${retryCount + 1}/3)...`)
       await new Promise<void>(resolve => { setTimeout(resolve, 2_000); })
-      return attemptSwap(connection, wallet, inputMint, amount, outputMint, retryCount + 1)
+      return attemptSwap(connection, wallet, inputMint, rawAmount, outputMint, retryCount + 1, minimumRemainingBalance, onSigned, onSettled)
     }
 
     // Token has no routes / can't swap — not a fatal error, just log
@@ -230,7 +298,10 @@ export async function swapTokensToSol(
   wallet: Keypair,
   inputMint: string,
   amount: string,
-  outputMint: string = WSOL_MINT
-): Promise<{ signature: string; outputAmount: string } | null> {
-  return attemptSwap(connection, wallet, inputMint, amount, outputMint, 0)
+  outputMint: string = WSOL_MINT,
+  minimumRemainingBalance = 0n,
+  onSigned?: SwapAttemptTracker,
+  onSettled?: SwapAttemptSettlement,
+): Promise<SwapResult | null> {
+  return attemptSwap(connection, wallet, inputMint, amount, outputMint, 0, minimumRemainingBalance, onSigned, onSettled)
 }

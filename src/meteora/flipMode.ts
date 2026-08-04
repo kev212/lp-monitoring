@@ -4,6 +4,7 @@ import { StrategyType } from '@meteora-ag/dlmm'
 import { clearPoolCache, getPool } from './positions.js'
 import { getSolPriceInUsd } from '../pricing.js'
 import type { PositionRow, TokenSide } from '../types.js'
+import { DurableTransactionPendingError, sendDurableTransaction } from '../executionLock.js'
 
 const BASIS_POINTS = new BN(10000)
 const DUST_USD_THRESHOLD = 0.1
@@ -186,11 +187,8 @@ async function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
-async function sendAndConfirm(connection: Connection, wallet: Keypair, tx: any): Promise<string> {
-  tx.sign(wallet)
-  const sig = await connection.sendTransaction(tx, [wallet])
-  await connection.confirmTransaction(sig, 'confirmed')
-  return sig
+async function sendAndConfirm(connection: Connection, wallet: Keypair, operationId: string, tx: any): Promise<string> {
+  return sendDurableTransaction(connection, wallet, wallet.publicKey.toBase58(), operationId, tx)
 }
 
 async function getTokenAmountUsd(
@@ -237,6 +235,7 @@ async function addBackBidAsk(
   tokenMint: string,
   amount: bigint,
   removedBinCount?: number,
+  operationId = `flip:${positionPubkey}`,
 ): Promise<FlipAddBackResult> {
   const result: FlipAddBackResult = {
     success: false,
@@ -303,7 +302,7 @@ async function addBackBidAsk(
             slippage,
           })
 
-          const sig = await sendAndConfirm(connection, wallet, addTx)
+          const sig = await sendAndConfirm(connection, wallet, operationId, addTx)
           const txResult = await connection.getTransaction(sig, { maxSupportedTransactionVersion: 0 }).catch(() => null)
           if (txResult?.meta?.err) {
             const errMsg = typeof txResult.meta.err === 'string' ? txResult.meta.err : JSON.stringify(txResult.meta.err)
@@ -320,6 +319,7 @@ async function addBackBidAsk(
           console.log(`[flip] add-back tx (slippage=${slippage}, bins=${lowerBinId}-${upperBinId}): ${sig}`)
           return result
         } catch (err) {
+          if (err instanceof DurableTransactionPendingError) throw err
           lastError = err instanceof Error ? err.message : 'unknown error'
           const postBalance = await getTokenBalance(connection, wallet, tokenMint)
           const spent = preBalance > postBalance ? preBalance - postBalance : 0n
@@ -372,7 +372,7 @@ async function addBackBidAsk(
         console.log(`[flip] add-back split into ${addTxs.length} txns (slippage=${slippage})`)
 
         for (const [j, tx] of addTxs.entries()) {
-          const sig = await sendAndConfirm(connection, wallet, tx)
+          const sig = await sendAndConfirm(connection, wallet, operationId, tx)
           const txResult = await connection.getTransaction(sig, { maxSupportedTransactionVersion: 0 }).catch(() => null)
           if (txResult?.meta?.err) {
             const errMsg = typeof txResult.meta.err === 'string' ? txResult.meta.err : JSON.stringify(txResult.meta.err)
@@ -388,6 +388,7 @@ async function addBackBidAsk(
         result.addSlippage = slippage
         break
       } catch (err) {
+        if (err instanceof DurableTransactionPendingError) throw err
         lastError = err instanceof Error ? err.message : 'unknown error'
         const postBalance = await getTokenBalance(connection, wallet, tokenMint)
         const spent = preBalance > postBalance ? preBalance - postBalance : 0n
@@ -462,6 +463,8 @@ export async function retryPendingFlipAdd(
     tokenSide,
     tokenMint,
     amountToAdd,
+    undefined,
+    `flip-retry:${pos.positionPubkey}`,
   )
 
   const addRemaining = BigInt(addResult.tokenAmountRemaining || amountToAdd.toString())
@@ -545,11 +548,12 @@ export async function executeFlipMode(
 
         const txs = Array.isArray(removeTxs) ? removeTxs : [removeTxs]
         for (const tx of txs) {
-          const sig = await sendAndConfirm(connection, wallet, tx)
+          const sig = await sendAndConfirm(connection, wallet, `flip:${pos.positionPubkey}`, tx)
           result.removeSignatures.push(sig)
           console.log(`[flip] remove token liq tx ${i + 1}/${removeRanges.length} (${range.from}-${range.to}): ${sig}`)
         }
       } catch (err) {
+        if (err instanceof DurableTransactionPendingError) throw err
         removeError = err instanceof Error ? err.message : 'unknown error'
         console.log(`[flip] remove token liq failed (${range.from}-${range.to}): ${removeError}`)
         break
@@ -580,6 +584,7 @@ export async function executeFlipMode(
       tokenMint,
       delta,
       removedBinCount,
+      `flip:${pos.positionPubkey}`,
     )
 
     result.addSignature = addResult.addSignature

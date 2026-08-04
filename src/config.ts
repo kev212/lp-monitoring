@@ -20,6 +20,12 @@ function envBool(key: string, fallback: boolean): boolean {
   return v === 'true' || v === '1'
 }
 
+const telegramChatId = envStr('TELEGRAM_CHAT_ID')
+const openMaxPriceMoveBins = envNum('OPEN_MAX_PRICE_MOVE_BINS', 3)
+if (!Number.isInteger(openMaxPriceMoveBins) || openMaxPriceMoveBins < 1 || openMaxPriceMoveBins > 25) {
+  throw new Error('OPEN_MAX_PRICE_MOVE_BINS must be an integer between 1 and 25')
+}
+
 export const config: Config = {
   solanaRpcUrl: envStr('SOLANA_RPC_URL', 'https://api.mainnet-beta.solana.com'),
   solanaRpcFallbackUrl: envStr('SOLANA_RPC_FALLBACK_URL'),
@@ -27,7 +33,10 @@ export const config: Config = {
   jupiterApiKey: envStr('JUPITER_API_KEY'),
   jupiterSwapBaseUrl: envStr('JUPITER_SWAP_BASE_URL', 'https://api.jup.ag/swap/v2'),
   telegramBotToken: envStr('TELEGRAM_BOT_TOKEN'),
-  telegramChatId: envStr('TELEGRAM_CHAT_ID'),
+  telegramChatId,
+  telegramUserId: envStr('TELEGRAM_USER_ID', telegramChatId.startsWith('-') ? '' : telegramChatId),
+  telegramManualTradingEnabled: envBool('TELEGRAM_MANUAL_TRADING_ENABLED', false),
+  telegramConfirmTtlMs: envNum('TELEGRAM_CONFIRM_TTL_MS', 120_000),
   defaultTpPercent: envNum('DEFAULT_TP_PERCENT', 10),
   defaultSlPercent: envNum('DEFAULT_SL_PERCENT', -17),
   pollIntervalMs: envNum('POLL_INTERVAL_MS', 2500),
@@ -47,6 +56,8 @@ export const config: Config = {
   maxDrawdownTpOverride: envNum('MAX_DRAWDOWN_TP_OVERRIDE', 2),
   flipModeInitialTriggerPct: envNum('FLIP_MODE_INITIAL_TRIGGER_PCT', 40),
   flipModeRepeatStepPct: envNum('FLIP_MODE_REPEAT_STEP_PCT', 10),
+  openMaxPriceMoveBins,
+  openSolFeeReserve: envNum('OPEN_SOL_FEE_RESERVE', 0.02),
   dbPath: envStr('DB_PATH', './monitoring-lp.sqlite'),
   logLevel: envStr('LOG_LEVEL', 'info'),
 }

@@ -1,0 +1,24 @@
+import assert from 'node:assert/strict'
+import test from 'node:test'
+import { isTelegramAuthorized, parseDashboardAction } from '../src/telegram/control.js'
+
+test('requires both configured chat and user for Telegram trading controls', () => {
+  assert.equal(isTelegramAuthorized('100', '200', '100', '200'), true)
+  assert.equal(isTelegramAuthorized('100', '201', '100', '200'), false)
+  assert.equal(isTelegramAuthorized('101', '200', '100', '200'), false)
+  assert.equal(isTelegramAuthorized('100', undefined, '100', '200'), false)
+})
+
+test('parses compact dashboard actions and rejects malformed callbacks', () => {
+  assert.deepEqual(parseDashboardAction('lpd:refresh:2'), { type: 'refresh', page: 2 })
+  assert.deepEqual(parseDashboardAction('lpd:pick:1:PositionKey'), {
+    type: 'close_select',
+    page: 1,
+    positionPubkey: 'PositionKey',
+  })
+  assert.deepEqual(parseDashboardAction('lpd:strategy:curve'), { type: 'open_strategy', strategy: 'curve' })
+  assert.deepEqual(parseDashboardAction('lpd:oc:abc123'), { type: 'open_confirm', token: 'abc123' })
+  assert.equal(parseDashboardAction('lpd:strategy:invalid'), null)
+  assert.equal(parseDashboardAction('lpd:refresh:-1'), null)
+  assert.equal(parseDashboardAction('other:refresh:0'), null)
+})

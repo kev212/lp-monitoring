@@ -34,7 +34,8 @@ import {
 } from './meteora/positions.js'
 import { clearPnlCache, estimateExitValue, getQuoteCurrency, type ValuationResult } from './meteora/valuation.js'
 import { fetchLpAgentPositions, type LpAgentPosition } from './lpagent.js'
-import { executeExit } from './meteora/exit.js'
+import { executeExit, reconcilePendingExits } from './meteora/exit.js'
+import { reconcilePendingOpens } from './meteora/open.js'
 import { executeDirectionalPrecisionCurve, THRESHOLD_RATIO, THRESHOLD_MIN, RECOVERY_MS } from './meteora/precisionCurve.js'
 import { calculateFlipProgressPct, executeFlipMode, retryPendingFlipAdd } from './meteora/flipMode.js'
 import { evaluateTrigger, type BinData } from './risk/rules.js'
@@ -48,6 +49,13 @@ import {
   formatBotStop,
 } from './telegram.js'
 import type { PositionRow, BasisConfidence, QuoteCurrency, TriggerType, StrategyType } from './types.js'
+import {
+  getWalletOperation,
+  reconcileDurableReshapeOperation,
+  reconcileOrphanExitIntent,
+  withDurableWalletOperation,
+  withWalletExecutionLock,
+} from './executionLock.js'
 
 const SOL_MINT = 'So11111111111111111111111111111111111111112'
 const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
@@ -93,6 +101,11 @@ export async function startBot(): Promise<void> {
   const walletPubkey = wallet.publicKey
   const ownerStr = walletPubkey.toBase58()
 
+  reconcileOrphanExitIntent(ownerStr)
+  const reshapeRecovery = await reconcileDurableReshapeOperation(getConnection(), ownerStr)
+  if (reshapeRecovery === 'review') console.log('[reshape] recovered transaction requires manual position review')
+  await reconcilePendingExits(getConnection(), wallet)
+  await reconcilePendingOpens(getConnection())
   sendNotification(formatBotStart(walletPubkey.toBase58(), 0))
   // Balance will be fetched in first cycle
 
@@ -106,6 +119,13 @@ export async function startBot(): Promise<void> {
       const now = Date.now()
       if (now - lastDiscoveryTime >= DISCOVERY_INTERVAL_MS) {
         lastDiscoveryTime = now
+        reconcileOrphanExitIntent(ownerStr)
+        const reshapeRecovery = await reconcileDurableReshapeOperation(getConnection(), ownerStr)
+        if (reshapeRecovery === 'review') {
+          sendNotification('🚨 <b>Reshape Recovery Requires Review</b>\n\nA finalized partial Flip/Precision transaction was recovered after restart. The position was marked error to prevent duplicate wallet mutations.')
+        }
+        await reconcilePendingExits(getConnection(), wallet)
+        await reconcilePendingOpens(getConnection())
         await discoverInitialPositions(getConnection(), walletPubkey, ownerStr)
       }
 
@@ -710,6 +730,15 @@ async function monitorSinglePosition(
             pos.poolPubkey, exitValuation.solUsdPrice, ownerStr, pos.quoteCurrency
           )
         )
+      } else if (result.pendingRecovery) {
+        sendNotification(
+          `⏳ <b>Exit Pending Reconciliation</b>\n\n` +
+          `<b>${pos.tokenXSymbol}/${pos.tokenYSymbol}</b>\n` +
+          `Position: <code>${pos.positionPubkey}</code>\n` +
+          `Reason: <code>${result.error || 'waiting for final chain state'}</code>\n\n` +
+          `No duplicate transaction will be sent while this state is unresolved.`
+        )
+        updatePositionConfirmations(pos.positionPubkey, 0)
       } else {
         sendNotification(
           formatExitFailed(
@@ -718,7 +747,6 @@ async function monitorSinglePosition(
             pos.poolPubkey
           )
         )
-        updatePositionStatus(pos.positionPubkey, 'monitoring')
         updatePositionConfirmations(pos.positionPubkey, 0)
       }
     } else if (decision.triggerType && !decision.shouldTrigger && decision.reason?.includes('awaiting confirmation')) {
@@ -769,6 +797,10 @@ async function maybeRunFlipMode(
   poolActiveBinId?: number,
 ): Promise<boolean> {
   const tokenLabel = `${pos.tokenXSymbol || pos.tokenXMint.slice(0, 4)}/${pos.tokenYSymbol || pos.tokenYMint.slice(0, 4)}`
+  if (getWalletOperation(pos.owner)) {
+    console.log(`[flip] ${tokenLabel} | durable wallet operation pending — reshape paused`)
+    return true
+  }
 
   if (pos.flipModePendingAdd) {
     if (pos.flipModeBusy) {
@@ -777,7 +809,30 @@ async function maybeRunFlipMode(
     }
 
     updateFlipModeBusy(pos.positionPubkey, true)
-    const result = await retryPendingFlipAdd(getConnection(), getWallet(), pos)
+    let result: Awaited<ReturnType<typeof retryPendingFlipAdd>>
+    try {
+      result = await withWalletExecutionLock(() => withDurableWalletOperation(
+        pos.owner,
+        'reshape',
+        `flip-retry:${pos.positionPubkey}`,
+        async () => {
+          const outcome = await retryPendingFlipAdd(getConnection(), getWallet(), pos)
+          const previousPending = BigInt(pos.flipModePendingTokenAmount || '0')
+          const remaining = BigInt(outcome.tokenAmountRemaining || previousPending.toString())
+          if (remaining < previousPending) {
+            if (remaining === 0n) clearFlipModePendingAdd(pos.positionPubkey)
+            else updateFlipModePendingAmount(pos.positionPubkey, remaining.toString(), outcome.error || null)
+          }
+          return outcome
+        },
+        outcome => outcome.success
+          || BigInt(outcome.tokenAmountRemaining || pos.flipModePendingTokenAmount || '0') < BigInt(pos.flipModePendingTokenAmount || '0'),
+      ))
+    } catch (err) {
+      updateFlipModeBusy(pos.positionPubkey, false)
+      console.log(`[flip] ${tokenLabel} | add-back paused: ${err instanceof Error ? err.message : 'wallet busy'}`)
+      return true
+    }
     const remaining = BigInt(result.tokenAmountRemaining || '0')
     const attempted = BigInt(result.tokenAmountAttempted || '0')
 
@@ -911,13 +966,35 @@ async function maybeRunFlipMode(
 
   updateFlipModeBusy(pos.positionPubkey, true)
   try {
-    const result = await executeFlipMode(getConnection(), getWallet(), pos, progressPct)
+    const result = await withWalletExecutionLock(() => withDurableWalletOperation(
+      pos.owner,
+      'reshape',
+      `flip:${pos.positionPubkey}`,
+      async () => {
+        const outcome = await executeFlipMode(getConnection(), getWallet(), pos, progressPct)
+        const outcomeActiveBin = outcome.activeBinId ?? poolActiveBinId
+        if (outcome.success) {
+          updateFlipModeState(pos.positionPubkey, progressPct, outcomeActiveBin, Date.now())
+          updateFlipModeRecoveryUntil(pos.positionPubkey, Date.now() + FLIP_MODE_RECOVERY_MS)
+        } else if (outcome.pendingAdd && outcome.tokenMint && outcome.tokenSide) {
+          setFlipModePendingAdd(pos.positionPubkey, {
+            tokenMint: outcome.tokenMint,
+            tokenSide: outcome.tokenSide,
+            tokenAmount: outcome.tokenAmount,
+            progressPct,
+            activeBin: outcomeActiveBin,
+            error: outcome.error || 'add-back pending retry',
+          })
+        } else {
+          updateFlipModeBusy(pos.positionPubkey, false)
+        }
+        return outcome
+      },
+      outcome => outcome.success || outcome.pendingAdd,
+    ))
     const activeBin = result.activeBinId ?? poolActiveBinId
 
     if (result.success) {
-      updateFlipModeState(pos.positionPubkey, progressPct, activeBin, Date.now())
-      updateFlipModeRecoveryUntil(pos.positionPubkey, Date.now() + FLIP_MODE_RECOVERY_MS)
-
       if (result.noop) {
         console.log(`[flip] ${tokenLabel} | no-op complete at progress=${progressPct.toFixed(2)}%`)
         sendNotification(
@@ -946,14 +1023,6 @@ async function maybeRunFlipMode(
     }
 
     if (result.pendingAdd && result.tokenMint && result.tokenSide) {
-      setFlipModePendingAdd(pos.positionPubkey, {
-        tokenMint: result.tokenMint,
-        tokenSide: result.tokenSide,
-        tokenAmount: result.tokenAmount,
-        progressPct,
-        activeBin,
-        error: result.error || 'add-back pending retry',
-      })
       console.log(`[flip] ${tokenLabel} | add-back pending: amount=${result.tokenAmount} error=${result.error || 'unknown'}`)
       sendNotification(
         `🔁 <b>Flip Mode Add-back Pending</b>\n\n` +
@@ -997,6 +1066,10 @@ async function maybeRunPrecisionCurve(
 ): Promise<boolean> {
   if (!pos.precisionCurveEnabled) return false
   const tokenLabel = `${pos.tokenXSymbol || pos.tokenXMint.slice(0, 4)}/${pos.tokenYSymbol || pos.tokenYMint.slice(0, 4)}`
+  if (getWalletOperation(pos.owner)) {
+    console.log(`[precision] ${tokenLabel} | durable wallet operation pending — reshape paused`)
+    return true
+  }
 
   if (pos.precisionCurveBusy) {
     console.log(`[precision] ${tokenLabel} | busy — skip trigger evaluation this cycle`)
@@ -1061,24 +1134,38 @@ async function maybeRunPrecisionCurve(
 
   updatePrecisionCurveBusy(pos.positionPubkey, true)
   try {
-    const result = await executeDirectionalPrecisionCurve(
-      getConnection(),
-      getWallet(),
-      pos.positionPubkey,
-      pos.poolPubkey,
-      pos.tokenXMint,
-      pos.tokenYMint,
-      pos.precisionCurveLastActiveBin,
-      pos.precisionCurveRangeHalf || 100,
-      pos.precisionCurveMovementLog || [],
-    )
+    const result = await withWalletExecutionLock(() => withDurableWalletOperation(
+      pos.owner,
+      'reshape',
+      `precision:${pos.positionPubkey}`,
+      async () => {
+        const outcome = await executeDirectionalPrecisionCurve(
+          getConnection(),
+          getWallet(),
+          pos.positionPubkey,
+          pos.poolPubkey,
+          pos.tokenXMint,
+          pos.tokenYMint,
+          pos.precisionCurveLastActiveBin,
+          pos.precisionCurveRangeHalf || 100,
+          pos.precisionCurveMovementLog || [],
+        )
+        if (outcome.success) {
+          updatePrecisionCurveState(pos.positionPubkey, outcome.activeBinId ?? poolActiveBinId, Date.now())
+          updatePrecisionCurveRecoveryUntil(pos.positionPubkey, Date.now() + RECOVERY_MS)
+        } else {
+          updatePrecisionCurveBusy(pos.positionPubkey, false)
+          if (outcome.removeSucceeded && outcome.addFailed) {
+            updatePrecisionCurveRecoveryUntil(pos.positionPubkey, Number.MAX_SAFE_INTEGER)
+          }
+        }
+        return outcome
+      },
+      outcome => outcome.success,
+    ))
 
     if (!result.success) {
-      updatePrecisionCurveBusy(pos.positionPubkey, false)
-
       if (result.removeSucceeded && result.addFailed) {
-        // Keep PnL exits disabled: part of this position's value is idle in the wallet.
-        updatePrecisionCurveRecoveryUntil(pos.positionPubkey, Number.MAX_SAFE_INTEGER)
         console.log(`[precision] ${tokenLabel} | CRITICAL: remove succeeded but add failed: ${result.error}`)
         sendNotification(
           `🚨 <b>Precision Curve CRITICAL</b>\n\n` +
@@ -1104,8 +1191,6 @@ async function maybeRunPrecisionCurve(
     }
 
     const newBaseline = result.activeBinId ?? poolActiveBinId
-    updatePrecisionCurveState(pos.positionPubkey, newBaseline, Date.now())
-    updatePrecisionCurveRecoveryUntil(pos.positionPubkey, Date.now() + RECOVERY_MS)
     console.log(`[precision] ${tokenLabel} | recovery window: ${RECOVERY_MS / 1000}s — peak frozen`)
 
     if (isInitialReshape) {
@@ -1189,10 +1274,7 @@ function checkExitCooldown(pubkey: string): void {
     const execRow = db.prepare(
       "SELECT status FROM executions WHERE position_pubkey = ? ORDER BY created_at DESC LIMIT 1"
     ).get(pubkey) as any
-    if (execRow && (execRow.status === 'completed' || execRow.status === 'failed' || execRow.status === 'removed' || execRow.status === 'swap_pending')) {
-      const targetStatus = execRow.status === 'completed' ? 'closed' : 'error'
-      updatePositionStatus(pubkey, targetStatus)
-    }
+    if (execRow?.status === 'completed') updatePositionStatus(pubkey, 'closed')
     exitCooldowns.set(pubkey, now)
   }
 }

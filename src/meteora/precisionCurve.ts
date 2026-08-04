@@ -2,6 +2,7 @@ import { Connection, Keypair, PublicKey } from '@solana/web3.js'
 import { BN } from '@coral-xyz/anchor'
 import { StrategyType } from '@meteora-ag/dlmm'
 import { getPool, clearPoolCache } from './positions.js'
+import { DurableTransactionPendingError, sendDurableTransaction } from '../executionLock.js'
 
 const BASIS_POINTS = new BN(10000)
 const ACTIVE_SIDE_BUFFER_BINS = 2
@@ -223,9 +224,13 @@ export async function executeDirectionalPrecisionCurve(
 
       const txs = Array.isArray(removeTxs) ? removeTxs : [removeTxs]
       for (const tx of txs) {
-        tx.sign(wallet)
-        const sig = await connection.sendTransaction(tx, [wallet])
-        await connection.confirmTransaction(sig, 'confirmed')
+        const sig = await sendDurableTransaction(
+          connection,
+          wallet,
+          wallet.publicKey.toBase58(),
+          `precision:${positionPubkey}`,
+          tx,
+        )
         result.removeSignature = sig
         console.log(`[precision] remove liq tx chunk ${i + 1}/${chunks.length} (${chunk.from}-${chunk.to}): ${sig}`)
       }
@@ -307,9 +312,13 @@ export async function executeDirectionalPrecisionCurve(
           slippage,
         })
 
-        addTx.sign(wallet)
-        addSig = await connection.sendTransaction(addTx, [wallet])
-        await connection.confirmTransaction(addSig, 'confirmed')
+        addSig = await sendDurableTransaction(
+          connection,
+          wallet,
+          wallet.publicKey.toBase58(),
+          `precision:${positionPubkey}`,
+          addTx,
+        )
 
         const txResult = await connection.getTransaction(addSig, { maxSupportedTransactionVersion: 0 })
         if (!txResult || txResult.meta?.err) {
@@ -324,6 +333,7 @@ export async function executeDirectionalPrecisionCurve(
         console.log(`[precision] add liq tx (slippage=${slippage}): ${addSig}`)
         break
       } catch (addErr) {
+        if (addErr instanceof DurableTransactionPendingError) throw addErr
         const msg = addErr instanceof Error ? addErr.message : 'unknown'
         console.log(`[precision] add liq failed (slippage=${slippage}): ${msg}`)
         if (!msg.includes('ExceededBinSlippageTolerance')) {

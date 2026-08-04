@@ -1,9 +1,9 @@
-export type PositionStatus = 'discovering' | 'monitoring' | 'exiting' | 'closed' | 'error'
+export type PositionStatus = 'opening' | 'discovering' | 'monitoring' | 'exiting' | 'closed' | 'error'
 export type BasisConfidence = 'high' | 'medium' | 'low'
 export type StrategyType = 'single_side_quote' | 'single_side_token' | 'balanced' | 'unknown'
 export type TokenSide = 'X' | 'Y'
 export type EventType = 'POSITION_INIT' | 'ADD_LIQUIDITY' | 'REMOVE_LIQUIDITY' | 'CLAIM_FEE' | 'CLAIM_REWARD' | 'CLOSE_POSITION' | 'UNKNOWN'
-export type TriggerType = 'TP' | 'SL' | 'TRAILING_STOP' | 'BIN_RANGE'
+export type TriggerType = 'TP' | 'SL' | 'TRAILING_STOP' | 'BIN_RANGE' | 'MANUAL'
 export type ExitStatus = 'pending_remove' | 'removed' | 'swap_pending' | 'completed' | 'failed'
 export type QuoteCurrency = 'SOL' | 'USDC'
 
@@ -95,6 +95,9 @@ export interface Config {
   jupiterSwapBaseUrl: string
   telegramBotToken: string
   telegramChatId: string
+  telegramUserId: string
+  telegramManualTradingEnabled: boolean
+  telegramConfirmTtlMs: number
   defaultTpPercent: number
   defaultSlPercent: number
   pollIntervalMs: number
@@ -114,6 +117,8 @@ export interface Config {
   maxDrawdownTpOverride: number
   flipModeInitialTriggerPct: number
   flipModeRepeatStepPct: number
+  openMaxPriceMoveBins: number
+  openSolFeeReserve: number
   dbPath: string
   logLevel: string
 }
