@@ -1,6 +1,7 @@
 import type { QuoteCurrency } from '../types.js'
 
 const SUBSCRIPT_DIGITS = '₀₁₂₃₄₅₆₇₈₉'
+const BIN_BAR_WIDTH = 10
 
 export interface BinRangeDisplayInput {
   lowerBinId: number
@@ -46,10 +47,10 @@ export function buildBinRangeDisplay(input: BinRangeDisplayInput): BinRangeDispl
   const progressPct = Number.isFinite(lower) && Number.isFinite(upper) && Number.isFinite(current) && upper > lower
     ? Math.max(0, Math.min(100, Math.round(((current - lower) / (upper - lower)) * 100)))
     : null
-  const filled = progressPct === null ? 0 : Math.round(progressPct / 10)
+  const cursor = progressPct === null ? 0 : Math.min(BIN_BAR_WIDTH - 1, Math.round(progressPct / 10))
   const bar = progressPct === null
-    ? '━━━━━━━━━│ N/A'
-    : `${'━'.repeat(filled)}│ ${progressPct}%`
+    ? `${'━'.repeat(BIN_BAR_WIDTH)} N/A`
+    : `${'━'.repeat(cursor)}│${'━'.repeat(BIN_BAR_WIDTH - cursor - 1)} ${progressPct}%`
   const format = (value: number): string => {
     const compact = formatCompactPrice(value)
     return input.quoteCurrency === 'USDC' ? `$${compact}` : `${compact} SOL`

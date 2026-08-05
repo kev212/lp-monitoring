@@ -179,6 +179,21 @@ function formatQuote(value: number, quote: PositionRow['quoteCurrency']): string
   return quote === 'USDC' ? `${value.toFixed(2)} USDC` : `${value.toFixed(4)} SOL`
 }
 
+function formatDashboardQuote(value: number, quote: PositionRow['quoteCurrency']): string {
+  return quote === 'USDC' ? `$${value.toFixed(2)}` : `${value.toFixed(2)} SOL`
+}
+
+export function formatPnlUsd(valuation: Pick<ValuationResult, 'quoteCurrency' | 'pnlQuote' | 'solUsdPrice'>): string | null {
+  if (valuation.quoteCurrency === 'SOL' && (!Number.isFinite(valuation.solUsdPrice) || valuation.solUsdPrice <= 0)) return null
+  const pnlUsd = valuation.quoteCurrency === 'USDC'
+    ? valuation.pnlQuote
+    : valuation.pnlQuote * valuation.solUsdPrice
+  if (!Number.isFinite(pnlUsd)) return null
+  const absolute = Math.abs(pnlUsd)
+  const amount = absolute >= 1 ? Math.round(absolute).toString() : absolute.toFixed(2)
+  return pnlUsd < 0 ? `~-$${amount}` : `~$${amount}`
+}
+
 function confirmationToken(): string {
   return randomBytes(8).toString('hex')
 }
@@ -359,16 +374,16 @@ class TelegramDashboardController {
       return valuation ? buildPositionBinDisplay(position, valuation).catch(() => null) : Promise.resolve(null)
     }))
     const lines = [
-      'LP MONITOR DASHBOARD',
-      `Wallet: ${shortAddress(getWallet().publicKey.toBase58())}`,
-      `Manual trading: ${config.telegramManualTradingEnabled ? 'ENABLED' : 'LOCKED'}`,
-      `Risk: SL ${riskSettings.slPercent}% · TP +${riskSettings.tpPercent}% · Trail ${riskSettings.trailingEnabled ? `ON (${riskSettings.trailingActivationPct}%/${riskSettings.trailingStopDropPct}%)` : 'OFF'}`,
-      `Updated: ${new Date().toISOString().replace('T', ' ').slice(0, 19)} UTC`,
+      '📊 LP MONITOR DASHBOARD',
+      `👛 Wallet: ${shortAddress(getWallet().publicKey.toBase58())}`,
+      `${config.telegramManualTradingEnabled ? '🔓' : '🔒'} Manual trading: ${config.telegramManualTradingEnabled ? 'ENABLED' : 'LOCKED'}`,
+      `🛡️ Risk: SL ${riskSettings.slPercent}% · TP +${riskSettings.tpPercent}% · Trail ${riskSettings.trailingEnabled ? `ON (${riskSettings.trailingActivationPct}%/${riskSettings.trailingStopDropPct}%)` : 'OFF'}`,
+      `🕒 Updated: ${new Date().toISOString().replace('T', ' ').slice(0, 19)} UTC`,
       '',
     ]
 
     if (pagePositions.length === 0) {
-      lines.push('Tidak ada posisi aktif.')
+      lines.push('📭 Tidak ada posisi aktif.')
     } else {
       for (let index = 0; index < pagePositions.length; index++) {
         const position = pagePositions[index]
@@ -377,37 +392,41 @@ class TelegramDashboardController {
         const pnl = valuation?.pnlPercent ?? position.lastPnlPercent
         const value = valuation?.estimatedExitQuote ?? position.lastEstimatedExitQuote
         const indicator = pnl === null ? '⚪' : pnl > 0 ? '🟢' : pnl < 0 ? '🔴' : '⚪'
-        const pnlLabel = pnl === null ? 'N/A' : `${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}%`
-        const valueLabel = value === null ? 'N/A' : formatQuote(value, position.quoteCurrency)
+        const pnlIcon = pnl === null ? '➖' : pnl > 0 ? '📈' : pnl < 0 ? '📉' : '➖'
+        const pnlUsd = valuation ? formatPnlUsd(valuation) : null
+        const pnlLabel = pnl === null
+          ? 'N/A'
+          : `${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}%${pnlUsd ? ` (${pnlUsd})` : ''}`
+        const valueLabel = value === null ? 'N/A' : formatDashboardQuote(value, position.quoteCurrency)
         const modes = [position.precisionCurveEnabled ? 'Precision' : '', position.flipModeEnabled ? 'Flip' : '', position.flipModePendingAdd ? 'FlipPending' : ''].filter(Boolean).join(', ') || 'off'
         const exceptionalStatus = ['opening', 'exiting', 'error'].includes(position.status) ? ` · ${position.status.toUpperCase()}` : ''
         lines.push(`${indicator} ${first + index + 1}. ${label}${exceptionalStatus}`)
-        lines.push(`   PnL ${pnlLabel} | Value ${valueLabel} | Basis ${formatQuote(position.basisQuote, position.quoteCurrency)}`)
+        lines.push(`   ${pnlIcon} PnL ${pnlLabel} · 💰 Value ${valueLabel}`)
         if (binDisplays[index]) {
           lines.push(`   ${binDisplays[index]!.bar}`)
           lines.push(`   ${binDisplays[index]!.prices}`)
         }
-        lines.push(`   Peak ${position.peakPnlPercent.toFixed(2)}% | Modes ${modes}`)
+        lines.push(`   🎯 Peak ${position.peakPnlPercent.toFixed(2)}% · ⚙️ Modes ${modes}`)
       }
     }
-    if (pageCount > 1) lines.push('', `Page ${page + 1}/${pageCount} | ${positions.length} positions`)
+    if (pageCount > 1) lines.push('', `📄 Page ${page + 1}/${pageCount} · ${positions.length} positions`)
 
     const inline_keyboard: TelegramBot.InlineKeyboardButton[][] = [
       [
-        { text: 'Refresh', callback_data: `lpd:refresh:${page}` },
-        { text: 'Close Position', callback_data: `lpd:close:${page}` },
+        { text: '🔄 Refresh', callback_data: `lpd:refresh:${page}` },
+        { text: '🔻 Close Position', callback_data: `lpd:close:${page}` },
       ],
-      [{ text: 'Open Position', callback_data: 'lpd:open' }],
-      [{ text: 'Risk Settings', callback_data: 'lpd:risk' }],
+      [{ text: '➕ Open Position', callback_data: 'lpd:open' }],
+      [{ text: '🛡️ Risk Settings', callback_data: 'lpd:risk' }],
       [
-        { text: 'Precision Curve', callback_data: 'lpd:precision' },
-        { text: 'Flip Mode', callback_data: 'lpd:flip' },
+        { text: '🎛️ Precision Curve', callback_data: 'lpd:precision' },
+        { text: '🔁 Flip Mode', callback_data: 'lpd:flip' },
       ],
     ]
     if (pageCount > 1) {
       const nav: TelegramBot.InlineKeyboardButton[] = []
-      if (page > 0) nav.push({ text: 'Prev', callback_data: `lpd:show:${page - 1}` })
-      if (page < pageCount - 1) nav.push({ text: 'Next', callback_data: `lpd:show:${page + 1}` })
+      if (page > 0) nav.push({ text: '◀️ Prev', callback_data: `lpd:show:${page - 1}` })
+      if (page < pageCount - 1) nav.push({ text: 'Next ▶️', callback_data: `lpd:show:${page + 1}` })
       inline_keyboard.push(nav)
     }
     return { text: lines.join('\n'), keyboard: { inline_keyboard }, positions, page }

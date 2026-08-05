@@ -1,15 +1,15 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { buildBinRangeDisplay, formatCompactPrice } from '../src/telegram/binDisplay.js'
-import { parseRiskInput } from '../src/telegram/control.js'
+import { formatPnlUsd, parseRiskInput } from '../src/telegram/control.js'
 import { validateRiskSettings } from '../src/risk/settings.js'
 import { evaluateTrigger } from '../src/risk/rules.js'
 import type { PositionRow } from '../src/types.js'
 
-test('formats compact prices and linear bin progress for a SOL quote', () => {
-  assert.equal(formatCompactPrice(0.0003579), '0.0₃3579')
-  assert.equal(formatCompactPrice(0.0004992), '0.0₃4992')
-  assert.equal(formatCompactPrice(0.0004908), '0.0₃4908')
+test('formats compact prices and a fixed-width linear bin progress bar', () => {
+  assert.equal(formatCompactPrice(0.00001695), '0.0₄1695')
+  assert.equal(formatCompactPrice(0.00004771), '0.0₄4771')
+  assert.equal(formatCompactPrice(0.00003795), '0.0₄3795')
 
   const display = buildBinRangeDisplay({
     lowerBinId: 10,
@@ -17,12 +17,12 @@ test('formats compact prices and linear bin progress for a SOL quote', () => {
     upperBinId: 20,
     quoteSide: 'Y',
     quoteCurrency: 'SOL',
-    priceForBin: bin => ({ 10: 0.0003579, 18: 0.0004908, 20: 0.0004992 }[bin] || 1),
+    priceForBin: bin => ({ 10: 0.00001695, 18: 0.00003795, 20: 0.00004771 }[bin] || 1),
   })
 
-  assert.equal(display.progressPct, 94)
-  assert.equal(display.bar, '━━━━━━━━━│ 94%')
-  assert.equal(display.prices, '0.0₃3579 SOL – 0.0₃4992 SOL · 0.0₃4908 SOL')
+  assert.equal(display.progressPct, 68)
+  assert.equal(display.bar, '━━━━━━━│━━ 68%')
+  assert.equal(display.prices, '0.0₄1695 SOL – 0.0₄4771 SOL · 0.0₄3795 SOL')
 })
 
 test('inverts bin prices for a quote-X position and formats USDC as dollars', () => {
@@ -36,7 +36,15 @@ test('inverts bin prices for a quote-X position and formats USDC as dollars', ()
   })
 
   assert.equal(display.progressPct, 33)
+  assert.equal(display.bar, '━━━│━━━━━━ 33%')
   assert.equal(display.prices, '$0.125 – $0.5 · $0.25')
+})
+
+test('formats approximate PnL in USD for SOL and USDC quotes', () => {
+  assert.equal(formatPnlUsd({ quoteCurrency: 'SOL', pnlQuote: 0.02, solUsdPrice: 50 }), '~$1')
+  assert.equal(formatPnlUsd({ quoteCurrency: 'SOL', pnlQuote: -0.02, solUsdPrice: 50 }), '~-$1')
+  assert.equal(formatPnlUsd({ quoteCurrency: 'SOL', pnlQuote: 0.02, solUsdPrice: 0 }), null)
+  assert.equal(formatPnlUsd({ quoteCurrency: 'USDC', pnlQuote: 1.25, solUsdPrice: 0 }), '~$1')
 })
 
 test('validates global risk inputs', () => {
