@@ -93,9 +93,31 @@ export function initSchema(db: Database.Database): void {
       updated_at INTEGER NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS risk_settings (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      sl_percent REAL NOT NULL,
+      tp_percent REAL NOT NULL,
+      trailing_enabled INTEGER NOT NULL DEFAULT 1,
+      trailing_activation_pct REAL NOT NULL,
+      trailing_stop_drop_pct REAL NOT NULL,
+      revision INTEGER NOT NULL DEFAULT 0,
+      updated_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS risk_setting_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      revision INTEGER NOT NULL,
+      old_settings TEXT NOT NULL,
+      new_settings TEXT NOT NULL,
+      actor_chat_id TEXT,
+      actor_user_id TEXT,
+      created_at INTEGER NOT NULL
+    );
+
     CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
     CREATE INDEX IF NOT EXISTS idx_position_events_pubkey ON position_events(position_pubkey);
     CREATE INDEX IF NOT EXISTS idx_executions_pubkey ON executions(position_pubkey);
+    CREATE INDEX IF NOT EXISTS idx_risk_setting_events_revision ON risk_setting_events(revision);
   `)
 
   // Add columns for existing DBs that were created before schema update

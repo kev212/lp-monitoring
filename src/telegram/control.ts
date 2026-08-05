@@ -1,6 +1,7 @@
 import { randomBytes } from 'node:crypto'
 import TelegramBot from 'node-telegram-bot-api'
 import { PublicKey } from '@solana/web3.js'
+import { getPriceOfBinByBinId } from '@meteora-ag/dlmm'
 import { config } from '../config.js'
 import { deleteSyncValue, getSyncValue, setSyncValue } from '../db/client.js'
 import { loadKnownPositions } from '../meteora/discovery.js'
@@ -13,13 +14,18 @@ import {
   type OpenLiquidityStrategy,
   type OpenPositionPreview,
 } from '../meteora/open.js'
-import { estimateExitValue } from '../meteora/valuation.js'
+import { getPool } from '../meteora/positions.js'
+import { estimateExitValue, type ValuationResult } from '../meteora/valuation.js'
+import { getRiskSettings, updateGlobalRiskSettings, validateRiskSettings, type RiskSettingsPatch } from '../risk/settings.js'
 import { getConnection } from '../solana/connection.js'
 import { getWallet } from '../solana/wallet.js'
-import type { PositionRow } from '../types.js'
+import type { GlobalRiskSettings, PositionRow, RiskSettingField } from '../types.js'
+import { buildBinRangeDisplay } from './binDisplay.js'
 
 const DASHBOARD_PAGE_SIZE = 5
 const DASHBOARD_KEY_PREFIX = 'telegram_dashboard:'
+const SOL_MINT = 'So11111111111111111111111111111111111111112'
+const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
 
 export type DashboardAction =
   | { type: 'show'; page: number }
@@ -31,6 +37,11 @@ export type DashboardAction =
   | { type: 'open_strategy'; strategy: OpenLiquidityStrategy }
   | { type: 'open_confirm'; token: string }
   | { type: 'open_cancel'; token: string }
+  | { type: 'risk' }
+  | { type: 'risk_field'; field: RiskSettingField }
+  | { type: 'risk_toggle' }
+  | { type: 'risk_confirm'; token: string }
+  | { type: 'risk_cancel'; token: string }
   | { type: 'precision' }
   | { type: 'flip' }
 
@@ -38,12 +49,14 @@ type PendingOpenInput =
   | PendingBase & { kind: 'pool'; strategy: OpenLiquidityStrategy }
   | PendingBase & { kind: 'range'; strategy: OpenLiquidityStrategy; poolPubkey: string; quoteSymbol: string }
   | PendingBase & { kind: 'amount'; strategy: OpenLiquidityStrategy; poolPubkey: string; rangePercent: number; quoteSymbol: string }
+  | PendingBase & { kind: 'risk'; field: RiskSettingField }
 
 interface PendingBase {
   chatId: string
   userId: string
   dashboardMessageId: number
   expiresAt: number
+  promptMessageId?: number
 }
 
 interface Confirmation<T> {
@@ -56,6 +69,13 @@ interface Confirmation<T> {
 interface CloseConfirmationValue {
   positionPubkey: string
   page: number
+}
+
+interface RiskConfirmationValue {
+  field: RiskSettingField | 'trailing_toggle'
+  oldValue: number | boolean
+  newValue: number | boolean
+  settings: GlobalRiskSettings
 }
 
 interface DashboardRender {
@@ -85,6 +105,26 @@ function parsePage(value: string | undefined): number | null {
   return Number.isSafeInteger(page) ? page : null
 }
 
+export function parseRiskInput(field: RiskSettingField, input: string): number | null {
+  const normalized = input.trim().replace(/%$/, '')
+  if (!/^-?(?:\d+(?:\.\d+)?|\.\d+)$/.test(normalized)) return null
+  const value = Number(normalized)
+  if (!Number.isFinite(value)) return null
+  if (field === 'sl' && (value >= 0 || value <= -100)) return null
+  if (field === 'tp' && (value <= 0 || value > 1000)) return null
+  if (field === 'trail_arm' && (value <= 0 || value > 1000)) return null
+  if (field === 'trail_drop' && value <= 0) return null
+  return value
+}
+
+function riskFieldLabel(field: RiskSettingField | 'trailing_toggle'): string {
+  if (field === 'sl') return 'Stop Loss'
+  if (field === 'tp') return 'Take Profit'
+  if (field === 'trail_arm') return 'Trail Arm'
+  if (field === 'trail_drop') return 'Trail Drop'
+  return 'Trailing'
+}
+
 export function parseDashboardAction(data: string | undefined): DashboardAction | null {
   if (!data?.startsWith('lpd:')) return null
   const parts = data.split(':')
@@ -103,6 +143,13 @@ export function parseDashboardAction(data: string | undefined): DashboardAction 
   }
   if (parts.length === 3 && parts[1] === 'oc' && parts[2]) return { type: 'open_confirm', token: parts[2] }
   if (parts.length === 3 && parts[1] === 'ox' && parts[2]) return { type: 'open_cancel', token: parts[2] }
+  if (parts.length === 2 && parts[1] === 'risk') return { type: 'risk' }
+  if (parts.length === 3 && parts[1] === 'rs' && ['sl', 'tp', 'trail_arm', 'trail_drop'].includes(parts[2] || '')) {
+    return { type: 'risk_field', field: parts[2] as RiskSettingField }
+  }
+  if (parts.length === 2 && parts[1] === 'rt') return { type: 'risk_toggle' }
+  if (parts.length === 3 && parts[1] === 'rc' && parts[2]) return { type: 'risk_confirm', token: parts[2] }
+  if (parts.length === 3 && parts[1] === 'rx' && parts[2]) return { type: 'risk_cancel', token: parts[2] }
   if (parts.length === 2 && parts[1] === 'precision') return { type: 'precision' }
   if (parts.length === 2 && parts[1] === 'flip') return { type: 'flip' }
   return null
@@ -150,6 +197,7 @@ class TelegramDashboardController {
   private readonly pendingInput = new Map<string, PendingOpenInput>()
   private readonly openConfirmations = new Map<string, Confirmation<OpenPositionPreview>>()
   private readonly closeConfirmations = new Map<string, Confirmation<CloseConfirmationValue>>()
+  private readonly riskConfirmations = new Map<string, Confirmation<RiskConfirmationValue>>()
   private readonly closeInFlight = new Set<string>()
   private openInFlight = false
   private readonly lastDashboardPositions = new Map<string, PositionRow[]>()
@@ -160,9 +208,13 @@ class TelegramDashboardController {
   ) {}
 
   register(): void {
-    this.bot.onText(/^\/(?:dashboard|status)(?:@\w+)?$/, msg => {
+    this.bot.onText(/^\/(dashboard|status)(?:@\w+)?$/, (msg, match) => {
       if (!this.authorized(msg)) return
-      void this.showDashboard(String(msg.chat.id), 0).catch(err => this.reportError(msg.chat.id, err))
+      void this.showDashboard(String(msg.chat.id), 0, undefined, match?.[1] === 'status').catch(err => this.reportError(msg.chat.id, err))
+    })
+    this.bot.onText(/^\/risk(?:@\w+)?$/, msg => {
+      if (!this.authorized(msg)) return
+      void this.showRiskMenu(String(msg.chat.id)).catch(err => this.reportError(msg.chat.id, err))
     })
     this.bot.onText(/^\/open(?:@\w+)?$/, msg => {
       if (!this.authorized(msg)) return
@@ -260,6 +312,27 @@ class TelegramDashboardController {
       await this.bot.sendMessage(chatId, 'Open position dibatalkan.')
       return
     }
+    if (action.type === 'risk') {
+      await this.showRiskMenu(chatId, message.message_id)
+      return
+    }
+    if (action.type === 'risk_field') {
+      await this.startRiskInput(chatId, query.from.id.toString(), message.message_id, action.field)
+      return
+    }
+    if (action.type === 'risk_toggle') {
+      await this.startRiskToggle(chatId, query.from.id.toString(), message.message_id)
+      return
+    }
+    if (action.type === 'risk_confirm') {
+      await this.confirmRiskChange(query, action.token)
+      return
+    }
+    if (action.type === 'risk_cancel') {
+      this.riskConfirmations.delete(action.token)
+      await this.showRiskMenu(chatId, message.message_id)
+      return
+    }
     if (action.type === 'precision') {
       this.menus.showPrecision(message.chat.id)
       return
@@ -268,6 +341,7 @@ class TelegramDashboardController {
   }
 
   private async buildDashboard(requestedPage: number): Promise<DashboardRender> {
+    const riskSettings = getRiskSettings()
     const positions = loadKnownPositions()
       .filter(position => position.status !== 'closed')
       .sort((a, b) => a.createdAt - b.createdAt)
@@ -280,10 +354,15 @@ class TelegramDashboardController {
         ? estimateExitValue(position.poolPubkey, position.owner, position.positionPubkey, position.quoteCurrency).catch(() => null)
         : Promise.resolve(null)
     ))
+    const binDisplays = await Promise.all(pagePositions.map((position, index) => {
+      const valuation = valuations[index]
+      return valuation ? buildPositionBinDisplay(position, valuation).catch(() => null) : Promise.resolve(null)
+    }))
     const lines = [
       'LP MONITOR DASHBOARD',
       `Wallet: ${shortAddress(getWallet().publicKey.toBase58())}`,
       `Manual trading: ${config.telegramManualTradingEnabled ? 'ENABLED' : 'LOCKED'}`,
+      `Risk: SL ${riskSettings.slPercent}% · TP +${riskSettings.tpPercent}% · Trail ${riskSettings.trailingEnabled ? `ON (${riskSettings.trailingActivationPct}%/${riskSettings.trailingStopDropPct}%)` : 'OFF'}`,
       `Updated: ${new Date().toISOString().replace('T', ' ').slice(0, 19)} UTC`,
       '',
     ]
@@ -297,13 +376,16 @@ class TelegramDashboardController {
         const label = `${position.tokenXSymbol || position.tokenXMint.slice(0, 4)}/${position.tokenYSymbol || position.tokenYMint.slice(0, 4)}`
         const pnl = valuation?.pnlPercent ?? position.lastPnlPercent
         const value = valuation?.estimatedExitQuote ?? position.lastEstimatedExitQuote
+        const indicator = pnl === null ? '⚪' : pnl > 0 ? '🟢' : pnl < 0 ? '🔴' : '⚪'
         const pnlLabel = pnl === null ? 'N/A' : `${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}%`
         const valueLabel = value === null ? 'N/A' : formatQuote(value, position.quoteCurrency)
         const modes = [position.precisionCurveEnabled ? 'Precision' : '', position.flipModeEnabled ? 'Flip' : '', position.flipModePendingAdd ? 'FlipPending' : ''].filter(Boolean).join(', ') || 'off'
-        lines.push(`${first + index + 1}. ${label} | ${position.status}`)
+        const exceptionalStatus = ['opening', 'exiting', 'error'].includes(position.status) ? ` · ${position.status.toUpperCase()}` : ''
+        lines.push(`${indicator} ${first + index + 1}. ${label}${exceptionalStatus}`)
         lines.push(`   PnL ${pnlLabel} | Value ${valueLabel} | Basis ${formatQuote(position.basisQuote, position.quoteCurrency)}`)
-        if (valuation?.lowerBinId !== undefined && valuation.upperBinId !== undefined && valuation.poolActiveBinId !== undefined) {
-          lines.push(`   Bins ${valuation.lowerBinId} < ${valuation.poolActiveBinId} < ${valuation.upperBinId}`)
+        if (binDisplays[index]) {
+          lines.push(`   ${binDisplays[index]!.bar}`)
+          lines.push(`   ${binDisplays[index]!.prices}`)
         }
         lines.push(`   Peak ${position.peakPnlPercent.toFixed(2)}% | Modes ${modes}`)
       }
@@ -316,6 +398,7 @@ class TelegramDashboardController {
         { text: 'Close Position', callback_data: `lpd:close:${page}` },
       ],
       [{ text: 'Open Position', callback_data: 'lpd:open' }],
+      [{ text: 'Risk Settings', callback_data: 'lpd:risk' }],
       [
         { text: 'Precision Curve', callback_data: 'lpd:precision' },
         { text: 'Flip Mode', callback_data: 'lpd:flip' },
@@ -330,11 +413,11 @@ class TelegramDashboardController {
     return { text: lines.join('\n'), keyboard: { inline_keyboard }, positions, page }
   }
 
-  private async showDashboard(chatId: string, page: number, messageId?: number): Promise<void> {
+  private async showDashboard(chatId: string, page: number, messageId?: number, forceNew = false): Promise<void> {
     const dashboard = await this.buildDashboard(page)
     this.lastDashboardPositions.set(chatId, dashboard.positions)
     const persistedId = Number(getSyncValue(`${DASHBOARD_KEY_PREFIX}${chatId}`) || 0)
-    const storedId = messageId ?? (persistedId || undefined)
+    const storedId = forceNew ? undefined : messageId ?? (persistedId || undefined)
     if (storedId) {
       try {
         await this.bot.editMessageText(dashboard.text, {
@@ -496,6 +579,152 @@ class TelegramDashboardController {
     await this.showDashboard(chatId, confirmation.page, messageId).catch(() => this.showDashboard(chatId, confirmation.page))
   }
 
+  private async showRiskMenu(chatId: string, messageId?: number): Promise<void> {
+    const settings = getRiskSettings()
+    const activeCount = loadKnownPositions().filter(position => position.status === 'monitoring' || position.status === 'discovering').length
+    const text = [
+      'GLOBAL RISK SETTINGS',
+      `Applies to: ${activeCount} active positions`,
+      '',
+      `Stop Loss: ${settings.slPercent}%`,
+      `Take Profit: +${settings.tpPercent}%`,
+      `Trailing: ${settings.trailingEnabled ? 'ON' : 'OFF'}`,
+      `Trail Arm: +${settings.trailingActivationPct}%`,
+      `Trail Drop: ${settings.trailingStopDropPct}% from peak`,
+      `Policy revision: ${settings.revision}`,
+      '',
+      'Changes apply to all active positions after confirmation.',
+    ].join('\n')
+    const keyboard: TelegramBot.InlineKeyboardMarkup = {
+      inline_keyboard: [
+        [
+          { text: 'Set SL', callback_data: 'lpd:rs:sl' },
+          { text: 'Set TP', callback_data: 'lpd:rs:tp' },
+        ],
+        [
+          { text: `Trailing ${settings.trailingEnabled ? 'OFF' : 'ON'}`, callback_data: 'lpd:rt' },
+        ],
+        [
+          { text: 'Set Trail Arm', callback_data: 'lpd:rs:trail_arm' },
+          { text: 'Set Trail Drop', callback_data: 'lpd:rs:trail_drop' },
+        ],
+        [{ text: 'Back to Dashboard', callback_data: 'lpd:show:0' }],
+      ],
+    }
+    if (messageId) {
+      try {
+        await this.bot.editMessageText(text, { chat_id: chatId, message_id: messageId, reply_markup: keyboard })
+        return
+      } catch (err) {
+        if (String(err).includes('message is not modified')) return
+      }
+    }
+    await this.bot.sendMessage(chatId, text, { reply_markup: keyboard })
+  }
+
+  private async startRiskInput(chatId: string, userId: string, messageId: number, field: RiskSettingField): Promise<void> {
+    const settings = getRiskSettings()
+    const prompt = await this.bot.sendMessage(
+      chatId,
+      `Risk Settings — ${riskFieldLabel(field)}\n` +
+        `Current: ${formatRiskValue(field, riskFieldValue(settings, field))}\n` +
+        `Kirim angka baru${field === 'sl' ? ' negatif' : ' positif'} (contoh: ${field === 'sl' ? '-12' : field === 'tp' ? '8' : '3'}).`,
+      { reply_markup: { force_reply: true, input_field_placeholder: field === 'sl' ? '-12' : '3' } },
+    )
+    this.pendingInput.set(chatId, {
+      kind: 'risk',
+      field,
+      chatId,
+      userId,
+      dashboardMessageId: messageId,
+      promptMessageId: prompt.message_id,
+      expiresAt: Date.now() + config.telegramConfirmTtlMs,
+    })
+  }
+
+  private async startRiskToggle(chatId: string, userId: string, messageId: number): Promise<void> {
+    const settings = getRiskSettings()
+    await this.armRiskConfirmation(chatId, userId, messageId, 'trailing_toggle', !settings.trailingEnabled)
+  }
+
+  private async armRiskConfirmation(
+    chatId: string,
+    userId: string,
+    _messageId: number,
+    field: RiskSettingField | 'trailing_toggle',
+    newValue: number | boolean,
+  ): Promise<void> {
+    const settings = getRiskSettings()
+    const patch = riskPatch(field, newValue)
+    try {
+      validateRiskSettings({
+        slPercent: patch.slPercent ?? settings.slPercent,
+        tpPercent: patch.tpPercent ?? settings.tpPercent,
+        trailingEnabled: patch.trailingEnabled ?? settings.trailingEnabled,
+        trailingActivationPct: patch.trailingActivationPct ?? settings.trailingActivationPct,
+        trailingStopDropPct: patch.trailingStopDropPct ?? settings.trailingStopDropPct,
+      })
+    } catch (err) {
+      await this.bot.sendMessage(chatId, `Risk setting tidak valid: ${errorMessage(err)}`)
+      return
+    }
+    const token = confirmationToken()
+    this.riskConfirmations.set(token, {
+      chatId,
+      userId,
+      expiresAt: Date.now() + config.telegramConfirmTtlMs,
+      value: { field, oldValue: riskFieldValue(settings, field), newValue, settings },
+    })
+    const activePositions = loadKnownPositions().filter(position => position.status === 'monitoring' || position.status === 'discovering')
+    const crossed = field === 'sl' && typeof newValue === 'number'
+      ? activePositions.filter(position => (position.lastPnlPercent ?? Number.POSITIVE_INFINITY) <= newValue).length
+      : 0
+    const text = [
+      'CONFIRM GLOBAL RISK CHANGE',
+      `${riskFieldLabel(field)}: ${formatRiskValue(field, riskFieldValue(settings, field))} -> ${formatRiskValue(field, newValue)}`,
+      `Affected positions: ${activePositions.length}`,
+      crossed > 0 ? `WARNING: ${crossed} position(s) already crossed this SL.` : null,
+      field === 'tp' && activePositions.some(position => position.drawdownTpOverrideActive)
+        ? 'Effective TP remains DD override on positions with Drawdown Lock.'
+        : null,
+      '',
+      'Perubahan berlaku setelah konfirmasi dan reset trigger confirmations.',
+    ].filter(Boolean).join('\n')
+    await this.bot.sendMessage(chatId, text, {
+      reply_markup: {
+        inline_keyboard: [[
+          { text: 'Confirm', callback_data: `lpd:rc:${token}` },
+          { text: 'Cancel', callback_data: `lpd:rx:${token}` },
+        ]],
+      },
+    })
+  }
+
+  private async confirmRiskChange(query: TelegramBot.CallbackQuery, token: string): Promise<void> {
+    const message = query.message!
+    const chatId = String(message.chat.id)
+    const confirmation = this.takeConfirmation(this.riskConfirmations, token, chatId, query.from.id.toString())
+    if (!confirmation) {
+      await this.bot.sendMessage(chatId, 'Konfirmasi risk kedaluwarsa atau sudah dipakai.')
+      return
+    }
+    const current = getRiskSettings()
+    const oldValue = riskFieldValue(current, confirmation.field)
+    if (current.revision !== confirmation.settings.revision || oldValue !== confirmation.oldValue) {
+      await this.bot.sendMessage(chatId, 'Risk settings sudah berubah. Review ulang perubahan terbaru.')
+      return
+    }
+    const result = updateGlobalRiskSettings(
+      riskPatch(confirmation.field, confirmation.newValue),
+      { chatId, userId: query.from.id.toString() },
+    )
+    await this.bot.editMessageText(
+      `Risk settings updated. Revision ${result.revision}\n${riskSettingsSummary(result)}`,
+      { chat_id: chatId, message_id: message.message_id },
+    ).catch(() => undefined)
+    await this.showRiskMenu(chatId)
+  }
+
   private async sendOpenStrategyMenu(chatId: number | string): Promise<void> {
     await this.bot.sendMessage(chatId, 'OPEN POSITION\nPilih distribusi liquidity:', {
       reply_markup: this.openStrategyKeyboard(),
@@ -526,9 +755,10 @@ class TelegramDashboardController {
     const chatId = String(message.chat.id)
     const pending = this.pendingInput.get(chatId)
     if (!pending || pending.userId !== message.from?.id.toString()) return
+    if (pending.promptMessageId && message.reply_to_message?.message_id !== pending.promptMessageId) return
     if (pending.expiresAt < Date.now()) {
       this.pendingInput.delete(chatId)
-      await this.bot.sendMessage(chatId, 'Input open position kedaluwarsa. Mulai lagi dari dashboard.')
+      await this.bot.sendMessage(chatId, 'Input kedaluwarsa. Mulai lagi dari dashboard.')
       return
     }
     const text = message.text!.trim()
@@ -541,15 +771,16 @@ class TelegramDashboardController {
       }
       try {
         const poolInfo = await inspectOpenPool(getConnection(), poolPubkey)
+        const prompt = await this.bot.sendMessage(chatId, `Pool ${poolInfo.baseSymbol}/${poolInfo.quoteSymbol}. Kirim range penurunan harga 1-99% (contoh: 30).`, {
+          reply_markup: { force_reply: true, input_field_placeholder: '30' },
+        })
         this.pendingInput.set(chatId, {
           ...pending,
           kind: 'range',
           poolPubkey,
           quoteSymbol: poolInfo.quoteSymbol,
+          promptMessageId: prompt.message_id,
           expiresAt: Date.now() + config.telegramConfirmTtlMs,
-        })
-        await this.bot.sendMessage(chatId, `Pool ${poolInfo.baseSymbol}/${poolInfo.quoteSymbol}. Kirim range penurunan harga 1-99% (contoh: 30).`, {
-          reply_markup: { force_reply: true, input_field_placeholder: '30' },
         })
       } catch (err) {
         await this.bot.sendMessage(chatId, `Pool tidak dapat dipakai: ${errorMessage(err)}`)
@@ -563,15 +794,27 @@ class TelegramDashboardController {
         await this.bot.sendMessage(chatId, 'Range tidak valid. Kirim angka lebih dari 0 dan kurang dari 100.')
         return
       }
+      const prompt = await this.bot.sendMessage(chatId, `Kirim jumlah deposit single-side dalam ${pending.quoteSymbol}.`, {
+        reply_markup: { force_reply: true, input_field_placeholder: pending.quoteSymbol === 'SOL' ? '0.1' : '100' },
+      })
       this.pendingInput.set(chatId, {
         ...pending,
         kind: 'amount',
         rangePercent,
+        promptMessageId: prompt.message_id,
         expiresAt: Date.now() + config.telegramConfirmTtlMs,
       })
-      await this.bot.sendMessage(chatId, `Kirim jumlah deposit single-side dalam ${pending.quoteSymbol}.`, {
-        reply_markup: { force_reply: true, input_field_placeholder: pending.quoteSymbol === 'SOL' ? '0.1' : '100' },
-      })
+      return
+    }
+
+    if (pending.kind === 'risk') {
+      const value = parseRiskInput(pending.field, text)
+      if (value === null) {
+        await this.bot.sendMessage(chatId, `Input ${riskFieldLabel(pending.field)} tidak valid. Gunakan angka ${pending.field === 'sl' ? 'negatif' : 'positif'} yang valid.`)
+        return
+      }
+      this.pendingInput.delete(chatId)
+      await this.armRiskConfirmation(chatId, pending.userId, pending.dashboardMessageId, pending.field, value)
       return
     }
 
@@ -713,6 +956,48 @@ function errorMessage(err: unknown): string {
   return message.replace(/[<>]/g, '').slice(0, 300)
 }
 
+function riskFieldValue(settings: GlobalRiskSettings, field: RiskSettingField | 'trailing_toggle'): number | boolean {
+  if (field === 'sl') return settings.slPercent
+  if (field === 'tp') return settings.tpPercent
+  if (field === 'trail_arm') return settings.trailingActivationPct
+  if (field === 'trail_drop') return settings.trailingStopDropPct
+  return settings.trailingEnabled
+}
+
+function riskPatch(field: RiskSettingField | 'trailing_toggle', value: number | boolean): RiskSettingsPatch {
+  if (field === 'sl') return { slPercent: Number(value) }
+  if (field === 'tp') return { tpPercent: Number(value) }
+  if (field === 'trail_arm') return { trailingActivationPct: Number(value) }
+  if (field === 'trail_drop') return { trailingStopDropPct: Number(value) }
+  return { trailingEnabled: Boolean(value) }
+}
+
+function formatRiskValue(field: RiskSettingField | 'trailing_toggle', value: number | boolean): string {
+  if (typeof value === 'boolean') return value ? 'ON' : 'OFF'
+  if (field === 'sl') return `${value}%`
+  return `+${value}%`
+}
+
+function riskSettingsSummary(settings: GlobalRiskSettings): string {
+  return `SL ${settings.slPercent}% · TP +${settings.tpPercent}% · Trail ${settings.trailingEnabled ? `ON (${settings.trailingActivationPct}%/${settings.trailingStopDropPct}%)` : 'OFF'}`
+}
+
 export function setupTelegramControl(bot: TelegramBot, menus: TelegramControlMenus): void {
   new TelegramDashboardController(bot, menus).register()
+}
+
+async function buildPositionBinDisplay(position: PositionRow, valuation: ValuationResult) {
+  if (valuation.lowerBinId === undefined || valuation.upperBinId === undefined || valuation.poolActiveBinId === undefined) return null
+  const pool = await getPool(getConnection(), new PublicKey(position.poolPubkey))
+  const quoteMint = position.quoteCurrency === 'SOL' ? SOL_MINT : USDC_MINT
+  const tokenXMint = pool.tokenX.publicKey.toBase58()
+  const quoteSide = tokenXMint === quoteMint ? 'X' : 'Y'
+  return buildBinRangeDisplay({
+    lowerBinId: valuation.lowerBinId,
+    activeBinId: valuation.poolActiveBinId,
+    upperBinId: valuation.upperBinId,
+    quoteSide,
+    quoteCurrency: position.quoteCurrency,
+    priceForBin: binId => Number(pool.fromPricePerLamport(Number(getPriceOfBinByBinId(binId, pool.lbPair.binStep)))),
+  })
 }

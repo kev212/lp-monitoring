@@ -1,8 +1,7 @@
 import TelegramBot from 'node-telegram-bot-api'
 import { config } from './config.js'
 import { loadActivePositions, updateFlipModeEnabled, updatePrecisionCurveEnabled, updatePrecisionCurveThreshold } from './meteora/discovery.js'
-import { getDb } from './db/client.js'
-import type { QuoteCurrency } from './types.js'
+import type { GlobalRiskSettings, QuoteCurrency } from './types.js'
 import { setupTelegramControl } from './telegram/control.js'
 
 let _bot: TelegramBot | null = null
@@ -12,6 +11,7 @@ const TELEGRAM_COMMANDS = [
   { command: 'status', description: 'Open the LP control dashboard' },
   { command: 'open', description: 'Open a Meteora position' },
   { command: 'close', description: 'Close a position from the dashboard' },
+  { command: 'risk', description: 'Configure global risk settings' },
   { command: 'precision', description: 'Precision Curve settings menu' },
   { command: 'flip', description: 'Flip Mode settings menu' },
   { command: 'help', description: 'List all available commands' },
@@ -47,39 +47,27 @@ function isAllowedChat(chatId: number | string, userId: number | string | undefi
 }
 
 function setupCommandHandlers(bot: TelegramBot): void {
-  const db = getDb()
-  const wiped = db.prepare("SELECT value FROM sync_state WHERE key = 'telegram_commands_wiped_v2'").get() as any
+  const scopes: Array<{ scope?: { type: string }; label: string }> = [
+    { scope: { type: 'default' }, label: 'default' },
+    { scope: { type: 'all_private_chats' }, label: 'all_private_chats' },
+    { scope: { type: 'all_group_chats' }, label: 'all_group_chats' },
+    { scope: { type: 'all_chat_administrators' }, label: 'all_chat_administrators' },
+  ]
+  const failures: string[] = []
 
-  if (!wiped || wiped.value !== '1') {
-    const scopes: Array<{ scope?: { type: string }; label: string }> = [
-      { scope: { type: 'default' }, label: 'default' },
-      { scope: { type: 'all_private_chats' }, label: 'all_private_chats' },
-      { scope: { type: 'all_group_chats' }, label: 'all_group_chats' },
-      { scope: { type: 'all_chat_administrators' }, label: 'all_chat_administrators' },
-    ]
-    const failures: string[] = []
-
-    ;(async () => {
-      for (const s of scopes) {
-        try {
-          await (bot as any).setMyCommands(TELEGRAM_COMMANDS, s.scope ? { scope: s.scope } : {})
-        } catch (err: any) {
-          failures.push(`${s.label}: ${err.message}`)
-        }
+  ;(async () => {
+    for (const s of scopes) {
+      try {
+        await (bot as any).setMyCommands(TELEGRAM_COMMANDS, { scope: s.scope })
+      } catch (err: any) {
+        failures.push(`${s.label}: ${err.message}`)
       }
-      if (failures.length > 0) {
-        console.log(`[telegram] wipe v2 failures: ${failures.join('; ')} — retrying next restart`)
-      } else {
-        db.prepare("INSERT OR REPLACE INTO sync_state (key, value, updated_at) VALUES ('telegram_commands_wiped_v2', '1', ?)").run(Date.now())
-        console.log('[telegram] wiped v2 all scopes with bot commands')
-      }
-      console.log(`[telegram] registered commands: ${TELEGRAM_COMMANDS.map(c => `/${c.command}`).join(', ')}`)
-    })().catch((err: any) => console.log(`[telegram] wipe v2 error: ${err.message}`))
-  } else {
-    bot.setMyCommands(TELEGRAM_COMMANDS)
-      .then(() => console.log(`[telegram] registered commands: ${TELEGRAM_COMMANDS.map(c => `/${c.command}`).join(', ')}`))
-      .catch(err => console.log(`[telegram] setMyCommands failed: ${err.message}`))
-  }
+    }
+    if (failures.length > 0) {
+      console.log(`[telegram] command registration failures: ${failures.join('; ')}`)
+    }
+    console.log(`[telegram] registered commands: ${TELEGRAM_COMMANDS.map(c => `/${c.command}`).join(', ')}`)
+  })().catch((err: any) => console.log(`[telegram] command registration error: ${err.message}`))
 
   bot.onText(/^\/precision(?:\s+(.+))?$/, msg => {
     if (!msg.chat || !isAllowedChat(msg.chat.id, msg.from?.id)) return
@@ -370,13 +358,19 @@ function sep(): string {
 
 // ─── Start / Stop ───────────────────────────────────────────────────
 
-export function formatBotStart(wallet: string, solBalance: number): string {
+export function formatBotStart(
+  wallet: string,
+  solBalance: number,
+  riskSettings?: Pick<GlobalRiskSettings, 'slPercent' | 'tpPercent'>,
+): string {
+  const slPercent = riskSettings?.slPercent ?? config.defaultSlPercent
+  const tpPercent = riskSettings?.tpPercent ?? config.defaultTpPercent
   return [
     `🚀 <b>LP Monitor Started</b>`,
     sep(),
     `Wallet: ${solscanAddr(wallet)} · ${gmgnWallet(wallet)}`,
     `Balance: <b>${solBalance.toFixed(4)} SOL</b>`,
-    `TP: <b>+${config.defaultTpPercent}%</b> | SL: <b>${config.defaultSlPercent}%</b>`,
+    `TP: <b>+${tpPercent}%</b> | SL: <b>${slPercent}%</b>`,
     sep(),
     `👀 <i>Scanning for positions...</i>`,
   ].join('\n')

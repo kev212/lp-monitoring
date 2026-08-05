@@ -214,10 +214,10 @@ export function updatePeakPnl(pubkey: string, peakPct: number, trailingActivated
   ).run(peakPct, trailingActivated ? 1 : 0, Date.now(), pubkey)
 }
 
-export function updatePositionStrategy(pubkey: string, strategy: StrategyType, slPercent: number, tpPercent: number): void {
+export function updatePositionStrategy(pubkey: string, strategy: StrategyType): void {
   getDb().prepare(
-    'UPDATE positions SET strategy = ?, sl_percent = ?, tp_percent = ?, updated_at = ? WHERE position_pubkey = ?'
-  ).run(strategy, slPercent, tpPercent, Date.now(), pubkey)
+    'UPDATE positions SET strategy = ?, updated_at = ? WHERE position_pubkey = ?'
+  ).run(strategy, Date.now(), pubkey)
 }
 
 export function updatePrecisionCurveEnabled(pubkey: string, enabled: boolean, currentActiveBin: number | null = null): void {

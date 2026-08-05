@@ -14,6 +14,7 @@ import type { QuoteCurrency } from '../types.js'
 import { deleteOpeningPosition, updatePositionStatus, upsertPosition } from './discovery.js'
 import { clearPnlCache, getQuoteCurrency } from './valuation.js'
 import { clearPoolCache, getPool, getPoolInfo } from './positions.js'
+import { getRiskSettings } from '../risk/settings.js'
 
 const SOL_MINT = 'So11111111111111111111111111111111111111112'
 const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
@@ -349,6 +350,7 @@ export async function prepareOpenPosition(
 }
 
 function persistOpenPosition(position: Keypair, preview: OpenPositionPreview, owner: string): void {
+  const riskSettings = getRiskSettings()
   upsertPosition({
     positionPubkey: position.publicKey.toBase58(),
     poolPubkey: preview.poolPubkey,
@@ -361,8 +363,8 @@ function persistOpenPosition(position: Keypair, preview: OpenPositionPreview, ow
     basisQuote: preview.amountQuote,
     basisSolLegacy: preview.quoteCurrency === 'SOL' ? preview.amountQuote : 0,
     basisConfidence: 'high',
-    tpPercent: config.defaultTpPercent,
-    slPercent: config.defaultSlPercent,
+    tpPercent: riskSettings.tpPercent,
+    slPercent: riskSettings.slPercent,
     status: 'opening',
     triggerConfirmations: 0,
     peakPnlPercent: 0,

@@ -39,6 +39,7 @@ import { reconcilePendingOpens } from './meteora/open.js'
 import { executeDirectionalPrecisionCurve, THRESHOLD_RATIO, THRESHOLD_MIN, RECOVERY_MS } from './meteora/precisionCurve.js'
 import { calculateFlipProgressPct, executeFlipMode, retryPendingFlipAdd } from './meteora/flipMode.js'
 import { evaluateTrigger, type BinData } from './risk/rules.js'
+import { getRiskSettings } from './risk/settings.js'
 import {
   sendNotification,
   formatPositionDiscovered,
@@ -106,7 +107,8 @@ export async function startBot(): Promise<void> {
   if (reshapeRecovery === 'review') console.log('[reshape] recovered transaction requires manual position review')
   await reconcilePendingExits(getConnection(), wallet)
   await reconcilePendingOpens(getConnection())
-  sendNotification(formatBotStart(walletPubkey.toBase58(), 0))
+  const riskSettings = getRiskSettings()
+  sendNotification(formatBotStart(walletPubkey.toBase58(), 0, riskSettings))
   // Balance will be fetched in first cycle
 
   await discoverInitialPositions(getConnection(), walletPubkey, ownerStr)
@@ -139,7 +141,9 @@ export async function startBot(): Promise<void> {
       }
 
       await monitorCycle(getConnection(), walletPubkey, ownerStr)
-      const fastTrailingPosition = loadActivePositions().some(pos => pos.trailingActivated || pendingTriggers.has(pos.positionPubkey))
+      const riskSettings = getRiskSettings()
+      const fastTrailingPosition = riskSettings.trailingEnabled
+        && loadActivePositions().some(pos => pos.trailingActivated || pendingTriggers.has(pos.positionPubkey))
       await sleep(fastTrailingPosition ? TRAILING_FAST_POLL_MS : config.pollIntervalMs)
     } catch (err) {
       console.log(`[loop] cycle error: ${err instanceof Error ? err.message : 'unknown'}`)
@@ -158,6 +162,7 @@ export function stopBot(): void {
 async function discoverInitialPositions(connection: Connection, walletPubkey: PublicKey, ownerStr: string): Promise<void> {
   console.log('[discovery] scanning for DLMM positions...')
   const discovered = await getAllPositionsForWallet(connection, walletPubkey)
+  const riskSettings = getRiskSettings()
   console.log(`[discovery] found ${discovered.length} positions`)
 
   for (const dp of discovered) {
@@ -212,8 +217,8 @@ async function discoverInitialPositions(connection: Connection, walletPubkey: Pu
 
       // --- Strategy detection from LP Agent deposit data ---
       let strategy: StrategyType = 'unknown'
-      let tpPercent = config.defaultTpPercent
-      let slPercent = config.defaultSlPercent
+      const tpPercent = riskSettings.tpPercent
+      const slPercent = riskSettings.slPercent
 
       try {
         const lpAgentPositions = await fetchLpAgentPositions(ownerStr, true)
@@ -242,20 +247,12 @@ async function discoverInitialPositions(connection: Connection, walletPubkey: Pu
 
             if (quoteAmount > 0 && tokenAmount === 0) {
               strategy = 'single_side_quote'
-              tpPercent = config.defaultTpPercent
-              slPercent = config.defaultSlPercent
             } else if (quoteAmount === 0 && tokenAmount > 0) {
               strategy = 'single_side_token'
-              tpPercent = 35
-              slPercent = -35
             } else if (quoteAmount > 0 && tokenAmount > 0) {
               strategy = 'balanced'
-              tpPercent = config.defaultTpPercent
-              slPercent = config.defaultSlPercent
             } else {
               strategy = 'unknown'
-              tpPercent = config.defaultTpPercent
-              slPercent = config.defaultSlPercent
             }
 
             console.log(`[discovery] ${dp.positionPubkey.slice(0, 8)} | strategy: ${strategy} | quote=${quoteAmount} token=${tokenAmount} | SL: ${slPercent}% TP: ${tpPercent}%`)
@@ -345,21 +342,17 @@ async function redetectStrategies(ownerStr: string): Promise<void> {
       }
 
       let strategy: StrategyType = 'unknown'
-      let tpPercent = config.defaultTpPercent
-      let slPercent = config.defaultSlPercent
 
       if (quoteAmount > 0 && tokenAmount === 0) {
         strategy = 'single_side_quote'
       } else if (quoteAmount === 0 && tokenAmount > 0) {
         strategy = 'single_side_token'
-        tpPercent = 35
-        slPercent = -35
       } else if (quoteAmount > 0 && tokenAmount > 0) {
         strategy = 'balanced'
       }
 
-      updatePositionStrategy(pos.positionPubkey, strategy, slPercent, tpPercent)
-      console.log(`[strategy] ${pos.tokenXSymbol}/${pos.tokenYSymbol} → ${strategy} | SL: ${slPercent}% TP: ${tpPercent}%`)
+      updatePositionStrategy(pos.positionPubkey, strategy)
+      console.log(`[strategy] ${pos.tokenXSymbol}/${pos.tokenYSymbol} → ${strategy}`)
     }
   } catch (err) {
     console.log(`[strategy] redetect error: ${err instanceof Error ? err.message : 'unknown'}`)
@@ -381,7 +374,8 @@ async function monitorSinglePosition(
   }
 
   try {
-    const forceFreshValuation = pos.trailingActivated || pendingTriggers.has(pos.positionPubkey)
+    const riskSettings = getRiskSettings()
+    const forceFreshValuation = (riskSettings.trailingEnabled && pos.trailingActivated) || pendingTriggers.has(pos.positionPubkey)
     const valuation = await estimateExitValue(pos.poolPubkey, ownerStr, pos.positionPubkey, pos.quoteCurrency, forceFreshValuation)
     if (!valuation) {
       const retryCount = (monitorRetries.get(pos.positionPubkey) || 0) + 1
@@ -439,13 +433,13 @@ async function monitorSinglePosition(
       : 'Conf: 0'
     const effectiveTp = pos.drawdownTpOverrideActive
       ? config.maxDrawdownTpOverride
-      : (pos.tpPercent ?? config.defaultTpPercent)
+      : riskSettings.tpPercent
     console.log(
       `[monitor] ${tokenLabel}${dupMarker} | ${pos.status} | PnL: ${pnlSign}${pnlPercent.toFixed(2)}% (${pnlSource})` +
       ` | Value: ${formatQuoteLog(valuation.estimatedExitQuote, pos.quoteCurrency)}` +
       ` | Withdrawn: ${formatQuoteLog(valuation.withdrawalQuote, pos.quoteCurrency)}` +
       ` | Basis: ${formatQuoteLog(pos.basisQuote, pos.quoteCurrency)}` +
-      ` | SL: ${pos.slPercent}% TP: +${effectiveTp}%${pos.drawdownTpOverrideActive ? ' (DD LOCK)' : ''}` +
+      ` | SL: ${riskSettings.slPercent}% TP: +${effectiveTp}%${pos.drawdownTpOverrideActive ? ' (DD LOCK)' : ''}` +
       ` | Peak: ${pos.peakPnlPercent.toFixed(2)}%` +
       ` | ${triggerInfo}`
     )
@@ -468,8 +462,8 @@ async function monitorSinglePosition(
       const spikeFromPeak = pnlPercent > pos.peakPnlPercent + 5
       const spikeFromLast = pos.lastPnlPercent !== null && (pnlPercent - pos.lastPnlPercent) > 5
       const activationCross = pos.lastPnlPercent !== null &&
-        pos.lastPnlPercent < config.trailingActivationPct - 2 &&
-        pnlPercent >= config.trailingActivationPct
+        pos.lastPnlPercent < riskSettings.trailingActivationPct - 2 &&
+        pnlPercent >= riskSettings.trailingActivationPct
       const suspiciousSpike = spikeFromPeak || spikeFromLast || activationCross
 
       if (suspiciousSpike && config.lpAgentApiKey) {
@@ -483,7 +477,7 @@ async function monitorSinglePosition(
               if (lpPos) {
                 const lpPnl = lpAgentPnl(lpPos)
                 const delta = Math.abs(pnlPercent - lpPnl)
-                if (delta > 3 && lpPnl < config.trailingActivationPct) {
+                if (delta > 3 && lpPnl < riskSettings.trailingActivationPct) {
                   console.log(`[peak-guard] ${tokenLabel} | blocked spike: on-chain=${pnlPercent.toFixed(2)}% vs lpagent=${lpPnl.toFixed(2)}% (delta=${delta.toFixed(1)}%)`)
                   canTrustPeak = false
                 }
@@ -517,21 +511,27 @@ async function monitorSinglePosition(
 
     // --- Trailing stop: track peak PnL ---
     let updatedPeak = pos.peakPnlPercent
-    let trailingActive = pos.trailingActivated
+    let trailingActive = riskSettings.trailingEnabled && pos.trailingActivated
     let peakOrTrailingChanged = false
 
-    if (canTrustPeak && !trailingActive && pnlPercent >= config.trailingActivationPct) {
+    if (riskSettings.trailingEnabled && canTrustPeak && !trailingActive && pnlPercent >= riskSettings.trailingActivationPct) {
       trailingActive = true
       peakOrTrailingChanged = true
       console.log(`[trailing] activated for ${pos.positionPubkey.slice(0, 8)} at ${pnlPercent.toFixed(2)}%`)
     }
 
-    if (canTrustPeak && pnlPercent > updatedPeak) {
+    if (riskSettings.trailingEnabled && canTrustPeak && pnlPercent > updatedPeak) {
       updatedPeak = pnlPercent
       peakOrTrailingChanged = true
     }
 
-    if (canTrustPeak && pnlPercent <= 0) {
+    if (riskSettings.trailingEnabled && canTrustPeak && pnlPercent <= 0) {
+      updatedPeak = 0
+      trailingActive = false
+      peakOrTrailingChanged = true
+    }
+
+    if (!riskSettings.trailingEnabled && (pos.trailingActivated || pos.peakPnlPercent !== 0)) {
       updatedPeak = 0
       trailingActive = false
       peakOrTrailingChanged = true
@@ -577,9 +577,9 @@ async function monitorSinglePosition(
       return
     }
 
-    const decision = evaluateTrigger(pos, pnlPercent, binData)
+    const decision = evaluateTrigger(pos, pnlPercent, binData, riskSettings)
     if (decision.shouldTrigger && decision.triggerType) {
-      const triggerType = decision.triggerType
+      let triggerType = decision.triggerType
       // LP Agent is diagnostic only; on-chain valuation remains authoritative.
       let lpAgentAtTrigger: LpAgentPosition | null = null
       try {
@@ -648,25 +648,21 @@ async function monitorSinglePosition(
           }
         }
 
-        const sl = pos.slPercent ?? config.defaultSlPercent
-        const tp = pos.drawdownTpOverrideActive ? config.maxDrawdownTpOverride : (pos.tpPercent ?? config.defaultTpPercent)
+        const latestPosition = loadKnownPositions().find(row => row.positionPubkey === pos.positionPubkey)
+        if (!latestPosition) throw new Error('position disappeared during risk re-check')
+        const latestRiskSettings = getRiskSettings()
+        const freshDecision = evaluateTrigger(
+          latestPosition,
+          freshPnlPct,
+          {
+            upperBinId: freshValuation.upperBinId,
+            poolActiveBinId: freshValuation.poolActiveBinId,
+          },
+          latestRiskSettings,
+          false,
+        )
 
-        let stillTriggers = false
-        if (decision.triggerType === 'SL') {
-          stillTriggers = freshPnlPct <= sl
-        } else if (decision.triggerType === 'TP') {
-          stillTriggers = freshPnlPct >= tp
-        } else if (decision.triggerType === 'BIN_RANGE') {
-          if (freshValuation.upperBinId !== undefined && freshValuation.poolActiveBinId !== undefined) {
-            const dist = freshValuation.upperBinId - freshValuation.poolActiveBinId
-            stillTriggers = freshPnlPct > config.binRangePnlThreshold && dist >= 0 && dist <= config.binRangeMaxDistance
-          }
-        } else if (decision.triggerType === 'TRAILING_STOP') {
-          const dropFromPeak = pos.peakPnlPercent - freshPnlPct
-          stillTriggers = dropFromPeak >= config.trailingStopDropPct
-        }
-
-        if (!stillTriggers) {
+        if (!freshDecision.shouldTrigger || !freshDecision.triggerType) {
           console.log(`[recheck] ${tokenLabel} | fresh Meteora PnL: ${freshPnlPct.toFixed(2)}% — ${decision.triggerType} no longer valid (was ${pending.pnlAtTrigger.toFixed(2)}%) — skip exit`)
           sendNotification(
             `⚠️ <b>Exit Skipped — PnL Re-check</b>\n\n` +
@@ -681,7 +677,8 @@ async function monitorSinglePosition(
           return
         }
 
-        console.log(`[recheck] ${tokenLabel} | fresh Meteora PnL: ${freshPnlPct.toFixed(2)}% — ${decision.triggerType} confirmed — proceeding with exit`)
+        triggerType = freshDecision.triggerType
+        console.log(`[recheck] ${tokenLabel} | fresh Meteora PnL: ${freshPnlPct.toFixed(2)}% — ${triggerType} confirmed — proceeding with exit`)
         verifiedPnlPct = freshPnlPct
         exitValuation = freshValuation
       } catch (err) {
@@ -696,7 +693,7 @@ async function monitorSinglePosition(
       const estimatedPnl = exitValuation.pnlQuote
       sendNotification(
         formatExitStarted(
-          pos.positionPubkey, decision.triggerType, verifiedPnlPct, estimatedPnl,
+          pos.positionPubkey, triggerType, verifiedPnlPct, estimatedPnl,
           pos.basisQuote, exitValuation.estimatedExitQuote,
           pos.tokenXMint.slice(0, 4),
           pos.tokenYMint.slice(0, 4),

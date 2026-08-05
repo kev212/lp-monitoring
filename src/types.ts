@@ -7,6 +7,18 @@ export type TriggerType = 'TP' | 'SL' | 'TRAILING_STOP' | 'BIN_RANGE' | 'MANUAL'
 export type ExitStatus = 'pending_remove' | 'removed' | 'swap_pending' | 'completed' | 'failed'
 export type QuoteCurrency = 'SOL' | 'USDC'
 
+export type RiskSettingField = 'sl' | 'tp' | 'trail_arm' | 'trail_drop'
+
+export interface GlobalRiskSettings {
+  slPercent: number
+  tpPercent: number
+  trailingEnabled: boolean
+  trailingActivationPct: number
+  trailingStopDropPct: number
+  revision: number
+  updatedAt: number
+}
+
 export interface PositionRow {
   positionPubkey: string
   poolPubkey: string

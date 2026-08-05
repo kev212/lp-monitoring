@@ -22,3 +22,12 @@ test('parses compact dashboard actions and rejects malformed callbacks', () => {
   assert.equal(parseDashboardAction('lpd:refresh:-1'), null)
   assert.equal(parseDashboardAction('other:refresh:0'), null)
 })
+
+test('parses global risk settings callbacks', () => {
+  assert.deepEqual(parseDashboardAction('lpd:risk'), { type: 'risk' })
+  assert.deepEqual(parseDashboardAction('lpd:rs:sl'), { type: 'risk_field', field: 'sl' })
+  assert.deepEqual(parseDashboardAction('lpd:rs:trail_drop'), { type: 'risk_field', field: 'trail_drop' })
+  assert.deepEqual(parseDashboardAction('lpd:rt'), { type: 'risk_toggle' })
+  assert.deepEqual(parseDashboardAction('lpd:rc:abc123'), { type: 'risk_confirm', token: 'abc123' })
+  assert.equal(parseDashboardAction('lpd:rs:invalid'), null)
+})
