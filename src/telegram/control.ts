@@ -401,12 +401,13 @@ class TelegramDashboardController {
         const modes = [position.precisionCurveEnabled ? 'Precision' : '', position.flipModeEnabled ? 'Flip' : '', position.flipModePendingAdd ? 'FlipPending' : ''].filter(Boolean).join(', ') || 'off'
         const exceptionalStatus = ['opening', 'exiting', 'error'].includes(position.status) ? ` · ${position.status.toUpperCase()}` : ''
         lines.push(`${indicator} ${first + index + 1}. ${label}${exceptionalStatus}`)
-        lines.push(`   ${pnlIcon} PnL ${pnlLabel} · 💰 Value ${valueLabel}`)
+        lines.push(`   ${pnlIcon} PnL ${pnlLabel} · 💰 ${valueLabel}`)
         if (binDisplays[index]) {
           lines.push(`   ${binDisplays[index]!.bar}`)
           lines.push(`   ${binDisplays[index]!.prices}`)
         }
         lines.push(`   🎯 Peak ${position.peakPnlPercent.toFixed(2)}% · ⚙️ Modes ${modes}`)
+        if (index < pagePositions.length - 1) lines.push('')
       }
     }
     if (pageCount > 1) lines.push('', `📄 Page ${page + 1}/${pageCount} · ${positions.length} positions`)
