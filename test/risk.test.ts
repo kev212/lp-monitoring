@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { buildBinRangeDisplay, formatCompactPrice } from '../src/telegram/binDisplay.js'
-import { formatPnlUsd, parseRiskInput } from '../src/telegram/control.js'
+import { formatOpeningDashboardLines, formatPnlUsd, parseRiskInput } from '../src/telegram/control.js'
 import { validateRiskSettings } from '../src/risk/settings.js'
 import { evaluateTrigger } from '../src/risk/rules.js'
 import type { PositionRow } from '../src/types.js'
@@ -45,6 +45,17 @@ test('formats approximate PnL in USD for SOL and USDC quotes', () => {
   assert.equal(formatPnlUsd({ quoteCurrency: 'SOL', pnlQuote: -0.02, solUsdPrice: 50 }), '~-$1')
   assert.equal(formatPnlUsd({ quoteCurrency: 'SOL', pnlQuote: 0.02, solUsdPrice: 0 }), null)
   assert.equal(formatPnlUsd({ quoteCurrency: 'USDC', pnlQuote: 1.25, solUsdPrice: 0 }), '~$1')
+})
+
+test('renders opening positions without monitoring metrics', () => {
+  const lines = formatOpeningDashboardLines({ basisQuote: 0.1, quoteCurrency: 'SOL' })
+
+  assert.deepEqual(lines, [
+    '   ⏳ Menunggu finalisasi transaksi dan sinkronisasi lokal',
+    '   💰 Deposit 0.10 SOL',
+  ])
+  assert.equal(lines.join('\n').includes('N/A'), false)
+  assert.equal(lines.join('\n').includes('Peak'), false)
 })
 
 test('validates global risk inputs', () => {

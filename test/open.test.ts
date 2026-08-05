@@ -3,6 +3,7 @@ import test from 'node:test'
 import {
   calculateSingleSideRange,
   formatRawAmount,
+  OpenSubmissionPendingError,
   parseUiAmountToRaw,
   remainingPriceMoveBins,
   sdkSlippagePercentForBins,
@@ -78,4 +79,12 @@ test('shares one total movement budget between refresh and on-chain execution', 
   assert.equal(remainingPriceMoveBins(3, 2), 1)
   assert.throws(() => remainingPriceMoveBins(3, 3))
   assert.throws(() => remainingPriceMoveBins(3, 4))
+})
+
+test('distinguishes finalized open transactions from unknown submission state', () => {
+  const finalized = new OpenSubmissionPendingError('position', 'signature', new Error('position read delayed'), true)
+  const unknown = new OpenSubmissionPendingError('position', 'signature', new Error('confirm timeout'))
+
+  assert.equal(finalized.transactionFinalized, true)
+  assert.equal(unknown.transactionFinalized, false)
 })

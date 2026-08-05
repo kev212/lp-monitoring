@@ -107,6 +107,7 @@ export class OpenSubmissionPendingError extends Error {
     readonly positionPubkey: string,
     readonly signature: string,
     cause: unknown,
+    readonly transactionFinalized = false,
   ) {
     super(`open submission ${signature} requires reconciliation: ${cause instanceof Error ? cause.message : String(cause)}`)
     this.name = 'OpenSubmissionPendingError'
@@ -582,6 +583,7 @@ export async function executeOpenPosition(
     }
     createPendingOpen(position, executedPreview, pendingState)
 
+    let transactionFinalized = false
     try {
       const signature = await connection.sendRawTransaction(signedTransaction, {
         skipPreflight: false,
@@ -600,6 +602,7 @@ export async function executeOpenPosition(
         finishOpenAttempt(pendingState, 'failed', message)
         throw new DefinitiveOpenError(message)
       }
+      transactionFinalized = true
       if (!await verifyFinalizedPosition(connection, pendingState)) {
         throw new Error('transaction finalized but the position account is not yet visible')
       }
@@ -609,7 +612,7 @@ export async function executeOpenPosition(
       if (!findPendingOpen(owner) && positionIsMonitoring(pendingState.positionPubkey)) {
         console.log(`[open] position ${pendingState.positionPubkey.slice(0, 8)} was finalized by concurrent reconciliation`)
       } else {
-        throw new OpenSubmissionPendingError(pendingState.positionPubkey, expectedSignature, err)
+        throw new OpenSubmissionPendingError(pendingState.positionPubkey, expectedSignature, err, transactionFinalized)
       }
     }
     clearPnlCache()

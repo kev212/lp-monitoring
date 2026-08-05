@@ -11,6 +11,7 @@ import {
   inspectOpenPool,
   OpenSubmissionPendingError,
   prepareOpenPosition,
+  reconcilePendingOpens,
   type OpenLiquidityStrategy,
   type OpenPositionPreview,
 } from '../meteora/open.js'
@@ -192,6 +193,13 @@ export function formatPnlUsd(valuation: Pick<ValuationResult, 'quoteCurrency' | 
   const absolute = Math.abs(pnlUsd)
   const amount = absolute >= 1 ? Math.round(absolute).toString() : absolute.toFixed(2)
   return pnlUsd < 0 ? `~-$${amount}` : `~$${amount}`
+}
+
+export function formatOpeningDashboardLines(position: Pick<PositionRow, 'basisQuote' | 'quoteCurrency'>): string[] {
+  return [
+    '   ⏳ Menunggu finalisasi transaksi dan sinkronisasi lokal',
+    `   💰 Deposit ${formatDashboardQuote(position.basisQuote, position.quoteCurrency)}`,
+  ]
 }
 
 function confirmationToken(): string {
@@ -387,8 +395,14 @@ class TelegramDashboardController {
     } else {
       for (let index = 0; index < pagePositions.length; index++) {
         const position = pagePositions[index]
-        const valuation = valuations[index]
         const label = `${position.tokenXSymbol || position.tokenXMint.slice(0, 4)}/${position.tokenYSymbol || position.tokenYMint.slice(0, 4)}`
+        if (position.status === 'opening') {
+          lines.push(`🟡 ${first + index + 1}. ${label} · OPENING`)
+          lines.push(...formatOpeningDashboardLines(position))
+          if (index < pagePositions.length - 1) lines.push('')
+          continue
+        }
+        const valuation = valuations[index]
         const pnl = valuation?.pnlPercent ?? position.lastPnlPercent
         const value = valuation?.estimatedExitQuote ?? position.lastEstimatedExitQuote
         const indicator = pnl === null ? '⚪' : pnl > 0 ? '🟢' : pnl < 0 ? '🔴' : '⚪'
@@ -910,11 +924,24 @@ class TelegramDashboardController {
       result = await executeOpenPosition(getConnection(), getWallet(), preview)
     } catch (err) {
       if (err instanceof OpenSubmissionPendingError) {
-        await this.bot.sendMessage(chatId, [
-          'Open position masih menunggu rekonsiliasi final. Jangan kirim open ulang.',
-          `Position: ${err.positionPubkey}`,
-          `Transaction: ${err.signature}`,
-        ].join('\n'))
+        const reconciled = await reconcileOpenForUser(err.positionPubkey)
+        if (reconciled) {
+          await this.bot.sendMessage(chatId, [
+            '✅ Open position berhasil direkonsiliasi.',
+            `${preview.baseSymbol}/${preview.quoteSymbol} | ${strategyLabel(preview.strategy)}`,
+            `Position: ${err.positionPubkey}`,
+            `Transaction: ${err.signature}`,
+          ].join('\n'))
+        } else {
+          await this.bot.sendMessage(chatId, [
+            err.transactionFinalized
+              ? '✅ Transaksi open sudah final di-chain, tetapi verifikasi lokal masih tertunda.'
+              : '⏳ Status final transaksi open belum dapat dipastikan.',
+            `Position: ${err.positionPubkey}`,
+            `Transaction: ${err.signature}`,
+            'Bot akan melanjutkan rekonsiliasi. Jangan kirim open ulang.',
+          ].join('\n'))
+        }
         await this.showDashboard(chatId, 0).catch(() => undefined)
       } else {
         await this.bot.sendMessage(chatId, `Open position gagal: ${errorMessage(err)}`)
@@ -969,6 +996,20 @@ class TelegramDashboardController {
   private async reportError(chatId: number | string, err: unknown): Promise<void> {
     await this.bot.sendMessage(chatId, `Dashboard error: ${errorMessage(err)}`).catch(() => undefined)
   }
+}
+
+async function reconcileOpenForUser(positionPubkey: string): Promise<boolean> {
+  for (const delayMs of [0, 1000, 2000]) {
+    if (delayMs > 0) await new Promise(resolve => setTimeout(resolve, delayMs))
+    try {
+      await reconcilePendingOpens(getConnection())
+    } catch {
+      // The background reconciliation loop remains the final recovery path.
+    }
+    const position = loadKnownPositions().find(row => row.positionPubkey === positionPubkey)
+    if (position?.status === 'monitoring') return true
+  }
+  return false
 }
 
 function errorMessage(err: unknown): string {
