@@ -1,7 +1,7 @@
 import { Connection, PublicKey } from '@solana/web3.js'
 import type { EventType, BasisConfidence } from '../types.js'
 
-const DLMM_PROGRAM_ID = new PublicKey('LBUZKhbPFn5XX4kz4LZ7Qd8hLEjNvF7M7bQeFqF7gYx')
+const DLMM_PROGRAM_ID = new PublicKey('LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo')
 
 export interface ParsedEvent {
   signature: string

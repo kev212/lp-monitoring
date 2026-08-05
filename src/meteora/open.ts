@@ -21,7 +21,7 @@ const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
 const LAMPORTS_PER_SOL = 1_000_000_000
 const OPEN_PENDING_PREFIX = 'open_pending:'
 const OPEN_ATTEMPT_PREFIX = 'open_attempt:'
-const DLMM_PROGRAM_ID = new PublicKey('LBUZKhbPFn5XX4kz4LZ7Qd8hLEjNvF7M7bQeFqF7gYx')
+const DLMM_PROGRAM_ID = new PublicKey('LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo')
 const EXPIRED_ABSENCE_CHECKS = 2
 const EXPIRED_ABSENCE_MIN_INTERVAL_MS = 5_000
 

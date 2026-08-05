@@ -2,7 +2,7 @@ import { Connection, PublicKey } from '@solana/web3.js'
 import { getDb } from '../db/client.js'
 import type { PositionRow, BasisConfidence, QuoteCurrency, StrategyType, TokenSide } from '../types.js'
 
-const DLMM_PROGRAM_ID = new PublicKey('LBUZKhbPFn5XX4kz4LZ7Qd8hLEjNvF7M7bQeFqF7gYx')
+const DLMM_PROGRAM_ID = new PublicKey('LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo')
 
 function safeParseJson<T>(json: string | null | undefined, fallback: T): T {
   if (!json) return fallback
