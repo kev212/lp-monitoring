@@ -397,7 +397,7 @@ class TelegramDashboardController {
         const position = pagePositions[index]
         const label = `${position.tokenXSymbol || position.tokenXMint.slice(0, 4)}/${position.tokenYSymbol || position.tokenYMint.slice(0, 4)}`
         if (position.status === 'opening') {
-          lines.push(`🟡 ${first + index + 1}. ${label} · OPENING`)
+          lines.push(`${first + index + 1}. 🟡 ${label} · OPENING`)
           lines.push(...formatOpeningDashboardLines(position))
           if (index < pagePositions.length - 1) lines.push('')
           continue
@@ -414,7 +414,7 @@ class TelegramDashboardController {
         const valueLabel = value === null ? 'N/A' : formatDashboardQuote(value, position.quoteCurrency)
         const modes = [position.precisionCurveEnabled ? 'Precision' : '', position.flipModeEnabled ? 'Flip' : '', position.flipModePendingAdd ? 'FlipPending' : ''].filter(Boolean).join(', ') || 'off'
         const exceptionalStatus = ['opening', 'exiting', 'error'].includes(position.status) ? ` · ${position.status.toUpperCase()}` : ''
-        lines.push(`${indicator} ${first + index + 1}. ${label}${exceptionalStatus}`)
+        lines.push(`${first + index + 1}. ${indicator} ${label}${exceptionalStatus}`)
         lines.push(`   ${pnlIcon} PnL ${pnlLabel} · 💰 ${valueLabel}`)
         if (binDisplays[index]) {
           lines.push(`   ${binDisplays[index]!.bar}`)
