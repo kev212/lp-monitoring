@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { mapMeteoraPosition } from '../src/meteora/valuation.js'
+import { calculatePnlPercent, mapMeteoraPosition } from '../src/meteora/valuation.js'
 import { isBasisIncrease } from '../src/meteora/discovery.js'
 
 const samplePosition = {
@@ -63,4 +63,38 @@ test('only increases the stored gross-deposit basis', () => {
   assert.equal(isBasisIncrease(0.2, 0.2), false)
   assert.equal(isBasisIncrease(0.2, 0.1), false)
   assert.equal(isBasisIncrease(Number.NaN, 0.2), false)
+})
+
+test('calculates Flip Mode PnL against gross basis less withdrawals', () => {
+  const result = calculatePnlPercent({
+    pnlQuote: -0.333217,
+    pnlPercent: -3.75,
+    withdrawalQuote: 5.886448,
+    source: 'meteora-api',
+  }, 8.886448, true)
+
+  assert.equal(result.source, 'flip-net-basis')
+  assert.ok(Math.abs(result.pnlPercent - (-11.107233333333334)) < 1e-12)
+})
+
+test('keeps Meteora API PnL percentage for non-Flip positions', () => {
+  const result = calculatePnlPercent({
+    pnlQuote: -0.333217,
+    pnlPercent: -3.75,
+    withdrawalQuote: 5.886448,
+    source: 'meteora-api',
+  }, 8.886448, false)
+
+  assert.deepEqual(result, { pnlPercent: -3.75, source: 'meteora-api' })
+})
+
+test('disables Flip PnL calculation when withdrawals consume the basis', () => {
+  const result = calculatePnlPercent({
+    pnlQuote: -0.1,
+    pnlPercent: -10,
+    withdrawalQuote: 1,
+    source: 'meteora-api',
+  }, 1, true)
+
+  assert.deepEqual(result, { pnlPercent: 0, source: 'flip-net-basis-unavailable' })
 })

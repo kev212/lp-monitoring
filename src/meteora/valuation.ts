@@ -45,6 +45,28 @@ export interface ValuationResult {
   poolActiveBinId?: number
 }
 
+export type PnlCalculationSource = 'meteora-api' | 'flip-net-basis' | 'flip-net-basis-unavailable'
+
+export function calculatePnlPercent(
+  valuation: Pick<ValuationResult, 'pnlQuote' | 'pnlPercent' | 'withdrawalQuote' | 'source'>,
+  basisQuote: number,
+  flipModeActive: boolean,
+): { pnlPercent: number; source: PnlCalculationSource } {
+  if (!flipModeActive) {
+    return { pnlPercent: valuation.pnlPercent, source: valuation.source }
+  }
+
+  const netBasis = basisQuote - valuation.withdrawalQuote
+  if (!Number.isFinite(netBasis) || netBasis <= 0 || !Number.isFinite(valuation.pnlQuote)) {
+    return { pnlPercent: 0, source: 'flip-net-basis-unavailable' }
+  }
+
+  return {
+    pnlPercent: (valuation.pnlQuote / netBasis) * 100,
+    source: 'flip-net-basis',
+  }
+}
+
 const apiCache = new Map<string, { ts: number; positions: Map<string, MeteoraPnlPosition> }>()
 const valuationCache = new Map<string, { ts: number; data: ValuationResult }>()
 

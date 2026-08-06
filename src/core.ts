@@ -32,7 +32,7 @@ import {
   getPool,
   getPoolInfo,
 } from './meteora/positions.js'
-import { clearPnlCache, estimateExitValue, getQuoteCurrency, type ValuationResult } from './meteora/valuation.js'
+import { calculatePnlPercent, clearPnlCache, estimateExitValue, getQuoteCurrency, type ValuationResult } from './meteora/valuation.js'
 import { fetchLpAgentPositions, type LpAgentPosition } from './lpagent.js'
 import {
   acknowledgeExitCompletionNotification,
@@ -88,11 +88,15 @@ function lpAgentPnl(position: LpAgentPosition): number {
   return position.pnlPercentNative
 }
 
-function pnlFromValuation(valuation: ValuationResult): { pnlPercent: number; source: string } {
-  return {
-    pnlPercent: valuation.pnlPercent,
-    source: valuation.source,
-  }
+function pnlFromValuation(
+  valuation: ValuationResult,
+  position: Pick<PositionRow, 'basisQuote' | 'flipModeEnabled' | 'flipModePendingAdd'>,
+): { pnlPercent: number; source: string } {
+  return calculatePnlPercent(
+    valuation,
+    position.basisQuote,
+    position.flipModeEnabled || position.flipModePendingAdd,
+  )
 }
 
 function formatQuoteLog(value: number, quoteCurrency: QuoteCurrency): string {
@@ -439,7 +443,7 @@ async function monitorSinglePosition(
       return
     }
 
-    const { pnlPercent, source: pnlSource } = pnlFromValuation(valuation)
+    const { pnlPercent, source: pnlSource } = pnlFromValuation(valuation, pos)
 
     updatePositionPnl(pos.positionPubkey, pnlPercent, valuation.estimatedExitQuote, pos.quoteCurrency)
 
@@ -654,7 +658,10 @@ async function monitorSinglePosition(
         const freshValuation = await estimateExitValue(pos.poolPubkey, ownerStr, pos.positionPubkey, pos.quoteCurrency, true)
         if (!freshValuation) throw new Error('fresh Meteora valuation unavailable')
 
-        const freshPnlPct = pnlFromValuation(freshValuation).pnlPercent
+        const latestPosition = loadKnownPositions().find(row => row.positionPubkey === pos.positionPubkey)
+        if (!latestPosition) throw new Error('position disappeared during risk re-check')
+
+        const freshPnlPct = pnlFromValuation(freshValuation, latestPosition).pnlPercent
         let recheckLpAgent = lpAgentAtTrigger
         if (!recheckLpAgent) {
           try {
@@ -672,8 +679,6 @@ async function monitorSinglePosition(
           }
         }
 
-        const latestPosition = loadKnownPositions().find(row => row.positionPubkey === pos.positionPubkey)
-        if (!latestPosition) throw new Error('position disappeared during risk re-check')
         const latestRiskSettings = getRiskSettings()
         const freshDecision = evaluateTrigger(
           latestPosition,

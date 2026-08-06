@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { isTelegramAuthorized, parseDashboardAction } from '../src/telegram/control.js'
+import { isDashboardPositionVisible, isTelegramAuthorized, parseDashboardAction } from '../src/telegram/control.js'
 
 test('requires both configured chat and user for Telegram trading controls', () => {
   assert.equal(isTelegramAuthorized('100', '200', '100', '200'), true)
@@ -30,4 +30,11 @@ test('parses global risk settings callbacks', () => {
   assert.deepEqual(parseDashboardAction('lpd:rt'), { type: 'risk_toggle' })
   assert.deepEqual(parseDashboardAction('lpd:rc:abc123'), { type: 'risk_confirm', token: 'abc123' })
   assert.equal(parseDashboardAction('lpd:rs:invalid'), null)
+})
+
+test('hides closed and manual-review positions from the active dashboard list', () => {
+  assert.equal(isDashboardPositionVisible('monitoring'), true)
+  assert.equal(isDashboardPositionVisible('exiting'), true)
+  assert.equal(isDashboardPositionVisible('error'), false)
+  assert.equal(isDashboardPositionVisible('closed'), false)
 })

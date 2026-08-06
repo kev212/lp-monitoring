@@ -16,11 +16,11 @@ import {
   type OpenPositionPreview,
 } from '../meteora/open.js'
 import { getPool } from '../meteora/positions.js'
-import { estimateExitValue, type ValuationResult } from '../meteora/valuation.js'
+import { calculatePnlPercent, estimateExitValue, type ValuationResult } from '../meteora/valuation.js'
 import { getRiskSettings, updateGlobalRiskSettings, validateRiskSettings, type RiskSettingsPatch } from '../risk/settings.js'
 import { getConnection } from '../solana/connection.js'
 import { getWallet } from '../solana/wallet.js'
-import type { GlobalRiskSettings, PositionRow, RiskSettingField } from '../types.js'
+import type { GlobalRiskSettings, PositionRow, PositionStatus, RiskSettingField } from '../types.js'
 import { buildBinRangeDisplay } from './binDisplay.js'
 
 const DASHBOARD_PAGE_SIZE = 5
@@ -98,6 +98,10 @@ export function isTelegramAuthorized(
   allowedUserId = config.telegramUserId,
 ): boolean {
   return Boolean(allowedChatId && allowedUserId && chatId === allowedChatId && userId === allowedUserId)
+}
+
+export function isDashboardPositionVisible(status: PositionStatus): boolean {
+  return status !== 'closed' && status !== 'error'
 }
 
 function parsePage(value: string | undefined): number | null {
@@ -193,6 +197,14 @@ export function formatPnlUsd(valuation: Pick<ValuationResult, 'quoteCurrency' | 
   const absolute = Math.abs(pnlUsd)
   const amount = absolute >= 1 ? Math.round(absolute).toString() : absolute.toFixed(2)
   return pnlUsd < 0 ? `~-$${amount}` : `~$${amount}`
+}
+
+function positionPnlPercent(position: PositionRow, valuation: ValuationResult): number {
+  return calculatePnlPercent(
+    valuation,
+    position.basisQuote,
+    position.flipModeEnabled || position.flipModePendingAdd,
+  ).pnlPercent
 }
 
 export function formatOpeningDashboardLines(position: Pick<PositionRow, 'basisQuote' | 'quoteCurrency'>): string[] {
@@ -365,8 +377,10 @@ class TelegramDashboardController {
 
   private async buildDashboard(requestedPage: number): Promise<DashboardRender> {
     const riskSettings = getRiskSettings()
-    const positions = loadKnownPositions()
-      .filter(position => position.status !== 'closed')
+    const knownPositions = loadKnownPositions()
+    const reviewCount = knownPositions.filter(position => position.status === 'error').length
+    const positions = knownPositions
+      .filter(position => isDashboardPositionVisible(position.status))
       .sort((a, b) => a.createdAt - b.createdAt)
     const pageCount = Math.max(1, Math.ceil(positions.length / DASHBOARD_PAGE_SIZE))
     const page = Math.max(0, Math.min(requestedPage, pageCount - 1))
@@ -389,6 +403,9 @@ class TelegramDashboardController {
       `🕒 Updated: ${new Date().toISOString().replace('T', ' ').slice(0, 19)} UTC`,
       '',
     ]
+    if (reviewCount > 0) {
+      lines.push(`⚠️ ${reviewCount} posisi perlu review manual dan disembunyikan dari daftar aktif.`, '')
+    }
 
     if (pagePositions.length === 0) {
       lines.push('📭 Tidak ada posisi aktif.')
@@ -403,7 +420,7 @@ class TelegramDashboardController {
           continue
         }
         const valuation = valuations[index]
-        const pnl = valuation?.pnlPercent ?? position.lastPnlPercent
+        const pnl = valuation ? positionPnlPercent(position, valuation) : position.lastPnlPercent
         const value = valuation?.estimatedExitQuote ?? position.lastEstimatedExitQuote
         const indicator = pnl === null ? '⚪' : pnl > 0 ? '🟢' : pnl < 0 ? '🔴' : '⚪'
         const pnlIcon = pnl === null ? '➖' : pnl > 0 ? '📈' : pnl < 0 ? '📉' : '➖'
@@ -518,10 +535,11 @@ class TelegramDashboardController {
       value: { positionPubkey, page },
     })
     const label = `${position.tokenXSymbol}/${position.tokenYSymbol}`
+    const pnlPercent = positionPnlPercent(position, valuation)
     const text = [
       'CONFIRM MANUAL CLOSE',
       `${label} ${shortAddress(position.positionPubkey)}`,
-      `PnL: ${valuation.pnlPercent >= 0 ? '+' : ''}${valuation.pnlPercent.toFixed(2)}%`,
+      `PnL: ${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(2)}%`,
       `Estimated value: ${formatQuote(valuation.estimatedExitQuote, position.quoteCurrency)}`,
       `Withdrawn before: ${formatQuote(valuation.withdrawalQuote, position.quoteCurrency)}`,
       '',
@@ -595,7 +613,7 @@ class TelegramDashboardController {
         position.tokenXMint,
         position.tokenYMint,
         'MANUAL',
-        valuation.pnlPercent,
+        positionPnlPercent(position, valuation),
         position.quoteCurrency,
         position.basisQuote,
         valuation.estimatedExitQuote,
