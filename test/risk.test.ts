@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { buildBinRangeDisplay, formatCompactPrice } from '../src/telegram/binDisplay.js'
-import { formatOpeningDashboardLines, formatPnlUsd, parseRiskInput } from '../src/telegram/control.js'
+import { formatDashboardPositionLines, formatOpeningDashboardLines, formatPnlUsd, parseRiskInput } from '../src/telegram/control.js'
 import { validateRiskSettings } from '../src/risk/settings.js'
 import { evaluateTrigger } from '../src/risk/rules.js'
 import type { PositionRow } from '../src/types.js'
@@ -59,6 +59,33 @@ test('formats approximate PnL in USD for SOL and USDC quotes', () => {
   assert.equal(formatPnlUsd({ quoteCurrency: 'SOL', pnlQuote: -0.02, solUsdPrice: 50 }), '~-$1')
   assert.equal(formatPnlUsd({ quoteCurrency: 'SOL', pnlQuote: 0.02, solUsdPrice: 0 }), null)
   assert.equal(formatPnlUsd({ quoteCurrency: 'USDC', pnlQuote: 1.25, solUsdPrice: 0 }), '~$1')
+})
+
+test('orders dashboard value before PnL and only shows positive Peak', () => {
+  assert.deepEqual(formatDashboardPositionLines(
+    { peakPnlPercent: 1.46 },
+    1.45,
+    149.87,
+    'USDC',
+    'off',
+    { bar: '━━━━━━━━│━ 86%', prices: '$763.9 – $819.1 · $811' },
+  ), [
+    '   💰 $149.87 · 📈 PnL +1.45% · 🎯 Peak 1.46%',
+    '   ━━━━━━━━│━ 86% · ⚙️ Modes off',
+    '   $763.9 – $819.1 · $811',
+  ])
+
+  assert.deepEqual(formatDashboardPositionLines(
+    { peakPnlPercent: 0 },
+    -1.2,
+    2,
+    'SOL',
+    'Flip',
+    null,
+  ), [
+    '   💰 2.00 SOL · 📉 PnL -1.20%',
+    '   ⚙️ Modes Flip',
+  ])
 })
 
 test('renders opening positions without monitoring metrics', () => {

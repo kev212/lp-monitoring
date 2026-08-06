@@ -21,7 +21,7 @@ import { getRiskSettings, updateGlobalRiskSettings, validateRiskSettings, type R
 import { getConnection } from '../solana/connection.js'
 import { getWallet } from '../solana/wallet.js'
 import type { GlobalRiskSettings, PositionRow, PositionStatus, RiskSettingField } from '../types.js'
-import { buildBinRangeDisplay } from './binDisplay.js'
+import { buildBinRangeDisplay, type BinRangeDisplay } from './binDisplay.js'
 
 const DASHBOARD_PAGE_SIZE = 5
 const DASHBOARD_KEY_PREFIX = 'telegram_dashboard:'
@@ -197,6 +197,28 @@ export function formatPnlUsd(valuation: Pick<ValuationResult, 'quoteCurrency' | 
   const absolute = Math.abs(pnlUsd)
   const amount = absolute >= 1 ? Math.round(absolute).toString() : absolute.toFixed(2)
   return pnlUsd < 0 ? `~-$${amount}` : `~$${amount}`
+}
+
+export function formatDashboardPositionLines(
+  position: Pick<PositionRow, 'peakPnlPercent'>,
+  pnl: number | null,
+  value: number | null,
+  quoteCurrency: PositionRow['quoteCurrency'],
+  modes: string,
+  binDisplay: Pick<BinRangeDisplay, 'bar' | 'prices'> | null,
+): string[] {
+  const pnlIcon = pnl === null ? '➖' : pnl > 0 ? '📈' : pnl < 0 ? '📉' : '➖'
+  const pnlLabel = pnl === null ? 'N/A' : `${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}%`
+  const valueLabel = value === null ? 'N/A' : formatDashboardQuote(value, quoteCurrency)
+  const peakLabel = position.peakPnlPercent > 0
+    ? ` · 🎯 Peak ${position.peakPnlPercent.toFixed(2)}%`
+    : ''
+  const lines = [`   💰 ${valueLabel} · ${pnlIcon} PnL ${pnlLabel}${peakLabel}`]
+  lines.push(binDisplay
+    ? `   ${binDisplay.bar} · ⚙️ Modes ${modes}`
+    : `   ⚙️ Modes ${modes}`)
+  if (binDisplay) lines.push(`   ${binDisplay.prices}`)
+  return lines
 }
 
 function positionPnlPercent(position: PositionRow, valuation: ValuationResult): number {
@@ -422,21 +444,17 @@ class TelegramDashboardController {
         const pnl = valuation ? positionPnlPercent(position, valuation) : position.lastPnlPercent
         const value = valuation?.estimatedExitQuote ?? position.lastEstimatedExitQuote
         const indicator = pnl === null ? '⚪' : pnl > 0 ? '🟢' : pnl < 0 ? '🔴' : '⚪'
-        const pnlIcon = pnl === null ? '➖' : pnl > 0 ? '📈' : pnl < 0 ? '📉' : '➖'
-        const pnlUsd = valuation ? formatPnlUsd(valuation) : null
-        const pnlLabel = pnl === null
-          ? 'N/A'
-          : `${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}%${pnlUsd ? ` (${pnlUsd})` : ''}`
-        const valueLabel = value === null ? 'N/A' : formatDashboardQuote(value, position.quoteCurrency)
         const modes = [position.precisionCurveEnabled ? 'Precision' : '', position.flipModeEnabled ? 'Flip' : '', position.flipModePendingAdd ? 'FlipPending' : ''].filter(Boolean).join(', ') || 'off'
         const exceptionalStatus = ['opening', 'exiting', 'error'].includes(position.status) ? ` · ${position.status.toUpperCase()}` : ''
         lines.push(`${first + index + 1}. ${indicator} ${label}${exceptionalStatus}`)
-        lines.push(`   ${pnlIcon} PnL ${pnlLabel} · 💰 ${valueLabel}`)
-        if (binDisplays[index]) {
-          lines.push(`   ${binDisplays[index]!.bar}`)
-          lines.push(`   ${binDisplays[index]!.prices}`)
-        }
-        lines.push(`   🎯 Peak ${position.peakPnlPercent.toFixed(2)}% · ⚙️ Modes ${modes}`)
+        lines.push(...formatDashboardPositionLines(
+          position,
+          pnl,
+          value,
+          position.quoteCurrency,
+          modes,
+          binDisplays[index] ?? null,
+        ))
       }
     }
     if (pageCount > 1) lines.push('', `📄 Page ${page + 1}/${pageCount} · ${positions.length} positions`)
