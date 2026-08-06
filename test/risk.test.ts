@@ -6,7 +6,7 @@ import { validateRiskSettings } from '../src/risk/settings.js'
 import { evaluateTrigger } from '../src/risk/rules.js'
 import type { PositionRow } from '../src/types.js'
 
-test('formats compact prices and a fixed-width linear bin progress bar', () => {
+test('formats compact prices and a fixed-width bin-position progress bar', () => {
   assert.equal(formatCompactPrice(0.00001695), '0.0₄1695')
   assert.equal(formatCompactPrice(0.00004771), '0.0₄4771')
   assert.equal(formatCompactPrice(0.00003795), '0.0₄3795')
@@ -20,8 +20,8 @@ test('formats compact prices and a fixed-width linear bin progress bar', () => {
     priceForBin: bin => ({ 10: 0.00001695, 18: 0.00003795, 20: 0.00004771 }[bin] || 1),
   })
 
-  assert.equal(display.progressPct, 68)
-  assert.equal(display.bar, '━━━━━━━│━━ 68%')
+  assert.equal(display.progressPct, 80)
+  assert.equal(display.bar, '━━━━━━━━│━ 80%')
   assert.equal(display.prices, '0.0₄1695 SOL – 0.0₄4771 SOL · 0.0₄3795 SOL')
 })
 
@@ -35,8 +35,8 @@ test('inverts bin prices for a quote-X position and formats USDC as dollars', ()
     priceForBin: bin => ({ 10: 2, 15: 4, 20: 8 }[bin] || 1),
   })
 
-  assert.equal(display.progressPct, 33)
-  assert.equal(display.bar, '━━━│━━━━━━ 33%')
+  assert.equal(display.progressPct, 50)
+  assert.equal(display.bar, '━━━━━│━━━━ 50%')
   assert.equal(display.prices, '$0.125 – $0.5 · $0.25')
 })
 

@@ -44,8 +44,10 @@ export function buildBinRangeDisplay(input: BinRangeDisplayInput): BinRangeDispl
   const current = quotePrice(input.priceForBin(input.activeBinId), input.quoteSide)
   const lower = Math.min(endpointA, endpointB)
   const upper = Math.max(endpointA, endpointB)
-  const progressPct = Number.isFinite(lower) && Number.isFinite(upper) && Number.isFinite(current) && upper > lower
-    ? Math.max(0, Math.min(100, Math.round(((current - lower) / (upper - lower)) * 100)))
+  const lowerBin = Math.min(input.lowerBinId, input.upperBinId)
+  const upperBin = Math.max(input.lowerBinId, input.upperBinId)
+  const progressPct = Number.isFinite(lowerBin) && Number.isFinite(upperBin) && Number.isFinite(input.activeBinId) && upperBin > lowerBin
+    ? Math.max(0, Math.min(100, Math.round(((input.activeBinId - lowerBin) / (upperBin - lowerBin)) * 100)))
     : null
   const cursor = progressPct === null ? 0 : Math.min(BIN_BAR_WIDTH - 1, Math.round(progressPct / 10))
   const bar = progressPct === null

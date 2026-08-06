@@ -416,7 +416,6 @@ class TelegramDashboardController {
         if (position.status === 'opening') {
           lines.push(`${first + index + 1}. 🟡 ${label} · OPENING`)
           lines.push(...formatOpeningDashboardLines(position))
-          if (index < pagePositions.length - 1) lines.push('')
           continue
         }
         const valuation = valuations[index]
@@ -438,7 +437,6 @@ class TelegramDashboardController {
           lines.push(`   ${binDisplays[index]!.prices}`)
         }
         lines.push(`   🎯 Peak ${position.peakPnlPercent.toFixed(2)}% · ⚙️ Modes ${modes}`)
-        if (index < pagePositions.length - 1) lines.push('')
       }
     }
     if (pageCount > 1) lines.push('', `📄 Page ${page + 1}/${pageCount} · ${positions.length} positions`)
