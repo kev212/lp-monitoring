@@ -5,7 +5,7 @@ let _primary: Connection | null = null
 let _fallback: Connection | null = null
 let _activeIsPrimary = true
 
-function getPrimaryConnection(): Connection {
+export function getPrimaryConnection(): Connection {
   if (!_primary) {
     _primary = new Connection(config.solanaRpcUrl, {
       commitment: 'confirmed',
@@ -15,7 +15,7 @@ function getPrimaryConnection(): Connection {
   return _primary
 }
 
-function getFallbackConnection(): Connection | null {
+export function getFallbackConnection(): Connection | null {
   if (config.solanaRpcFallbackUrl && !_fallback) {
     _fallback = new Connection(config.solanaRpcFallbackUrl, 'confirmed')
   }
@@ -38,6 +38,21 @@ export async function withValuationFallback<T>(fn: (connection: Connection) => P
     const fallback = getFallbackConnection()
     if (!fallback) throw err
     console.log(`[connection] primary valuation RPC failed (${err instanceof Error ? err.message : 'unknown'}), retrying fallback`)
+    return await fn(fallback)
+  }
+}
+
+/** Read from the selected RPC first, then retry the same read on the configured fallback. */
+export async function withRpcFallback<T>(
+  fn: (connection: Connection) => Promise<T>,
+  primary: Connection = getConnection(),
+  fallback: Connection | null = getFallbackConnection(),
+): Promise<T> {
+  try {
+    return await fn(primary)
+  } catch (err) {
+    if (!fallback || primary === fallback) throw err
+    console.log(`[connection] RPC read failed (${err instanceof Error ? err.message : 'unknown'}), retrying fallback`)
     return await fn(fallback)
   }
 }

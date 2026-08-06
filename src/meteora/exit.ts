@@ -7,6 +7,7 @@ import { getDb, listSyncValues } from '../db/client.js'
 import { swapTokensToSol, type SignedSwapAttempt } from '../swap.js'
 import { config } from '../config.js'
 import { confirmSignature } from '../solana/confirmation.js'
+import { withRpcFallback } from '../solana/connection.js'
 import type { ExecutionRow, ExitCompletionNotification, ExitStatus, QuoteCurrency, TriggerType } from '../types.js'
 import { updatePositionStatus } from './discovery.js'
 import {
@@ -376,7 +377,10 @@ async function getTokenBalance(
   for (let attempt = 0; attempt < attempts; attempt++) {
     if (attempt > 0) await new Promise<void>(resolve => { setTimeout(resolve, 800) })
     try {
-      const accounts = await connection.getTokenAccountsByOwner(owner, { mint: new PublicKey(mint) })
+      const accounts = await withRpcFallback(
+        rpc => rpc.getTokenAccountsByOwner(owner, { mint: new PublicKey(mint) }),
+        connection,
+      )
       let total = 0n
       for (const acc of accounts.value) {
         const view = new DataView(acc.account.data.buffer, acc.account.data.byteOffset + 64, 8)
@@ -397,7 +401,7 @@ export async function collectExitBaselines(
   quoteCurrency: QuoteCurrency,
   tokensToSwap: string[],
 ): Promise<{ preSolBalance: number; preUsdcBalance: bigint; preSwapTokenBalances: Map<string, bigint> }> {
-  const preSolBalance = await connection.getBalance(owner)
+  const preSolBalance = await withRpcFallback(rpc => rpc.getBalance(owner), connection)
   const preUsdcBalance = quoteCurrency === 'USDC'
     ? await getTokenBalance(connection, owner, USDC_MINT)
     : 0n
@@ -416,7 +420,7 @@ export async function sendTrackedTransaction(
   onConfirmed?: (attempt: SignedRemoveAttempt) => void,
 ): Promise<string> {
   const startedAt = Date.now()
-  const latest = await connection.getLatestBlockhash('confirmed')
+  const latest = await withRpcFallback(rpc => rpc.getLatestBlockhash('confirmed'), connection)
   transaction.feePayer = wallet.publicKey
   transaction.recentBlockhash = latest.blockhash
   transaction.sign(wallet)
@@ -616,7 +620,7 @@ async function removePositionLiquidity(
 ): Promise<'removed' | 'pending' | 'failed'> {
   try {
     const positionAddress = new PublicKey(state.positionPubkey)
-    const account = await connection.getAccountInfo(positionAddress, 'finalized')
+    const account = await withRpcFallback(rpc => rpc.getAccountInfo(positionAddress, 'finalized'), connection)
     if (!account) {
       if (state.removeSignatures.length === 0) {
         const now = Date.now()
@@ -828,7 +832,7 @@ async function settleExit(
       }
     }
 
-    const postSolBalance = await connection.getBalance(wallet.publicKey)
+    const postSolBalance = await withRpcFallback(rpc => rpc.getBalance(wallet.publicKey), connection)
     result.solReceived = (postSolBalance - state.preSolBalance) / 1_000_000_000
     if (quoteIsUsdc) {
       const postUsdcBalance = await getTokenBalance(connection, wallet.publicKey, USDC_MINT, 2)
@@ -869,7 +873,7 @@ async function reconcileFinalizingAttempt(
   if (finalizing.kind === 'remove') {
     try {
       const account = await withRpcTimeout(
-        connection.getAccountInfo(new PublicKey(state.positionPubkey), 'finalized'),
+        withRpcFallback(rpc => rpc.getAccountInfo(new PublicKey(state.positionPubkey), 'finalized'), connection),
         RECONCILIATION_PROBE_TIMEOUT_MS,
       )
       if (!account) return 'finalized'
@@ -881,7 +885,10 @@ async function reconcileFinalizingAttempt(
   let status
   try {
     status = await withRpcTimeout(
-      connection.getSignatureStatus(finalizing.attempt.signature, { searchTransactionHistory: true }),
+      withRpcFallback(
+        rpc => rpc.getSignatureStatus(finalizing.attempt.signature, { searchTransactionHistory: true }),
+        connection,
+      ),
       RECONCILIATION_PROBE_TIMEOUT_MS,
     )
   } catch {
@@ -914,18 +921,24 @@ async function reconcileSignedAttempt(
   kind: 'remove' | 'swap',
 ): Promise<'succeeded' | 'confirmed' | 'finalized_failed' | 'expired' | 'pending'> {
   if (kind === 'remove') {
-    const account = await connection.getAccountInfo(new PublicKey(state.positionPubkey), 'finalized')
+    const account = await withRpcFallback(
+      rpc => rpc.getAccountInfo(new PublicKey(state.positionPubkey), 'finalized'),
+      connection,
+    )
     if (!account) return 'succeeded'
   }
 
-  const status = await connection.getSignatureStatus(attempt.signature, { searchTransactionHistory: true })
+  const status = await withRpcFallback(
+    rpc => rpc.getSignatureStatus(attempt.signature, { searchTransactionHistory: true }),
+    connection,
+  )
   if (status.value?.err) return 'finalized_failed'
   if (status.value?.confirmationStatus === 'finalized') {
     return 'succeeded'
   }
   if (status.value?.confirmationStatus === 'confirmed') return 'confirmed'
 
-  const blockHeight = await connection.getBlockHeight('confirmed')
+  const blockHeight = await withRpcFallback(rpc => rpc.getBlockHeight('confirmed'), connection)
   if (blockHeight > attempt.lastValidBlockHeight) {
     const now = Date.now()
     const canCount = state.lastExpiryAbsenceAt === null
@@ -1076,7 +1089,11 @@ async function reconcilePendingExitsUnlocked(connection: Connection, wallet: Key
           errorMessage: state.lastError,
         })
         if (outcome === 'finalized_failed' && state.removeSignatures.length === 0) {
-          const account = await connection.getAccountInfo(new PublicKey(state.positionPubkey), 'finalized')
+          const positionAddress = new PublicKey(state.positionPubkey)
+          const account = await withRpcFallback(
+            rpc => rpc.getAccountInfo(positionAddress, 'finalized'),
+            connection,
+          )
           if (account) {
             finishExit(state, 'failed', 'monitoring', {
               removeLiqSig: current.signature,

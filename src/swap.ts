@@ -3,6 +3,7 @@ import axios from 'axios'
 import bs58 from 'bs58'
 import { config } from './config.js'
 import { confirmSignature } from './solana/confirmation.js'
+import { withRpcFallback } from './solana/connection.js'
 
 const WSOL_MINT = 'So11111111111111111111111111111111111111112'
 
@@ -38,9 +39,9 @@ export type SwapAttemptSettlement = (signature: string, status: 'confirmed' | 'f
 
 async function getRawTokenBalance(connection: Connection, wallet: Keypair, mint: string): Promise<bigint | null> {
   try {
-    const accounts = await connection.getTokenAccountsByOwner(
-      wallet.publicKey,
-      { mint: new PublicKey(mint) }
+    const accounts = await withRpcFallback(
+      rpc => rpc.getTokenAccountsByOwner(wallet.publicKey, { mint: new PublicKey(mint) }),
+      connection,
     )
     if (accounts.value.length > 0) {
       let total = 0n
@@ -113,7 +114,10 @@ async function tryLegacySwap(
     if (!swapTransaction) throw new Error('No swapTransaction in swap response')
 
     const tx = VersionedTransaction.deserialize(Buffer.from(swapTransaction, 'base64'))
-    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed')
+    const { blockhash, lastValidBlockHeight } = await withRpcFallback(
+      rpc => rpc.getLatestBlockhash('confirmed'),
+      connection,
+    )
     tx.message.recentBlockhash = blockhash
     tx.sign([wallet])
 
@@ -222,7 +226,10 @@ async function attemptSwap(
 
     // Sign & send via RPC langsung (karena gak selalu ada requestId buat /execute)
     const tx = VersionedTransaction.deserialize(Buffer.from(rawTx, 'base64'))
-    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed')
+    const { blockhash, lastValidBlockHeight } = await withRpcFallback(
+      rpc => rpc.getLatestBlockhash('confirmed'),
+      connection,
+    )
     tx.message.recentBlockhash = blockhash
     tx.sign([wallet])
 
