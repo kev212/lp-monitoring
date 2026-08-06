@@ -2,6 +2,7 @@ import { Connection, Keypair, PublicKey, VersionedTransaction } from '@solana/we
 import axios from 'axios'
 import bs58 from 'bs58'
 import { config } from './config.js'
+import { confirmSignature } from './solana/confirmation.js'
 
 const WSOL_MINT = 'So11111111111111111111111111111111111111112'
 
@@ -33,21 +34,7 @@ export interface SwapResult {
 }
 
 export type SwapAttemptTracker = (attempt: SignedSwapAttempt) => void
-export type SwapAttemptSettlement = (signature: string, status: 'finalized' | 'failed') => void
-
-async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
-  let timer: NodeJS.Timeout | undefined
-  try {
-    return await Promise.race([
-      promise,
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`confirm timeout (${timeoutMs / 1000}s)`)), timeoutMs)
-      }),
-    ])
-  } finally {
-    if (timer) clearTimeout(timer)
-  }
-}
+export type SwapAttemptSettlement = (signature: string, status: 'confirmed' | 'finalized' | 'failed') => void
 
 async function getRawTokenBalance(connection: Connection, wallet: Keypair, mint: string): Promise<bigint | null> {
   try {
@@ -83,6 +70,7 @@ async function tryLegacySwap(
   onSettled?: SwapAttemptSettlement,
 ): Promise<SwapResult | null> {
   let sentSig = ''
+  const startedAt = Date.now()
   try {
     const rawAmount = normalizeRawSwapAmount(amount)
     const baseUrl = config.jupiterSwapBaseUrl.replace(/\/$/, '')
@@ -141,12 +129,15 @@ async function tryLegacySwap(
     })
     const sig = await connection.sendTransaction(tx, { skipPreflight: true, maxRetries: 3 })
     if (sig !== sentSig) throw new Error('RPC returned a signature that does not match the signed swap transaction')
-    const confirmation = await withTimeout(
-      connection.confirmTransaction({ signature: sentSig, blockhash, lastValidBlockHeight }, 'finalized'),
-      20_000,
+    const confirmation = await confirmSignature(
+      connection,
+      { signature: sentSig, blockhash, lastValidBlockHeight },
+      'confirmed',
+      config.swapConfirmTimeoutMs,
     )
     if (confirmation.value.err) throw new Error(`swap transaction failed on-chain: ${JSON.stringify(confirmation.value.err)}`)
-    onSettled?.(sentSig, 'finalized')
+    onSettled?.(sentSig, 'confirmed')
+    console.log(`[swap-timing] legacy ${sentSig.slice(0, 8)} confirmed in ${Date.now() - startedAt}ms`)
 
     return { signature: sentSig, outputAmount: quote.outAmount || '0', confirmed: true }
   } catch (err) {
@@ -189,6 +180,7 @@ async function attemptSwap(
   if (amountRaw <= 0n) return null
 
   let sentSig = ''
+  const startedAt = Date.now()
 
   try {
     const baseUrl = config.jupiterSwapBaseUrl.replace(/\/$/, '')
@@ -246,12 +238,15 @@ async function attemptSwap(
     })
     const rpcSignature = await connection.sendTransaction(tx, { skipPreflight: true, maxRetries: 3 })
     if (rpcSignature !== sentSig) throw new Error('RPC returned a signature that does not match the signed swap transaction')
-    const confirmation = await withTimeout(
-      connection.confirmTransaction({ signature: sentSig, blockhash, lastValidBlockHeight }, 'finalized'),
-      20_000,
+    const confirmation = await confirmSignature(
+      connection,
+      { signature: sentSig, blockhash, lastValidBlockHeight },
+      'confirmed',
+      config.swapConfirmTimeoutMs,
     )
     if (confirmation.value.err) throw new Error(`swap transaction failed on-chain: ${JSON.stringify(confirmation.value.err)}`)
-    onSettled?.(sentSig, 'finalized')
+    onSettled?.(sentSig, 'confirmed')
+    console.log(`[swap-timing] ultra ${sentSig.slice(0, 8)} confirmed in ${Date.now() - startedAt}ms`)
 
     console.log(`[swap] ultra success: ${sentSig}`)
     return {
@@ -267,7 +262,6 @@ async function attemptSwap(
 
     // If confirmation timed out, the tx may have gone through — check balance
     if (sentSig && !msg.includes('failed on-chain')) {
-      await new Promise<void>(r => setTimeout(r, 5_000))
       const balanceAfter = await getRawTokenBalance(connection, wallet, inputMint)
       if (balanceAfter !== null && balanceAfter <= minimumRemainingBalance) {
         console.log(`[swap] tx succeeded despite RPC timeout`)

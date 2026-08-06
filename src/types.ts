@@ -99,8 +99,22 @@ export interface ExecutionRow {
   updatedAt: number
 }
 
+export interface ExitCompletionNotification {
+  executionId: number
+  positionPubkey: string
+  pair: string
+  triggerType: TriggerType
+  quoteCurrency: QuoteCurrency
+  receivedQuote: number
+  rentRefundSol: number
+  removeLiqSig: string | null
+  swapSig: string | null
+  createdAt: number
+}
+
 export interface Config {
   solanaRpcUrl: string
+  solanaWsUrl: string
   solanaRpcFallbackUrl: string
   solanaPrivateKey: string
   jupiterApiKey: string
@@ -117,6 +131,10 @@ export interface Config {
   maxRetries: number
   exitCooldownMs: number
   maxSwapSlippageBps: number
+  removeConfirmTimeoutMs: number
+  swapConfirmTimeoutMs: number
+  exitRecoveryPollMs: number
+  exitFinalityReviewTimeoutMs: number
   trailingActivationPct: number
   trailingStopDropPct: number
   recheckDelayMs: number

@@ -3,6 +3,7 @@ import test from 'node:test'
 import { Connection, Keypair, Transaction, TransactionInstruction } from '@solana/web3.js'
 import bs58 from 'bs58'
 import { collectExitBaselines, positiveBalanceDelta, sendTrackedTransaction } from '../src/meteora/exit.js'
+import { formatExitReconciled } from '../src/telegram.js'
 
 test('isolates only newly received close proceeds from an existing wallet balance', () => {
   assert.equal(positiveBalanceDelta(1_000n, 1_450n), 450n)
@@ -50,6 +51,33 @@ test('rejects a finalized remove transaction with an on-chain error', async () =
   )
 })
 
+test('returns after confirmed remove confirmation and records the attempt', async () => {
+  const wallet = Keypair.generate()
+  let commitment = ''
+  let confirmedSignature = ''
+  const connection = {
+    getLatestBlockhash: async () => ({ blockhash: Keypair.generate().publicKey.toBase58(), lastValidBlockHeight: 10 }),
+    sendRawTransaction: async (raw: Buffer) => {
+      const transaction = Transaction.from(raw)
+      return bs58.encode(transaction.signature!)
+    },
+    confirmTransaction: async (_strategy: unknown, requestedCommitment: string) => {
+      commitment = requestedCommitment
+      return { value: { err: null } }
+    },
+  } as unknown as Connection
+
+  const signature = await sendTrackedTransaction(
+    connection,
+    wallet,
+    signedTestTransaction(wallet),
+    () => undefined,
+    attempt => { confirmedSignature = attempt.signature },
+  )
+  assert.equal(commitment, 'confirmed')
+  assert.equal(confirmedSignature, signature)
+})
+
 test('aborts baseline collection when an RPC balance read fails', async () => {
   const connection = {
     getBalance: async () => { throw new Error('RPC unavailable') },
@@ -58,4 +86,24 @@ test('aborts baseline collection when an RPC balance read fails', async () => {
     collectExitBaselines(connection, Keypair.generate().publicKey, 'SOL', []),
     /RPC unavailable/,
   )
+})
+
+test('formats a final background reconciliation notification with transaction links', () => {
+  const message = formatExitReconciled({
+    executionId: 7,
+    positionPubkey: '2acTcQJ4NSQdFy68SEbLDEWWxa9PwxPXYv8kr6kwV8ua',
+    pair: 'Doom/SOL',
+    triggerType: 'MANUAL',
+    quoteCurrency: 'SOL',
+    receivedQuote: 3.137309,
+    rentRefundSol: 0.002,
+    removeLiqSig: 'remove-signature',
+    swapSig: 'swap-signature',
+    createdAt: Date.now(),
+  })
+  assert.match(message, /Exit Complete — Reconciled/)
+  assert.match(message, /Doom\/SOL/)
+  assert.match(message, /3\.1373 SOL/)
+  assert.match(message, /solscan\.io\/tx\/remove-signature/)
+  assert.match(message, /solscan\.io\/tx\/swap-signature/)
 })

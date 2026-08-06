@@ -5,7 +5,9 @@ import bs58 from 'bs58'
 import { getPool } from './positions.js'
 import { getDb, listSyncValues } from '../db/client.js'
 import { swapTokensToSol, type SignedSwapAttempt } from '../swap.js'
-import type { ExecutionRow, ExitStatus, QuoteCurrency, TriggerType } from '../types.js'
+import { config } from '../config.js'
+import { confirmSignature } from '../solana/confirmation.js'
+import type { ExecutionRow, ExitCompletionNotification, ExitStatus, QuoteCurrency, TriggerType } from '../types.js'
 import { updatePositionStatus } from './discovery.js'
 import {
   releaseWalletOperation,
@@ -20,24 +22,12 @@ const SOL_MINTS = new Set([
 ])
 const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
 const EXIT_PENDING_PREFIX = 'exit_pending:'
+const EXIT_NOTIFICATION_PREFIX = 'exit_notification:'
 const EXPIRED_ABSENCE_CHECKS = 2
 const EXPIRED_ABSENCE_MIN_INTERVAL_MS = 5_000
+const RECONCILIATION_PROBE_TIMEOUT_MS = 2_000
 
 class ConfirmedTransactionError extends Error {}
-
-async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
-  let timer: NodeJS.Timeout | undefined
-  try {
-    return await Promise.race([
-      promise,
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`confirm timeout (${timeoutMs / 1000}s)`)), timeoutMs)
-      }),
-    ])
-  } finally {
-    if (timer) clearTimeout(timer)
-  }
-}
 
 export interface SignedRemoveAttempt {
   signature: string
@@ -46,8 +36,17 @@ export interface SignedRemoveAttempt {
   signedTransaction: string
 }
 
+type ExitStage = 'pending_remove' | 'swap_pending' | 'finalizing'
+
+interface FinalizingExitAttempt {
+  kind: 'remove' | 'swap'
+  attempt: SignedRemoveAttempt | SignedSwapAttempt
+  resumeStage: Exclude<ExitStage, 'finalizing'>
+  confirmedAt: number
+}
+
 interface ExitPendingState {
-  version: 3
+  version: 4
   revision: number
   leaseId: string
   executionId: number
@@ -65,16 +64,22 @@ interface ExitPendingState {
   preUsdcBalance: string
   preSwapTokenBalances: Record<string, string>
   rentRefundSol: number
-  stage: 'pending_remove' | 'swap_pending'
+  stage: ExitStage
   removeSignatures: string[]
   swapSignatures: string[]
   currentRemove: SignedRemoveAttempt | null
   currentSwap: SignedSwapAttempt | null
+  finalizing: FinalizingExitAttempt[]
   missingAfterExpiryChecks: number
   lastExpiryAbsenceAt: number | null
   lastError: string | null
   createdAt: number
   updatedAt: number
+}
+
+function executionStatusForState(state: ExitPendingState): ExitStatus {
+  if (state.stage !== 'finalizing') return state.stage
+  return state.finalizing[0]?.kind === 'remove' ? 'removed' : 'swap_pending'
 }
 
 export function saveExecution(row: ExecutionRow): number {
@@ -128,6 +133,27 @@ function exitPendingKey(positionPubkey: string): string {
   return `${EXIT_PENDING_PREFIX}${positionPubkey}`
 }
 
+function exitNotificationKey(executionId: number): string {
+  return `${EXIT_NOTIFICATION_PREFIX}${executionId}`
+}
+
+export function listPendingExitNotifications(): ExitCompletionNotification[] {
+  return listSyncValues(EXIT_NOTIFICATION_PREFIX).flatMap(row => {
+    try {
+      const notification = JSON.parse(row.value) as ExitCompletionNotification
+      if (!Number.isSafeInteger(notification.executionId) || !notification.positionPubkey || !notification.pair) return []
+      return [notification]
+    } catch {
+      console.log(`[exit] malformed completion notification ${row.key}`)
+      return []
+    }
+  })
+}
+
+export function acknowledgeExitCompletionNotification(executionId: number): void {
+  getDb().prepare('DELETE FROM sync_state WHERE key = ?').run(exitNotificationKey(executionId))
+}
+
 function ensureExitWalletLease(state: ExitPendingState): void {
   const db = getDb()
   db.transaction(() => {
@@ -168,11 +194,23 @@ function ensureExitWalletLease(state: ExitPendingState): void {
 
 function parseExitPendingState(value: string): ExitPendingState {
   const parsed = JSON.parse(value) as Omit<Partial<ExitPendingState>, 'version'> & { version?: number }
-  const state = parsed.version === 1 && parsed.revision === undefined
+  let state = parsed.version === 1 && parsed.revision === undefined
     ? { ...parsed, version: 3, revision: 0, leaseId: randomUUID() }
-    : parsed.version === 2 && !parsed.leaseId
-      ? { ...parsed, version: 3, leaseId: randomUUID() }
-      : parsed
+      : parsed.version === 2 && !parsed.leaseId
+        ? { ...parsed, version: 3, leaseId: randomUUID() }
+        : parsed
+  if (state.version === 3) state = { ...state, version: 4, finalizing: [] }
+  if (state.version === 4 && !Array.isArray(state.finalizing)) {
+    state = { ...state, finalizing: state.finalizing ? [state.finalizing] : [] }
+  }
+  if (state.version === 4 && Array.isArray(state.finalizing)) {
+    state = {
+      ...state,
+      finalizing: state.finalizing.map(finalizing => finalizing.kind === 'remove'
+        ? { ...finalizing, resumeStage: 'pending_remove' }
+        : finalizing),
+    }
+  }
   const validRawBalances = state.preSwapTokenBalances
     && Object.values(state.preSwapTokenBalances).every(balance => /^\d+$/.test(balance))
   const validAttempt = (attempt: SignedRemoveAttempt | SignedSwapAttempt | null | undefined): boolean => !attempt || Boolean(
@@ -181,8 +219,14 @@ function parseExitPendingState(value: string): ExitPendingState {
     && Number.isSafeInteger(attempt.lastValidBlockHeight)
     && attempt.signedTransaction
   )
+  const validFinalizing = Array.isArray(state.finalizing) && state.finalizing.every(finalizing =>
+    (finalizing.kind === 'remove' || finalizing.kind === 'swap')
+    && validAttempt(finalizing.attempt)
+    && (finalizing.resumeStage === 'pending_remove' || finalizing.resumeStage === 'swap_pending')
+    && Number.isSafeInteger(finalizing.confirmedAt)
+  )
   if (
-    state.version !== 3
+    state.version !== 4
     || !Number.isSafeInteger(state.revision) || state.revision! < 0
     || !state.leaseId
     || !Number.isSafeInteger(state.executionId) || state.executionId! < 1
@@ -192,7 +236,7 @@ function parseExitPendingState(value: string): ExitPendingState {
     || !state.tokenXMint
     || !state.tokenYMint
     || !['SOL', 'USDC'].includes(state.quoteCurrency || '')
-    || !['pending_remove', 'swap_pending'].includes(state.stage || '')
+    || !['pending_remove', 'swap_pending', 'finalizing'].includes(state.stage || '')
     || !Number.isSafeInteger(state.preSolBalance)
     || !/^\d+$/.test(state.preUsdcBalance || '')
     || !validRawBalances
@@ -200,6 +244,8 @@ function parseExitPendingState(value: string): ExitPendingState {
     || !Array.isArray(state.swapSignatures)
     || !validAttempt(state.currentRemove)
     || !validAttempt(state.currentSwap)
+    || !validFinalizing
+    || (state.stage === 'finalizing' && (!state.finalizing || state.finalizing.length === 0))
   ) {
     throw new Error('durable exit state is malformed')
   }
@@ -258,6 +304,7 @@ function finishExit(
   executionStatus: Extract<ExitStatus, 'completed' | 'failed'>,
   positionStatus: 'monitoring' | 'closed' | 'error',
   fields: Partial<ExecutionRow>,
+  queueCompletionNotification = false,
 ): void {
   const db = getDb()
   db.transaction(() => {
@@ -270,6 +317,27 @@ function finishExit(
     if (deleted.changes !== 1) throw new Error('refusing to finish a stale durable exit state')
     updateExecution(state.executionId, executionStatus, fields)
     updatePositionStatus(state.positionPubkey, positionStatus)
+    if (executionStatus === 'completed' && queueCompletionNotification) {
+      const position = db.prepare(`
+        SELECT token_x_symbol, token_y_symbol
+        FROM positions
+        WHERE position_pubkey = ?
+      `).get(state.positionPubkey) as { token_x_symbol?: string; token_y_symbol?: string } | undefined
+      const notification: ExitCompletionNotification = {
+        executionId: state.executionId,
+        positionPubkey: state.positionPubkey,
+        pair: `${position?.token_x_symbol || state.tokenXMint.slice(0, 4)}/${position?.token_y_symbol || state.tokenYMint.slice(0, 4)}`,
+        triggerType: state.triggerType,
+        quoteCurrency: state.quoteCurrency,
+        receivedQuote: fields.finalQuoteReceived ?? fields.finalSolReceived ?? 0,
+        rentRefundSol: state.rentRefundSol,
+        removeLiqSig: fields.removeLiqSig ?? state.removeSignatures.at(-1) ?? null,
+        swapSig: fields.swapSig ?? state.swapSignatures.at(-1) ?? null,
+        createdAt: Date.now(),
+      }
+      db.prepare('INSERT OR IGNORE INTO sync_state (key, value, updated_at) VALUES (?, ?, ?)')
+        .run(exitNotificationKey(state.executionId), JSON.stringify(notification), notification.createdAt)
+    }
     const released = db.prepare(`
       DELETE FROM sync_state
       WHERE key = ?
@@ -284,6 +352,7 @@ function finishExit(
 export interface ExitResult {
   success: boolean
   pendingRecovery: boolean
+  executionId: number | null
   removeSucceeded: boolean
   solReceived: number
   usdcReceived: number
@@ -344,32 +413,39 @@ export async function sendTrackedTransaction(
   wallet: Keypair,
   transaction: Transaction,
   onSubmitted: (attempt: SignedRemoveAttempt) => void,
+  onConfirmed?: (attempt: SignedRemoveAttempt) => void,
 ): Promise<string> {
+  const startedAt = Date.now()
   const latest = await connection.getLatestBlockhash('confirmed')
   transaction.feePayer = wallet.publicKey
   transaction.recentBlockhash = latest.blockhash
   transaction.sign(wallet)
   const signature = bs58.encode(transaction.signature!)
   const signedTransaction = transaction.serialize()
-  onSubmitted({
+  const attempt: SignedRemoveAttempt = {
     signature,
     blockhash: latest.blockhash,
     lastValidBlockHeight: latest.lastValidBlockHeight,
     signedTransaction: signedTransaction.toString('base64'),
-  })
+  }
+  onSubmitted(attempt)
   const rpcSignature = await connection.sendRawTransaction(signedTransaction, {
     skipPreflight: false,
     preflightCommitment: 'confirmed',
     maxRetries: 3,
   })
   if (rpcSignature !== signature) throw new Error('RPC returned a signature that does not match the signed remove transaction')
-  const confirmation = await withTimeout(
-    connection.confirmTransaction({ signature, ...latest }, 'finalized'),
-    30_000,
+  const confirmation = await confirmSignature(
+    connection,
+    { signature, ...latest },
+    'confirmed',
+    config.removeConfirmTimeoutMs,
   )
   if (confirmation.value.err) {
     throw new ConfirmedTransactionError(`transaction ${signature} failed on-chain: ${JSON.stringify(confirmation.value.err)}`)
   }
+  onConfirmed?.(attempt)
+  console.log(`[exit-timing] remove ${signature.slice(0, 8)} confirmed in ${Date.now() - startedAt}ms`)
   return signature
 }
 
@@ -419,6 +495,7 @@ async function executeExitUnlocked(
   const result: ExitResult = {
     success: false,
     pendingRecovery: false,
+    executionId: null,
     removeSucceeded: false,
     solReceived: 0,
     usdcReceived: 0,
@@ -471,7 +548,7 @@ async function executeExitUnlocked(
       createdAt: now,
       updatedAt: now,
     }, {
-      version: 3,
+      version: 4,
       revision: 0,
       leaseId: initializationLease.leaseId!,
       positionPubkey,
@@ -493,6 +570,7 @@ async function executeExitUnlocked(
       swapSignatures: [],
       currentRemove: null,
       currentSwap: null,
+      finalizing: [],
       missingAfterExpiryChecks: 0,
       lastExpiryAbsenceAt: null,
       lastError: null,
@@ -509,6 +587,7 @@ async function executeExitUnlocked(
     result.error = 'position is already exiting, closed, or unavailable'
     return result
   }
+  result.executionId = state.executionId
 
   const removeOutcome = await removePositionLiquidity(connection, wallet, state, result)
   if (removeOutcome === 'pending') return result
@@ -526,7 +605,7 @@ async function executeExitUnlocked(
   state.lastError = null
   persistExitState(state, 'swap_pending', { removeLiqSig: result.removeLiqSig })
   await new Promise<void>(resolve => { setTimeout(resolve, 1500) })
-  return settleExit(connection, wallet, state, result)
+  return settleExit(connection, wallet, state, result, false)
 }
 
 async function removePositionLiquidity(
@@ -584,24 +663,45 @@ async function removePositionLiquidity(
     if (removeTxs.length === 0) throw new Error('Meteora returned no remove-liquidity transaction')
 
     for (const tx of removeTxs) {
-      const signature = await sendTrackedTransaction(connection, wallet, tx, attempt => {
-        state.currentRemove = attempt
-        state.missingAfterExpiryChecks = 0
-        state.lastExpiryAbsenceAt = null
-        state.lastError = null
-        result.removeLiqSig = attempt.signature
-        persistExitState(state, 'pending_remove', { removeLiqSig: attempt.signature })
-      })
+      const signature = await sendTrackedTransaction(
+        connection,
+        wallet,
+        tx,
+        attempt => {
+          state.currentRemove = attempt
+          state.missingAfterExpiryChecks = 0
+          state.lastExpiryAbsenceAt = null
+          state.lastError = null
+          result.removeLiqSig = attempt.signature
+          persistExitState(state, 'pending_remove', { removeLiqSig: attempt.signature })
+        },
+        attempt => {
+          state.finalizing.push({
+            kind: 'remove',
+            attempt,
+            resumeStage: 'pending_remove',
+            confirmedAt: Date.now(),
+          })
+          state.stage = 'finalizing'
+          result.removeLiqSig = attempt.signature
+          persistExitState(state, 'removed', { removeLiqSig: attempt.signature })
+        },
+      )
       state.removeSignatures.push(signature)
       state.currentRemove = null
       state.missingAfterExpiryChecks = 0
       state.lastExpiryAbsenceAt = null
       result.removeLiqSig = signature
-      persistExitState(state, 'pending_remove', { removeLiqSig: signature })
+      persistExitState(state, state.finalizing.length > 0 ? 'removed' : 'pending_remove', { removeLiqSig: signature })
       console.log(`[exit] remove liq tx: ${signature}`)
     }
     result.removeSucceeded = true
     result.rentRefundSol = state.rentRefundSol
+    if (state.finalizing.length > 0) {
+      result.pendingRecovery = true
+      result.error = 'remove liquidity confirmed; waiting for finality reconciliation'
+      return 'pending'
+    }
     return 'removed'
   } catch (err) {
     const message = `remove liquidity failed: ${err instanceof Error ? err.message : 'unknown'}`
@@ -630,16 +730,26 @@ async function settleExit(
   wallet: Keypair,
   state: ExitPendingState,
   result: ExitResult,
+  queueCompletionNotification: boolean,
 ): Promise<ExitResult> {
   result.removeSucceeded = true
   result.rentRefundSol = state.rentRefundSol
   result.removeLiqSig = state.removeSignatures.at(-1) || state.currentRemove?.signature || null
-  result.swapSig = state.swapSignatures.at(-1) || state.currentSwap?.signature || null
+  result.swapSig = state.swapSignatures.at(-1)
+    || state.currentSwap?.signature
+    || state.finalizing.find(finalizing => finalizing.kind === 'swap')?.attempt.signature
+    || null
   const quoteIsUsdc = state.quoteCurrency === 'USDC'
   const swapTarget = quoteIsUsdc ? USDC_MINT : undefined
   const targetLabel = quoteIsUsdc ? 'USDC' : 'SOL'
 
   try {
+    if (state.finalizing.length > 0) {
+      const finalizing = state.finalizing[0]
+      result.pendingRecovery = true
+      result.error = `${finalizing.kind} ${finalizing.attempt.signature} is pending finality reconciliation`
+      return result
+    }
     if (state.currentSwap) {
       result.pendingRecovery = true
       result.error = `swap ${state.currentSwap.signature} is pending final reconciliation`
@@ -670,6 +780,20 @@ async function settleExit(
           },
           (signature, status) => {
             if (state.currentSwap?.signature !== signature) return
+            if (status === 'confirmed') {
+              const attempt = state.currentSwap
+              state.finalizing.push({
+                kind: 'swap',
+                attempt,
+                resumeStage: 'swap_pending',
+                confirmedAt: Date.now(),
+              })
+              state.currentSwap = null
+              state.stage = 'finalizing'
+              state.lastError = null
+              persistExitState(state, 'swap_pending', { swapSig: signature })
+              return
+            }
             if (status === 'finalized' && !state.swapSignatures.includes(signature)) state.swapSignatures.push(signature)
             state.currentSwap = null
             state.lastError = status === 'failed' ? `swap ${signature} failed on-chain` : null
@@ -679,6 +803,12 @@ async function settleExit(
         if (swapResult && !swapResult.confirmed) {
           result.pendingRecovery = true
           result.error = `swap ${swapResult.signature} is pending final reconciliation`
+          return result
+        }
+        const pendingFinalizing = state.finalizing[0]
+        if (pendingFinalizing) {
+          result.pendingRecovery = true
+          result.error = `swap ${pendingFinalizing.attempt.signature} confirmed; waiting for finality reconciliation`
           return result
         }
         if (!swapResult) await new Promise<void>(resolve => { setTimeout(resolve, 2_000) })
@@ -713,7 +843,7 @@ async function settleExit(
       finalSolReceived: result.solReceived,
       finalQuoteReceived: quoteReceived,
       errorMessage: null,
-    })
+    }, queueCompletionNotification)
     result.success = true
     result.pendingRecovery = false
     console.log(`[exit] completed, received ${quoteIsUsdc ? `${result.usdcReceived.toFixed(2)} USDC` : `${result.solReceived.toFixed(6)} SOL`}`)
@@ -728,22 +858,72 @@ async function settleExit(
   return result
 }
 
+async function reconcileFinalizingAttempt(
+  connection: Connection,
+  state: ExitPendingState,
+  finalizing: FinalizingExitAttempt,
+): Promise<'finalized' | 'failed' | 'review' | 'pending'> {
+  const deadlineReached = () => Date.now() - finalizing.confirmedAt >= config.exitFinalityReviewTimeoutMs
+  if (deadlineReached()) return 'review'
+
+  if (finalizing.kind === 'remove') {
+    try {
+      const account = await withRpcTimeout(
+        connection.getAccountInfo(new PublicKey(state.positionPubkey), 'finalized'),
+        RECONCILIATION_PROBE_TIMEOUT_MS,
+      )
+      if (!account) return 'finalized'
+    } catch {
+      return deadlineReached() ? 'review' : 'pending'
+    }
+  }
+
+  let status
+  try {
+    status = await withRpcTimeout(
+      connection.getSignatureStatus(finalizing.attempt.signature, { searchTransactionHistory: true }),
+      RECONCILIATION_PROBE_TIMEOUT_MS,
+    )
+  } catch {
+    return deadlineReached() ? 'review' : 'pending'
+  }
+  if (status.value?.err) return 'failed'
+  if (status.value?.confirmationStatus === 'finalized') return 'finalized'
+  if (deadlineReached()) return 'review'
+  return 'pending'
+}
+
+async function withRpcTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: NodeJS.Timeout | undefined
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`RPC probe timeout (${timeoutMs}ms)`)), timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
 async function reconcileSignedAttempt(
   connection: Connection,
   state: ExitPendingState,
   attempt: SignedRemoveAttempt | SignedSwapAttempt,
   kind: 'remove' | 'swap',
-): Promise<'succeeded' | 'finalized_failed' | 'expired' | 'pending'> {
+): Promise<'succeeded' | 'confirmed' | 'finalized_failed' | 'expired' | 'pending'> {
   if (kind === 'remove') {
     const account = await connection.getAccountInfo(new PublicKey(state.positionPubkey), 'finalized')
     if (!account) return 'succeeded'
   }
 
   const status = await connection.getSignatureStatus(attempt.signature, { searchTransactionHistory: true })
+  if (status.value?.err) return 'finalized_failed'
   if (status.value?.confirmationStatus === 'finalized') {
-    return status.value.err ? 'finalized_failed' : 'succeeded'
+    return 'succeeded'
   }
-  if (status.value) return 'pending'
+  if (status.value?.confirmationStatus === 'confirmed') return 'confirmed'
 
   const blockHeight = await connection.getBlockHeight('confirmed')
   if (blockHeight > attempt.lastValidBlockHeight) {
@@ -754,7 +934,7 @@ async function reconcileSignedAttempt(
       state.missingAfterExpiryChecks++
       state.lastExpiryAbsenceAt = now
       state.lastError = `${kind} signature absent after blockhash expiry`
-      persistExitState(state, state.stage, { errorMessage: state.lastError })
+      persistExitState(state, executionStatusForState(state), { errorMessage: state.lastError })
     }
     return state.missingAfterExpiryChecks >= EXPIRED_ABSENCE_CHECKS ? 'expired' : 'pending'
   }
@@ -778,8 +958,8 @@ async function reconcilePendingExitsUnlocked(connection: Connection, wallet: Key
         console.log(`[exit] pending position ${state.positionPubkey.slice(0, 8)} belongs to a different wallet`)
         continue
       }
-      const storedVersion = (JSON.parse(row.value) as { version?: number }).version
-      if (storedVersion !== 3) {
+      const stored = JSON.parse(row.value) as { version?: number; finalizing?: unknown }
+      if (stored.version !== 4 || !Array.isArray(stored.finalizing)) {
         const migrated = getDb().prepare(`
           UPDATE sync_state SET value = ?, updated_at = ? WHERE key = ? AND value = ?
         `).run(JSON.stringify(state), Date.now(), row.key, row.value)
@@ -790,25 +970,107 @@ async function reconcilePendingExitsUnlocked(connection: Connection, wallet: Key
       const result: ExitResult = {
         success: false,
         pendingRecovery: false,
-        removeSucceeded: state.stage === 'swap_pending',
+        executionId: state.executionId,
+        removeSucceeded: state.stage !== 'pending_remove',
         solReceived: 0,
         usdcReceived: 0,
         rentRefundSol: state.rentRefundSol,
         removeLiqSig: state.removeSignatures.at(-1) || state.currentRemove?.signature || null,
-        swapSig: state.swapSignatures.at(-1) || state.currentSwap?.signature || null,
+        swapSig: state.swapSignatures.at(-1)
+          || state.currentSwap?.signature
+          || state.finalizing.find(finalizing => finalizing.kind === 'swap')?.attempt.signature
+          || null,
+      }
+
+      if (state.finalizing.length > 0) {
+        const finalizingAttempts = [...state.finalizing]
+        const outcomes: Array<'finalized' | 'failed' | 'review' | 'pending'> = []
+        for (const finalizing of finalizingAttempts) {
+          const outcome = await reconcileFinalizingAttempt(connection, state, finalizing)
+          if (outcome === 'pending') continue
+          outcomes.push(outcome)
+        }
+        if (outcomes.length !== finalizingAttempts.length) continue
+
+        const review = outcomes.find(outcome => outcome === 'review')
+        const failedRemove = finalizingAttempts.find((finalizing, index) =>
+          finalizing.kind === 'remove' && outcomes[index] === 'failed'
+        )
+        const failedSwap = finalizingAttempts.find((finalizing, index) =>
+          finalizing.kind === 'swap' && outcomes[index] === 'failed'
+        )
+        if (review || failedRemove) {
+          const unresolved = review
+            ? finalizingAttempts.find((finalizing, index) => outcomes[index] === 'review')!
+            : failedRemove!
+          const message = review
+            ? `${unresolved.kind} ${unresolved.attempt.signature} did not reach finalized before the review deadline`
+            : `${unresolved.kind} ${unresolved.attempt.signature} failed on-chain after confirmation`
+          finishExit(state, 'failed', 'error', {
+            removeLiqSig: unresolved.kind === 'remove' ? unresolved.attempt.signature : result.removeLiqSig,
+            swapSig: unresolved.kind === 'swap' ? unresolved.attempt.signature : result.swapSig,
+            errorMessage: message,
+          })
+          console.log(`[exit] ${message}; position requires manual review`)
+          continue
+        }
+
+        state.finalizing = []
+        state.stage = state.currentRemove
+          ? 'pending_remove'
+          : finalizingAttempts.at(-1)!.resumeStage
+        state.lastError = failedSwap
+          ? `swap ${failedSwap.attempt.signature} failed on-chain after confirmation; retrying attributed balance`
+          : null
+        for (const finalizing of finalizingAttempts) {
+          if (outcomes[finalizingAttempts.indexOf(finalizing)] !== 'finalized') continue
+          if (finalizing.kind === 'remove' && !state.removeSignatures.includes(finalizing.attempt.signature)) {
+            state.removeSignatures.push(finalizing.attempt.signature)
+          }
+          if (finalizing.kind === 'swap' && !state.swapSignatures.includes(finalizing.attempt.signature)) {
+            state.swapSignatures.push(finalizing.attempt.signature)
+          }
+          console.log(`[exit-timing] ${finalizing.kind} ${finalizing.attempt.signature.slice(0, 8)} ${outcomes[finalizingAttempts.indexOf(finalizing)]} after ${Date.now() - finalizing.confirmedAt}ms`)
+        }
+        const finalizingStatus: ExitStatus = finalizingAttempts.some(finalizing => finalizing.kind === 'remove')
+          && !finalizingAttempts.some(finalizing => finalizing.kind === 'swap')
+          && !failedSwap
+          ? 'removed'
+          : 'swap_pending'
+        persistExitState(state, finalizingStatus, {
+          removeLiqSig: finalizingAttempts.find(finalizing => finalizing.kind === 'remove')?.attempt.signature,
+          swapSig: finalizingAttempts.find(finalizing => finalizing.kind === 'swap')?.attempt.signature,
+          errorMessage: state.lastError,
+        })
       }
 
       if (state.currentRemove) {
         const current = state.currentRemove
         const outcome = await reconcileSignedAttempt(connection, state, current, 'remove')
         if (outcome === 'pending') continue
-        if (outcome === 'succeeded' && !state.removeSignatures.includes(current.signature)) {
+        if ((outcome === 'succeeded' || outcome === 'confirmed') && !state.removeSignatures.includes(current.signature)) {
           state.removeSignatures.push(current.signature)
         }
         state.currentRemove = null
         state.missingAfterExpiryChecks = 0
         state.lastExpiryAbsenceAt = null
-        state.lastError = outcome === 'succeeded' ? null : `remove ${current.signature} ${outcome === 'expired' ? 'expired without a final status' : 'failed on-chain'}`
+        state.lastError = outcome === 'succeeded' || outcome === 'confirmed'
+          ? null
+          : `remove ${current.signature} ${outcome === 'expired' ? 'expired without a final status' : 'failed on-chain'}`
+        if (outcome === 'confirmed') {
+          state.finalizing.push({
+            kind: 'remove',
+            attempt: current,
+            resumeStage: 'pending_remove',
+            confirmedAt: Date.now(),
+          })
+          state.stage = 'finalizing'
+          persistExitState(state, 'removed', {
+            removeLiqSig: current.signature,
+            errorMessage: null,
+          })
+          continue
+        }
         persistExitState(state, 'pending_remove', {
           removeLiqSig: current.signature,
           errorMessage: state.lastError,
@@ -852,6 +1114,18 @@ async function reconcilePendingExitsUnlocked(connection: Connection, wallet: Key
         state.currentSwap = null
         state.missingAfterExpiryChecks = 0
         state.lastExpiryAbsenceAt = null
+        if (outcome === 'confirmed') {
+          state.finalizing.push({
+            kind: 'swap',
+            attempt: current,
+            resumeStage: 'swap_pending',
+            confirmedAt: Date.now(),
+          })
+          state.stage = 'finalizing'
+          state.lastError = null
+          persistExitState(state, 'swap_pending', { swapSig: current.signature })
+          continue
+        }
         state.lastError = outcome === 'succeeded' ? null : `swap ${current.signature} failed or expired; retrying attributed balance`
         persistExitState(state, 'swap_pending', {
           swapSig: current.signature,
@@ -859,12 +1133,12 @@ async function reconcilePendingExitsUnlocked(connection: Connection, wallet: Key
         })
       }
 
-      await settleExit(connection, wallet, state, result)
+      await settleExit(connection, wallet, state, result, true)
     } catch (err) {
       const message = err instanceof Error ? err.message : 'unknown'
       if (state) {
         state.lastError = `exit reconciliation failed: ${message}`
-        try { persistExitState(state, state.stage, { errorMessage: state.lastError }) } catch { /* Keep prior state. */ }
+        try { persistExitState(state, executionStatusForState(state), { errorMessage: state.lastError }) } catch { /* Keep prior state. */ }
       }
       console.log(`[exit] reconciliation failed: ${message}`)
     }

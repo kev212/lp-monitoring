@@ -5,7 +5,7 @@ import { getPriceOfBinByBinId } from '@meteora-ag/dlmm'
 import { config } from '../config.js'
 import { deleteSyncValue, getSyncValue, setSyncValue } from '../db/client.js'
 import { loadKnownPositions } from '../meteora/discovery.js'
-import { executeExit } from '../meteora/exit.js'
+import { acknowledgeExitCompletionNotification, executeExit } from '../meteora/exit.js'
 import {
   executeOpenPosition,
   inspectOpenPool,
@@ -607,6 +607,7 @@ class TelegramDashboardController {
       if (!result.success) throw new Error(result.error || 'Manual close failed')
       const received = position.quoteCurrency === 'USDC' ? result.usdcReceived : result.solReceived
       await this.bot.sendMessage(chatId, `Manual close selesai. Received ${formatQuote(received, position.quoteCurrency)}\nRemove: ${result.removeLiqSig || '-'}\nSwap: ${result.swapSig || 'none'}`)
+      if (result.executionId !== null) acknowledgeExitCompletionNotification(result.executionId)
     } catch (err) {
       await this.bot.sendMessage(chatId, `Manual close gagal: ${errorMessage(err)}`)
     }

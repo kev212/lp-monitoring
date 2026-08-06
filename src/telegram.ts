@@ -1,7 +1,7 @@
 import TelegramBot from 'node-telegram-bot-api'
 import { config } from './config.js'
 import { loadActivePositions, updateFlipModeEnabled, updatePrecisionCurveEnabled, updatePrecisionCurveThreshold } from './meteora/discovery.js'
-import type { GlobalRiskSettings, QuoteCurrency } from './types.js'
+import type { ExitCompletionNotification, GlobalRiskSettings, QuoteCurrency } from './types.js'
 import { setupTelegramControl } from './telegram/control.js'
 
 let _bot: TelegramBot | null = null
@@ -30,15 +30,23 @@ function getBot(): TelegramBot | null {
 }
 
 export function sendNotification(message: string): void {
-  const bot = getBot()
-  if (!bot || !config.telegramChatId) return
+  void sendNotificationAsync(message)
+}
 
-  bot.sendMessage(config.telegramChatId, message, {
-    parse_mode: 'HTML',
-    disable_web_page_preview: true,
-  }).catch(err => {
-    console.log(`[telegram] send failed: ${err.message}`)
-  })
+export async function sendNotificationAsync(message: string): Promise<boolean> {
+  const bot = getBot()
+  if (!bot || !config.telegramChatId) return false
+
+  try {
+    await bot.sendMessage(config.telegramChatId, message, {
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+    })
+    return true
+  } catch (err) {
+    console.log(`[telegram] send failed: ${err instanceof Error ? err.message : String(err)}`)
+    return false
+  }
 }
 
 function isAllowedChat(chatId: number | string, userId: number | string | undefined): boolean {
@@ -526,6 +534,24 @@ export function formatExitSuccess(
     swapSig ? `Swap: ${solscanTx(swapSig)}` : 'Swap: <i>none (quote-only)</i>',
     sep(),
     `Wallet: ${solscanAddr(wallet)} · ${gmgnWallet(wallet)}`,
+  ].filter(Boolean).join('\n')
+}
+
+export function formatExitReconciled(notification: ExitCompletionNotification): string {
+  return [
+    `✅ <b>Exit Complete — Reconciled</b>`,
+    sep(),
+    `<b>${notification.pair}</b>`,
+    `Position: <code>${shortAddr(notification.positionPubkey)}</code>`,
+    `Trigger: <b>${notification.triggerType}</b>`,
+    sep(),
+    `Received: <b>${formatQuoteValue(notification.receivedQuote, notification.quoteCurrency)}</b>`,
+    notification.rentRefundSol > 0 ? `Rent refund: ${formatQuoteValue(notification.rentRefundSol, 'SOL')}` : null,
+    sep(),
+    `Remove: ${solscanTx(notification.removeLiqSig || '')}`,
+    notification.swapSig ? `Swap: ${solscanTx(notification.swapSig)}` : 'Swap: <i>none (quote-only)</i>',
+    sep(),
+    `Final transaction state was confirmed by background reconciliation.`,
   ].filter(Boolean).join('\n')
 }
 

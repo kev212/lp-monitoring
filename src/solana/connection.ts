@@ -7,7 +7,10 @@ let _activeIsPrimary = true
 
 function getPrimaryConnection(): Connection {
   if (!_primary) {
-    _primary = new Connection(config.solanaRpcUrl, 'confirmed')
+    _primary = new Connection(config.solanaRpcUrl, {
+      commitment: 'confirmed',
+      ...(config.solanaWsUrl ? { wsEndpoint: config.solanaWsUrl } : {}),
+    })
   }
   return _primary
 }
@@ -25,7 +28,7 @@ export function getConnection(): Connection {
   return _activeIsPrimary ? primary : (fallback ?? primary)
 }
 
-/** Read valuation state from the public RPC first, then retry Helius on an RPC error. */
+/** Read valuation state from the primary RPC first, then retry the fallback on an RPC error. */
 export async function withValuationFallback<T>(fn: (connection: Connection) => Promise<T>): Promise<T> {
   try {
     return await fn(getPrimaryConnection())
@@ -34,7 +37,7 @@ export async function withValuationFallback<T>(fn: (connection: Connection) => P
     if (err instanceof Error && /account .* not found/i.test(err.message)) throw err
     const fallback = getFallbackConnection()
     if (!fallback) throw err
-    console.log(`[connection] public valuation RPC failed (${err instanceof Error ? err.message : 'unknown'}), retrying Helius`)
+    console.log(`[connection] primary valuation RPC failed (${err instanceof Error ? err.message : 'unknown'}), retrying fallback`)
     return await fn(fallback)
   }
 }

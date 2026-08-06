@@ -28,6 +28,7 @@ if (!Number.isInteger(openMaxPriceMoveBins) || openMaxPriceMoveBins < 1 || openM
 
 export const config: Config = {
   solanaRpcUrl: envStr('SOLANA_RPC_URL', 'https://api.mainnet-beta.solana.com'),
+  solanaWsUrl: envStr('SOLANA_WS_URL'),
   solanaRpcFallbackUrl: envStr('SOLANA_RPC_FALLBACK_URL'),
   solanaPrivateKey: envStr('SOLANA_PRIVATE_KEY'),
   jupiterApiKey: envStr('JUPITER_API_KEY'),
@@ -44,6 +45,10 @@ export const config: Config = {
   maxRetries: envNum('MAX_RETRIES', 3),
   exitCooldownMs: envNum('EXIT_COOLDOWN_MS', 15000),
   maxSwapSlippageBps: envNum('MAX_SWAP_SLIPPAGE_BPS', 300),
+  removeConfirmTimeoutMs: envNum('REMOVE_CONFIRM_TIMEOUT_MS', 10_000),
+  swapConfirmTimeoutMs: envNum('SWAP_CONFIRM_TIMEOUT_MS', 5_000),
+  exitRecoveryPollMs: envNum('EXIT_RECOVERY_POLL_MS', 2_000),
+  exitFinalityReviewTimeoutMs: envNum('EXIT_FINALITY_REVIEW_TIMEOUT_MS', 60_000),
   trailingActivationPct: envNum('TRAILING_ACTIVATION_PCT', 3),
   trailingStopDropPct: envNum('TRAILING_STOP_DROP_PCT', 1),
   recheckDelayMs: envNum('RECHECK_DELAY_MS', 3000),

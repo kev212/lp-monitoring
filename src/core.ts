@@ -34,7 +34,12 @@ import {
 } from './meteora/positions.js'
 import { clearPnlCache, estimateExitValue, getQuoteCurrency, type ValuationResult } from './meteora/valuation.js'
 import { fetchLpAgentPositions, type LpAgentPosition } from './lpagent.js'
-import { executeExit, reconcilePendingExits } from './meteora/exit.js'
+import {
+  acknowledgeExitCompletionNotification,
+  executeExit,
+  listPendingExitNotifications,
+  reconcilePendingExits,
+} from './meteora/exit.js'
 import { reconcilePendingOpens } from './meteora/open.js'
 import { executeDirectionalPrecisionCurve, THRESHOLD_RATIO, THRESHOLD_MIN, RECOVERY_MS } from './meteora/precisionCurve.js'
 import { calculateFlipProgressPct, executeFlipMode, retryPendingFlipAdd } from './meteora/flipMode.js'
@@ -42,9 +47,11 @@ import { evaluateTrigger, type BinData } from './risk/rules.js'
 import { getRiskSettings } from './risk/settings.js'
 import {
   sendNotification,
+  sendNotificationAsync,
   formatPositionDiscovered,
   formatExitStarted,
   formatExitSuccess,
+  formatExitReconciled,
   formatExitFailed,
   formatBotStart,
   formatBotStop,
@@ -75,6 +82,7 @@ const TRAILING_FAST_POLL_MS = 1_000
 const TRAILING_RECHECK_DELAY_MS = 1_500
 let lastLpAgentGuardAt = 0
 const lastProcessedValuationAt = new Map<string, number>()
+let lastExitRecoveryAt = 0
 
 function lpAgentPnl(position: LpAgentPosition): number {
   return position.pnlPercentNative
@@ -93,6 +101,13 @@ function formatQuoteLog(value: number, quoteCurrency: QuoteCurrency): string {
     : `${value.toFixed(6)} SOL`
 }
 
+async function flushExitCompletionNotifications(): Promise<void> {
+  for (const notification of listPendingExitNotifications()) {
+    const delivered = await sendNotificationAsync(formatExitReconciled(notification))
+    if (delivered) acknowledgeExitCompletionNotification(notification.executionId)
+  }
+}
+
 export async function startBot(): Promise<void> {
   console.log('[app] starting monitoring-lp...')
   running = true
@@ -106,7 +121,9 @@ export async function startBot(): Promise<void> {
   const reshapeRecovery = await reconcileDurableReshapeOperation(getConnection(), ownerStr)
   if (reshapeRecovery === 'review') console.log('[reshape] recovered transaction requires manual position review')
   await reconcilePendingExits(getConnection(), wallet)
+  await flushExitCompletionNotifications()
   await reconcilePendingOpens(getConnection())
+  lastExitRecoveryAt = Date.now()
   const riskSettings = getRiskSettings()
   sendNotification(formatBotStart(walletPubkey.toBase58(), 0, riskSettings))
   // Balance will be fetched in first cycle
@@ -117,6 +134,13 @@ export async function startBot(): Promise<void> {
 
   while (running) {
     try {
+      const loopNow = Date.now()
+      if (loopNow - lastExitRecoveryAt >= config.exitRecoveryPollMs) {
+        lastExitRecoveryAt = loopNow
+        await reconcilePendingExits(getConnection(), wallet)
+        await flushExitCompletionNotifications()
+      }
+
       // Periodic discovery — every 5 menit
       const now = Date.now()
       if (now - lastDiscoveryTime >= DISCOVERY_INTERVAL_MS) {
@@ -126,7 +150,6 @@ export async function startBot(): Promise<void> {
         if (reshapeRecovery === 'review') {
           sendNotification('🚨 <b>Reshape Recovery Requires Review</b>\n\nA finalized partial Flip/Precision transaction was recovered after restart. The position was marked error to prevent duplicate wallet mutations.')
         }
-        await reconcilePendingExits(getConnection(), wallet)
         await reconcilePendingOpens(getConnection())
         await discoverInitialPositions(getConnection(), walletPubkey, ownerStr)
       }
@@ -136,7 +159,8 @@ export async function startBot(): Promise<void> {
       if (activePositions.length === 0) {
         // Gak ada posisi → tidur sampe discovery berikutnya
         const nextDiscovery = DISCOVERY_INTERVAL_MS - (Date.now() - lastDiscoveryTime)
-        await sleep(Math.max(nextDiscovery, 5_000))
+        const nextExitRecovery = config.exitRecoveryPollMs - (Date.now() - lastExitRecoveryAt)
+        await sleep(Math.max(Math.min(nextDiscovery, nextExitRecovery), 500))
         continue
       }
 
@@ -717,7 +741,7 @@ async function monitorSinglePosition(
         const finalPnl = pos.basisQuote > 0
           ? (finalPnlValue / pos.basisQuote) * 100
           : 0
-        sendNotification(
+        const delivered = await sendNotificationAsync(
           formatExitSuccess(
             pos.positionPubkey, received, finalPnl, finalPnlValue,
             rentRefund,
@@ -727,6 +751,9 @@ async function monitorSinglePosition(
             pos.poolPubkey, exitValuation.solUsdPrice, ownerStr, pos.quoteCurrency
           )
         )
+        if (delivered && result.executionId !== null) {
+          acknowledgeExitCompletionNotification(result.executionId)
+        }
       } else if (result.pendingRecovery) {
         sendNotification(
           `⏳ <b>Exit Pending Reconciliation</b>\n\n` +
