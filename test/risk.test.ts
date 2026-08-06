@@ -40,6 +40,20 @@ test('inverts bin prices for a quote-X position and formats USDC as dollars', ()
   assert.equal(display.prices, '$0.125 – $0.5 · $0.25')
 })
 
+test('keeps a sub-90 percent marker off the final bar slot', () => {
+  const display = buildBinRangeDisplay({
+    lowerBinId: 0,
+    activeBinId: 88,
+    upperBinId: 100,
+    quoteSide: 'Y',
+    quoteCurrency: 'SOL',
+    priceForBin: () => 1,
+  })
+
+  assert.equal(display.progressPct, 88)
+  assert.equal(display.bar, '━━━━━━━━│━ 88%')
+})
+
 test('formats approximate PnL in USD for SOL and USDC quotes', () => {
   assert.equal(formatPnlUsd({ quoteCurrency: 'SOL', pnlQuote: 0.02, solUsdPrice: 50 }), '~$1')
   assert.equal(formatPnlUsd({ quoteCurrency: 'SOL', pnlQuote: -0.02, solUsdPrice: 50 }), '~-$1')

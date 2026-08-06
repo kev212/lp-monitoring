@@ -49,7 +49,9 @@ export function buildBinRangeDisplay(input: BinRangeDisplayInput): BinRangeDispl
   const progressPct = Number.isFinite(lowerBin) && Number.isFinite(upperBin) && Number.isFinite(input.activeBinId) && upperBin > lowerBin
     ? Math.max(0, Math.min(100, Math.round(((input.activeBinId - lowerBin) / (upperBin - lowerBin)) * 100)))
     : null
-  const cursor = progressPct === null ? 0 : Math.min(BIN_BAR_WIDTH - 1, Math.round(progressPct / 10))
+  const cursor = progressPct === null
+    ? 0
+    : Math.min(BIN_BAR_WIDTH - 1, Math.floor((progressPct * BIN_BAR_WIDTH) / 100))
   const bar = progressPct === null
     ? `${'━'.repeat(BIN_BAR_WIDTH)} N/A`
     : `${'━'.repeat(cursor)}│${'━'.repeat(BIN_BAR_WIDTH - cursor - 1)} ${progressPct}%`
