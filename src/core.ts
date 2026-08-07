@@ -118,6 +118,17 @@ async function flushExitCompletionNotifications(): Promise<void> {
   }
 }
 
+function notifyOpenReconcileFailures(summary: { failed: number }): void {
+  if (summary.failed <= 0) return
+  console.log(`[open] reconciliation failed ${summary.failed} open attempt(s)`)
+  sendNotification(
+    `⚠️ <b>Open Reconciliation Failed</b>\n\n` +
+    `${summary.failed} open attempt(s) did not finalize on-chain.\n` +
+    `The opening position was removed from the active list.\n` +
+    `Review the wallet before opening again.`
+  )
+}
+
 export async function startBot(): Promise<void> {
   console.log('[app] starting monitoring-lp...')
   running = true
@@ -132,7 +143,7 @@ export async function startBot(): Promise<void> {
   if (reshapeRecovery === 'review') console.log('[reshape] recovered transaction requires manual position review')
   await reconcilePendingExits(getConnection(), wallet)
   await flushExitCompletionNotifications()
-  await reconcilePendingOpens(getConnection())
+  notifyOpenReconcileFailures(await reconcilePendingOpens(getConnection()))
   await reconcilePendingRebalanceOpens(getConnection(), wallet)
   const pendingRebalancePositions = new Set(listRebalanceReopenIntents().map(intent => intent.positionPubkey))
   for (const position of loadKnownPositions().filter(p => p.rebalanceBusy && p.status === 'closed' && !pendingRebalancePositions.has(p.positionPubkey))) {
@@ -174,7 +185,7 @@ export async function startBot(): Promise<void> {
         if (reshapeRecovery === 'review') {
           sendNotification('🚨 <b>Reshape Recovery Requires Review</b>\n\nA finalized partial Flip/Precision transaction was recovered after restart. The position was marked error to prevent duplicate wallet mutations.')
         }
-        await reconcilePendingOpens(getConnection())
+        notifyOpenReconcileFailures(await reconcilePendingOpens(getConnection()))
         await discoverInitialPositions(getConnection(), walletPubkey, ownerStr)
       }
 
@@ -1195,6 +1206,7 @@ async function maybeRunAutoRebalance(
           quoteCurrency: pos.quoteCurrency,
           amountQuote: pos.basisQuote,
           rangeWidth,
+          inheritMode: pos.autoRebalanceEnabled,
         })
         console.log(`[rebalance] ${tokenLabel} | close confirmed — reopen will run once finality reconciliation completes`)
         sendNotification(

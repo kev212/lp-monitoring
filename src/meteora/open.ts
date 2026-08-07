@@ -24,6 +24,7 @@ const OPEN_ATTEMPT_PREFIX = 'open_attempt:'
 const DLMM_PROGRAM_ID = new PublicKey('LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo')
 const EXPIRED_ABSENCE_CHECKS = 2
 const EXPIRED_ABSENCE_MIN_INTERVAL_MS = 5_000
+const MAX_VERIFICATION_MISSING_CHECKS = 5
 
 export type OpenLiquidityStrategy = 'spot' | 'curve' | 'bidask'
 export type OpenQuoteSide = 'X' | 'Y'
@@ -87,6 +88,7 @@ interface OpenAttemptState {
   lastValidBlockHeight: number
   stage: PendingOpenStage | TerminalOpenStage
   missingAfterExpiryChecks: number
+  missingVerificationChecks: number
   lastExpiryAbsenceAt: number | null
   createdAt: number
   updatedAt: number
@@ -691,6 +693,7 @@ async function submitOpenPosition(
     lastValidBlockHeight: latest.lastValidBlockHeight,
     stage: 'prepared',
     missingAfterExpiryChecks: 0,
+    missingVerificationChecks: 0,
     lastExpiryAbsenceAt: null,
     createdAt: now,
     updatedAt: now,
@@ -809,7 +812,19 @@ export async function reconcilePendingOpens(connection: Connection): Promise<Ope
         pending = { ...pending, lastError: `non-final transaction error: ${JSON.stringify(status.value.err)}` }
         updatePendingOpen(pending)
       } else if (status.value.confirmationStatus === 'finalized') {
-        pending = { ...pending, stage: 'confirmed', lastError: 'finalized signature found but position verification is unavailable' }
+        const missingVerificationChecks = (pending.missingVerificationChecks || 0) + 1
+        if (missingVerificationChecks >= MAX_VERIFICATION_MISSING_CHECKS) {
+          finishOpenAttempt(pending, 'failed', 'finalized open signature but the position account never became visible; review the wallet before reopening')
+          summary.failed++
+          console.log(`[open] reconciled failed position ${pending.positionPubkey.slice(0, 8)}: finalized signature but account never visible`)
+          continue
+        }
+        pending = {
+          ...pending,
+          stage: 'confirmed',
+          missingVerificationChecks,
+          lastError: 'finalized signature found but position verification is unavailable',
+        }
         updatePendingOpen(pending)
       }
       summary.pending++

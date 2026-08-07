@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { buildRebalanceRange, decideRebalanceReopen, isOorAbove, rebalanceCloseDisposition, rebalanceTimerStatus } from '../src/meteora/rebalance.js'
+import { buildRebalanceRange, decideRebalanceOpenAttempt, isOorAbove, rebalanceCloseDisposition, rebalanceTimerStatus } from '../src/meteora/rebalance.js'
 
 const MINUTE = 60_000
 
@@ -32,13 +32,60 @@ test('builds the rebalance range anchored at the active bin with the original wi
 })
 
 test('defers the reopen while the close is still finalizing and aborts on close failure', () => {
-  assert.equal(decideRebalanceReopen('monitoring'), 'defer')
-  assert.equal(decideRebalanceReopen('exiting'), 'defer')
-  assert.equal(decideRebalanceReopen('discovering'), 'defer')
-  assert.equal(decideRebalanceReopen('closed'), 'reopen')
-  assert.equal(decideRebalanceReopen('error'), 'abort')
-  assert.equal(decideRebalanceReopen(undefined), 'abort')
-  assert.equal(decideRebalanceReopen('opening'), 'ignore')
+  assert.equal(decideRebalanceOpenAttempt({
+    intentHasOpenPosition: false,
+    pendingOpen: false,
+    oldPositionStatus: 'monitoring',
+    newPositionStatus: undefined,
+  }), 'defer')
+  assert.equal(decideRebalanceOpenAttempt({
+    intentHasOpenPosition: false,
+    pendingOpen: false,
+    oldPositionStatus: 'error',
+    newPositionStatus: undefined,
+  }), 'abort')
+  assert.equal(decideRebalanceOpenAttempt({
+    intentHasOpenPosition: false,
+    pendingOpen: false,
+    oldPositionStatus: undefined,
+    newPositionStatus: undefined,
+  }), 'abort')
+})
+
+test('never reopens once an open attempt produced a position', () => {
+  assert.equal(decideRebalanceOpenAttempt({
+    intentHasOpenPosition: true,
+    pendingOpen: false,
+    oldPositionStatus: 'closed',
+    newPositionStatus: 'monitoring',
+  }), 'complete')
+  assert.equal(decideRebalanceOpenAttempt({
+    intentHasOpenPosition: true,
+    pendingOpen: true,
+    oldPositionStatus: 'closed',
+    newPositionStatus: 'opening',
+  }), 'defer')
+  assert.equal(decideRebalanceOpenAttempt({
+    intentHasOpenPosition: true,
+    pendingOpen: false,
+    oldPositionStatus: 'closed',
+    newPositionStatus: undefined,
+  }), 'abort')
+})
+
+test('executes a fresh reopen only when no attempt has been made yet', () => {
+  assert.equal(decideRebalanceOpenAttempt({
+    intentHasOpenPosition: false,
+    pendingOpen: false,
+    oldPositionStatus: 'closed',
+    newPositionStatus: undefined,
+  }), 'execute')
+  assert.equal(decideRebalanceOpenAttempt({
+    intentHasOpenPosition: false,
+    pendingOpen: true,
+    oldPositionStatus: 'closed',
+    newPositionStatus: undefined,
+  }), 'defer')
 })
 
 test('classifies a pending close as deferred even when success is false', () => {
