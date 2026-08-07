@@ -58,7 +58,7 @@ export const config: Config = {
   binRangeMaxDistance: envNum('BIN_RANGE_MAX_DISTANCE', 7),
   binRangeDistanceRatio: envNum('BIN_RANGE_DISTANCE_RATIO', 0.05),
   maxDrawdownThreshold: envNum('MAX_DRAWDOWN_THRESHOLD', -6),
-  maxDrawdownTpOverride: envNum('MAX_DRAWDOWN_TP_OVERRIDE', 2),
+  maxDrawdownTpOverride: envNum('MAX_DRAWDOWN_TP_OVERRIDE', 3),
   flipModeInitialTriggerPct: envNum('FLIP_MODE_INITIAL_TRIGGER_PCT', 40),
   flipModeRepeatStepPct: envNum('FLIP_MODE_REPEAT_STEP_PCT', 10),
   rebalanceOorMinutes: envNum('REBALANCE_OOR_MINUTES', 5),

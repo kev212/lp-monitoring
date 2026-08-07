@@ -104,12 +104,15 @@ test('validates global risk inputs', () => {
   assert.equal(parseRiskInput('tp', '8'), 8)
   assert.equal(parseRiskInput('trail_arm', '3'), 3)
   assert.equal(parseRiskInput('trail_drop', '1%'), 1)
+  assert.equal(parseRiskInput('dd_tp', '3'), 3)
   assert.equal(parseRiskInput('rebal_tp', '6'), 6)
   assert.equal(parseRiskInput('rebal_sl', '-10'), -10)
   assert.equal(parseRiskInput('sl', '12'), null)
   assert.equal(parseRiskInput('tp', '1e2'), null)
   assert.equal(parseRiskInput('rebal_tp', '0'), null)
   assert.equal(parseRiskInput('rebal_tp', '1500'), null)
+  assert.equal(parseRiskInput('dd_tp', '0'), null)
+  assert.equal(parseRiskInput('dd_tp', '1500'), null)
   assert.equal(parseRiskInput('rebal_sl', '5'), null)
   assert.equal(parseRiskInput('rebal_sl', '-150'), null)
   assert.throws(() => validateRiskSettings({
@@ -118,6 +121,7 @@ test('validates global risk inputs', () => {
     trailingEnabled: true,
     trailingActivationPct: 1,
     trailingStopDropPct: 1,
+    ddLockTpPercent: 3,
     rebalanceTpPercent: null,
     rebalanceSlPercent: null,
   }))
@@ -127,6 +131,7 @@ test('validates global risk inputs', () => {
     trailingEnabled: true,
     trailingActivationPct: 1,
     trailingStopDropPct: 1,
+    ddLockTpPercent: 3,
     rebalanceTpPercent: 5,
     rebalanceSlPercent: 3,
   }))
@@ -139,6 +144,7 @@ test('applies rebalance TP/SL only to Auto Rebalance positions with global fallb
     trailingEnabled: true,
     trailingActivationPct: 3,
     trailingStopDropPct: 1,
+    ddLockTpPercent: 3,
     rebalanceTpPercent: 3,
     rebalanceSlPercent: -10,
     revision: 1,
@@ -171,6 +177,7 @@ test('excludes BIN_RANGE close for Auto Rebalance positions', () => {
     trailingEnabled: false,
     trailingActivationPct: 3,
     trailingStopDropPct: 1,
+    ddLockTpPercent: 3,
     revision: 1,
     updatedAt: 1,
   }
@@ -197,6 +204,7 @@ test('trailing remains eligible when bin-range distance is outside its window', 
     trailingEnabled: true,
     trailingActivationPct: 3,
     trailingStopDropPct: 1,
+    ddLockTpPercent: 3,
     rebalanceTpPercent: null,
     rebalanceSlPercent: null,
     revision: 1,
@@ -221,6 +229,7 @@ test('disabled trailing cannot trigger', () => {
     trailingEnabled: false,
     trailingActivationPct: 3,
     trailingStopDropPct: 1,
+    ddLockTpPercent: 3,
     rebalanceTpPercent: null,
     rebalanceSlPercent: null,
     revision: 1,
@@ -228,4 +237,28 @@ test('disabled trailing cannot trigger', () => {
   }, false)
 
   assert.equal(decision.shouldTrigger, false)
+})
+
+test('uses configurable DD lock TP instead of the global TP', () => {
+  const decision = evaluateTrigger({
+    status: 'monitoring',
+    drawdownTpOverrideActive: true,
+    trailingActivated: false,
+    peakPnlPercent: 0,
+    triggerConfirmations: 0,
+  } as PositionRow, 3, undefined, {
+    slPercent: -20,
+    tpPercent: 20,
+    trailingEnabled: false,
+    trailingActivationPct: 3,
+    trailingStopDropPct: 1,
+    ddLockTpPercent: 3,
+    rebalanceTpPercent: null,
+    rebalanceSlPercent: null,
+    revision: 1,
+    updatedAt: 1,
+  }, false)
+
+  assert.equal(decision.shouldTrigger, true)
+  assert.equal(decision.triggerType, 'TP')
 })

@@ -8,6 +8,7 @@ export interface RiskSettingsPatch {
   trailingEnabled?: boolean
   trailingActivationPct?: number
   trailingStopDropPct?: number
+  ddLockTpPercent?: number
   rebalanceTpPercent?: number | null
   rebalanceSlPercent?: number | null
 }
@@ -24,6 +25,7 @@ export function defaultRiskSettings(): Omit<GlobalRiskSettings, 'revision' | 'up
     trailingEnabled: true,
     trailingActivationPct: config.trailingActivationPct,
     trailingStopDropPct: config.trailingStopDropPct,
+    ddLockTpPercent: config.maxDrawdownTpOverride,
     rebalanceTpPercent: null,
     rebalanceSlPercent: null,
   }
@@ -41,6 +43,9 @@ export function validateRiskSettings(settings: Omit<GlobalRiskSettings, 'revisio
   }
   if (!Number.isFinite(settings.trailingStopDropPct) || settings.trailingStopDropPct <= 0 || settings.trailingStopDropPct >= settings.trailingActivationPct) {
     throw new Error('Trailing drop must be positive and lower than the trailing arm')
+  }
+  if (!Number.isFinite(settings.ddLockTpPercent) || settings.ddLockTpPercent <= 0 || settings.ddLockTpPercent > 1000) {
+    throw new Error('DD Lock Take Profit must be greater than 0% and at most 1000%')
   }
   if (settings.rebalanceTpPercent !== null) {
     if (!Number.isFinite(settings.rebalanceTpPercent) || settings.rebalanceTpPercent <= 0 || settings.rebalanceTpPercent > 1000) {
@@ -61,6 +66,7 @@ function rowToRiskSettings(row: any): GlobalRiskSettings {
     trailingEnabled: row.trailing_enabled === 1,
     trailingActivationPct: Number(row.trailing_activation_pct),
     trailingStopDropPct: Number(row.trailing_stop_drop_pct),
+    ddLockTpPercent: Number(row.dd_lock_tp_percent),
     rebalanceTpPercent: row.rebalance_tp_percent === null || row.rebalance_tp_percent === undefined
       ? null
       : Number(row.rebalance_tp_percent),
@@ -86,14 +92,15 @@ function ensureRiskSettings(): GlobalRiskSettings {
     const inserted = db.prepare(`
       INSERT OR IGNORE INTO risk_settings
         (id, sl_percent, tp_percent, trailing_enabled, trailing_activation_pct, trailing_stop_drop_pct,
-         rebalance_tp_percent, rebalance_sl_percent, revision, updated_at)
-      VALUES (1, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+         dd_lock_tp_percent, rebalance_tp_percent, rebalance_sl_percent, revision, updated_at)
+      VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
     `).run(
       defaults.slPercent,
       defaults.tpPercent,
       defaults.trailingEnabled ? 1 : 0,
       defaults.trailingActivationPct,
       defaults.trailingStopDropPct,
+      defaults.ddLockTpPercent,
       defaults.rebalanceTpPercent,
       defaults.rebalanceSlPercent,
       now,
@@ -118,6 +125,7 @@ export function riskSettingValue(settings: GlobalRiskSettings, field: RiskSettin
   if (field === 'tp') return settings.tpPercent
   if (field === 'trail_arm') return settings.trailingActivationPct
   if (field === 'trail_drop') return settings.trailingStopDropPct
+  if (field === 'dd_tp') return settings.ddLockTpPercent
   if (field === 'rebal_tp') return settings.rebalanceTpPercent
   if (field === 'rebal_sl') return settings.rebalanceSlPercent
   return settings.trailingEnabled
@@ -143,6 +151,7 @@ export function updateGlobalRiskSettings(patch: RiskSettingsPatch, actor: RiskSe
     trailingEnabled: patch.trailingEnabled ?? current.trailingEnabled,
     trailingActivationPct: patch.trailingActivationPct ?? current.trailingActivationPct,
     trailingStopDropPct: patch.trailingStopDropPct ?? current.trailingStopDropPct,
+    ddLockTpPercent: patch.ddLockTpPercent ?? current.ddLockTpPercent,
     rebalanceTpPercent: patch.rebalanceTpPercent === undefined ? current.rebalanceTpPercent : patch.rebalanceTpPercent,
     rebalanceSlPercent: patch.rebalanceSlPercent === undefined ? current.rebalanceSlPercent : patch.rebalanceSlPercent,
   }
@@ -153,6 +162,7 @@ export function updateGlobalRiskSettings(patch: RiskSettingsPatch, actor: RiskSe
     || current.trailingEnabled !== nextValues.trailingEnabled
     || current.trailingActivationPct !== nextValues.trailingActivationPct
     || current.trailingStopDropPct !== nextValues.trailingStopDropPct
+    || current.ddLockTpPercent !== nextValues.ddLockTpPercent
     || current.rebalanceTpPercent !== nextValues.rebalanceTpPercent
     || current.rebalanceSlPercent !== nextValues.rebalanceSlPercent
   if (!changed) return current
@@ -169,7 +179,7 @@ export function updateGlobalRiskSettings(patch: RiskSettingsPatch, actor: RiskSe
       UPDATE risk_settings
       SET sl_percent = ?, tp_percent = ?, trailing_enabled = ?,
           trailing_activation_pct = ?, trailing_stop_drop_pct = ?,
-          rebalance_tp_percent = ?, rebalance_sl_percent = ?,
+          dd_lock_tp_percent = ?, rebalance_tp_percent = ?, rebalance_sl_percent = ?,
           revision = ?, updated_at = ?
       WHERE id = 1 AND revision = ?
     `).run(
@@ -178,6 +188,7 @@ export function updateGlobalRiskSettings(patch: RiskSettingsPatch, actor: RiskSe
       nextValues.trailingEnabled ? 1 : 0,
       nextValues.trailingActivationPct,
       nextValues.trailingStopDropPct,
+      nextValues.ddLockTpPercent,
       nextValues.rebalanceTpPercent,
       nextValues.rebalanceSlPercent,
       nextRevision,

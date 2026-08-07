@@ -104,6 +104,7 @@ export function initSchema(db: Database.Database): void {
       trailing_enabled INTEGER NOT NULL DEFAULT 1,
       trailing_activation_pct REAL NOT NULL,
       trailing_stop_drop_pct REAL NOT NULL,
+      dd_lock_tp_percent REAL NOT NULL DEFAULT 3,
       rebalance_tp_percent REAL,
       rebalance_sl_percent REAL,
       revision INTEGER NOT NULL DEFAULT 0,
@@ -309,6 +310,10 @@ export function initSchema(db: Database.Database): void {
 
   const riskCols = db.prepare("PRAGMA table_info('risk_settings')").all() as any[]
   const hasRebalanceTpPercent = riskCols.some((c: any) => c.name === 'rebalance_tp_percent')
+  const hasDdLockTpPercent = riskCols.some((c: any) => c.name === 'dd_lock_tp_percent')
+  if (!hasDdLockTpPercent) {
+    db.exec("ALTER TABLE risk_settings ADD COLUMN dd_lock_tp_percent REAL NOT NULL DEFAULT 3")
+  }
   if (!hasRebalanceTpPercent) {
     db.exec("ALTER TABLE risk_settings ADD COLUMN rebalance_tp_percent REAL")
   }

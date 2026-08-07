@@ -28,6 +28,7 @@ test('parses global risk settings callbacks', () => {
   assert.deepEqual(parseDashboardAction('lpd:risk'), { type: 'risk' })
   assert.deepEqual(parseDashboardAction('lpd:rs:sl'), { type: 'risk_field', field: 'sl' })
   assert.deepEqual(parseDashboardAction('lpd:rs:trail_drop'), { type: 'risk_field', field: 'trail_drop' })
+  assert.deepEqual(parseDashboardAction('lpd:rs:dd_tp'), { type: 'risk_field', field: 'dd_tp' })
   assert.deepEqual(parseDashboardAction('lpd:rs:rebal_tp'), { type: 'risk_field', field: 'rebal_tp' })
   assert.deepEqual(parseDashboardAction('lpd:rs:rebal_sl'), { type: 'risk_field', field: 'rebal_sl' })
   assert.deepEqual(parseDashboardAction('lpd:rt'), { type: 'risk_toggle' })

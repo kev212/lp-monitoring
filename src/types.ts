@@ -7,7 +7,7 @@ export type TriggerType = 'TP' | 'SL' | 'TRAILING_STOP' | 'BIN_RANGE' | 'MANUAL'
 export type ExitStatus = 'pending_remove' | 'removed' | 'swap_pending' | 'completed' | 'failed'
 export type QuoteCurrency = 'SOL' | 'USDC'
 
-export type RiskSettingField = 'sl' | 'tp' | 'trail_arm' | 'trail_drop' | 'rebal_tp' | 'rebal_sl'
+export type RiskSettingField = 'sl' | 'tp' | 'trail_arm' | 'trail_drop' | 'dd_tp' | 'rebal_tp' | 'rebal_sl'
 
 export interface GlobalRiskSettings {
   slPercent: number
@@ -15,6 +15,7 @@ export interface GlobalRiskSettings {
   trailingEnabled: boolean
   trailingActivationPct: number
   trailingStopDropPct: number
+  ddLockTpPercent: number
   rebalanceTpPercent: number | null
   rebalanceSlPercent: number | null
   revision: number

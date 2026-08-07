@@ -491,7 +491,7 @@ async function monitorSinglePosition(
       ? `Conf: ${pos.triggerConfirmations}/${config.triggerConfirmations}`
       : 'Conf: 0'
     const effectiveTp = pos.drawdownTpOverrideActive
-      ? config.maxDrawdownTpOverride
+      ? riskSettings.ddLockTpPercent
       : riskSettings.tpPercent
     console.log(
       `[monitor] ${tokenLabel}${dupMarker} | ${pos.status} | PnL: ${pnlSign}${pnlPercent.toFixed(2)}% (${pnlSource})` +
@@ -607,7 +607,7 @@ async function monitorSinglePosition(
     if (!reshapeUnstable && !pos.drawdownTpOverrideActive && pnlPercent <= config.maxDrawdownThreshold) {
       pos.drawdownTpOverrideActive = true
       updateDrawdownTpOverride(pos.positionPubkey, true)
-      console.log(`[drawdown] ${tokenLabel} | TP LOCKED to ${config.maxDrawdownTpOverride}% (PnL ${pnlPercent.toFixed(2)}% <= ${config.maxDrawdownThreshold}%)`)
+      console.log(`[drawdown] ${tokenLabel} | TP LOCKED to ${riskSettings.ddLockTpPercent}% (PnL ${pnlPercent.toFixed(2)}% <= ${config.maxDrawdownThreshold}%)`)
     }
 
     const binData: BinData = {

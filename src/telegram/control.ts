@@ -122,6 +122,7 @@ export function parseRiskInput(field: RiskSettingField, input: string): number |
   if (field === 'trail_arm' && (value <= 0 || value > 1000)) return null
   if (field === 'trail_drop' && value <= 0) return null
   if (field === 'rebal_sl' && (value >= 0 || value <= -100)) return null
+  if (field === 'dd_tp' && (value <= 0 || value > 1000)) return null
   if (field === 'rebal_tp' && (value <= 0 || value > 1000)) return null
   return value
 }
@@ -131,6 +132,7 @@ function riskFieldLabel(field: RiskSettingField | 'trailing_toggle'): string {
   if (field === 'tp') return 'Take Profit'
   if (field === 'trail_arm') return 'Trail Arm'
   if (field === 'trail_drop') return 'Trail Drop'
+  if (field === 'dd_tp') return 'DD Lock TP'
   if (field === 'rebal_tp') return 'Rebalance TP'
   if (field === 'rebal_sl') return 'Rebalance SL'
   return 'Trailing'
@@ -155,7 +157,7 @@ export function parseDashboardAction(data: string | undefined): DashboardAction 
   if (parts.length === 3 && parts[1] === 'oc' && parts[2]) return { type: 'open_confirm', token: parts[2] }
   if (parts.length === 3 && parts[1] === 'ox' && parts[2]) return { type: 'open_cancel', token: parts[2] }
   if (parts.length === 2 && parts[1] === 'risk') return { type: 'risk' }
-  if (parts.length === 3 && parts[1] === 'rs' && ['sl', 'tp', 'trail_arm', 'trail_drop', 'rebal_tp', 'rebal_sl'].includes(parts[2] || '')) {
+  if (parts.length === 3 && parts[1] === 'rs' && ['sl', 'tp', 'trail_arm', 'trail_drop', 'dd_tp', 'rebal_tp', 'rebal_sl'].includes(parts[2] || '')) {
     return { type: 'risk_field', field: parts[2] as RiskSettingField }
   }
   if (parts.length === 2 && parts[1] === 'rt') return { type: 'risk_toggle' }
@@ -672,6 +674,7 @@ class TelegramDashboardController {
       `Trailing: ${settings.trailingEnabled ? 'ON' : 'OFF'}`,
       `Trail Arm: +${settings.trailingActivationPct}%`,
       `Trail Drop: ${settings.trailingStopDropPct}% from peak`,
+      `DD Lock TP: +${settings.ddLockTpPercent}%`,
       `Rebalance TP: ${settings.rebalanceTpPercent === null ? 'default (global)' : `+${settings.rebalanceTpPercent}%`}`,
       `Rebalance SL: ${settings.rebalanceSlPercent === null ? 'default (global)' : `${settings.rebalanceSlPercent}%`}`,
       `Policy revision: ${settings.revision}`,
@@ -692,6 +695,7 @@ class TelegramDashboardController {
           { text: 'Set Trail Arm', callback_data: 'lpd:rs:trail_arm' },
           { text: 'Set Trail Drop', callback_data: 'lpd:rs:trail_drop' },
         ],
+        [{ text: 'Set DD Lock TP', callback_data: 'lpd:rs:dd_tp' }],
         [
           { text: 'Set Rebal TP', callback_data: 'lpd:rs:rebal_tp' },
           { text: 'Set Rebal SL', callback_data: 'lpd:rs:rebal_sl' },
@@ -713,7 +717,7 @@ class TelegramDashboardController {
   private async startRiskInput(chatId: string, userId: string, messageId: number, field: RiskSettingField): Promise<void> {
     const settings = getRiskSettings()
     const negativeField = field === 'sl' || field === 'rebal_sl'
-    const example = field === 'sl' ? '-12' : field === 'tp' ? '8' : field === 'rebal_sl' ? '-15' : '5'
+    const example = field === 'sl' ? '-12' : field === 'tp' ? '8' : field === 'dd_tp' ? '3' : field === 'rebal_sl' ? '-15' : '5'
     const prompt = await this.bot.sendMessage(
       chatId,
       `Risk Settings — ${riskFieldLabel(field)}\n` +
@@ -753,6 +757,7 @@ class TelegramDashboardController {
         trailingEnabled: patch.trailingEnabled ?? settings.trailingEnabled,
         trailingActivationPct: patch.trailingActivationPct ?? settings.trailingActivationPct,
         trailingStopDropPct: patch.trailingStopDropPct ?? settings.trailingStopDropPct,
+        ddLockTpPercent: patch.ddLockTpPercent ?? settings.ddLockTpPercent,
         rebalanceTpPercent: patch.rebalanceTpPercent === undefined ? settings.rebalanceTpPercent : patch.rebalanceTpPercent,
         rebalanceSlPercent: patch.rebalanceSlPercent === undefined ? settings.rebalanceSlPercent : patch.rebalanceSlPercent,
       })
@@ -1083,6 +1088,7 @@ function riskFieldValue(settings: GlobalRiskSettings, field: RiskSettingField | 
   if (field === 'tp') return settings.tpPercent
   if (field === 'trail_arm') return settings.trailingActivationPct
   if (field === 'trail_drop') return settings.trailingStopDropPct
+  if (field === 'dd_tp') return settings.ddLockTpPercent
   if (field === 'rebal_tp') return settings.rebalanceTpPercent
   if (field === 'rebal_sl') return settings.rebalanceSlPercent
   return settings.trailingEnabled
@@ -1093,6 +1099,7 @@ function riskPatch(field: RiskSettingField | 'trailing_toggle', value: number | 
   if (field === 'tp') return { tpPercent: Number(value) }
   if (field === 'trail_arm') return { trailingActivationPct: Number(value) }
   if (field === 'trail_drop') return { trailingStopDropPct: Number(value) }
+  if (field === 'dd_tp') return { ddLockTpPercent: Number(value) }
   if (field === 'rebal_tp') return { rebalanceTpPercent: Number(value) }
   if (field === 'rebal_sl') return { rebalanceSlPercent: Number(value) }
   return { trailingEnabled: Boolean(value) }
@@ -1109,7 +1116,7 @@ function riskSettingsSummary(settings: GlobalRiskSettings): string {
   const rebal = settings.rebalanceTpPercent !== null || settings.rebalanceSlPercent !== null
     ? ` · Rebal TP ${settings.rebalanceTpPercent === null ? 'default' : `+${settings.rebalanceTpPercent}%`}/SL ${settings.rebalanceSlPercent === null ? 'default' : `${settings.rebalanceSlPercent}%`}`
     : ''
-  return `SL ${settings.slPercent}% · TP +${settings.tpPercent}% · Trail ${settings.trailingEnabled ? `ON (${settings.trailingActivationPct}%/${settings.trailingStopDropPct}%)` : 'OFF'}${rebal}`
+  return `SL ${settings.slPercent}% · TP +${settings.tpPercent}% · DD Lock +${settings.ddLockTpPercent}% · Trail ${settings.trailingEnabled ? `ON (${settings.trailingActivationPct}%/${settings.trailingStopDropPct}%)` : 'OFF'}${rebal}`
 }
 
 export function setupTelegramControl(bot: TelegramBot, menus: TelegramControlMenus): void {

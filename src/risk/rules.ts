@@ -24,14 +24,15 @@ export function evaluateTrigger(
     return { shouldTrigger: false, triggerType: null, reason: 'position already exiting/closed' }
   }
 
-  const policy: Pick<GlobalRiskSettings, 'slPercent' | 'tpPercent' | 'trailingEnabled' | 'trailingStopDropPct'> = riskSettings || {
+  const policy: Pick<GlobalRiskSettings, 'slPercent' | 'tpPercent' | 'trailingEnabled' | 'trailingStopDropPct' | 'ddLockTpPercent'> = riskSettings || {
     slPercent: config.defaultSlPercent,
     tpPercent: config.defaultTpPercent,
     trailingEnabled: true,
     trailingStopDropPct: config.trailingStopDropPct,
+    ddLockTpPercent: config.maxDrawdownTpOverride,
   }
   const baseTp = policy.tpPercent
-  const tp = position.drawdownTpOverrideActive ? config.maxDrawdownTpOverride : baseTp
+  const tp = position.drawdownTpOverrideActive ? policy.ddLockTpPercent : baseTp
   const sl = policy.slPercent
   const trailDrop = policy.trailingStopDropPct
 
