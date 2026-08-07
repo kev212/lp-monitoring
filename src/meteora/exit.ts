@@ -65,6 +65,7 @@ interface ExitPendingState {
   preUsdcBalance: string
   preSwapTokenBalances: Record<string, string>
   rentRefundSol: number
+  skipSwap: boolean
   stage: ExitStage
   removeSignatures: string[]
   swapSignatures: string[]
@@ -211,6 +212,9 @@ function parseExitPendingState(value: string): ExitPendingState {
         ? { ...finalizing, resumeStage: 'pending_remove' }
         : finalizing),
     }
+  }
+  if (state.version === 4) {
+    state = { ...state, skipSwap: state.skipSwap === true }
   }
   const validRawBalances = state.preSwapTokenBalances
     && Object.values(state.preSwapTokenBalances).every(balance => /^\d+$/.test(balance))
@@ -465,7 +469,25 @@ export async function executeExit(
   quoteCurrency: QuoteCurrency,
   basisQuote: number,
   estimatedExitQuote: number,
+  skipSwap = false,
+  skipLock = false,
 ): Promise<ExitResult> {
+  if (skipLock) {
+    return executeExitUnlocked(
+      connection,
+      wallet,
+      positionPubkey,
+      poolPubkey,
+      tokenXMint,
+      tokenYMint,
+      triggerType,
+      pnlPercent,
+      quoteCurrency,
+      basisQuote,
+      estimatedExitQuote,
+      skipSwap,
+    )
+  }
   return withWalletExecutionLock(() => executeExitUnlocked(
     connection,
     wallet,
@@ -478,6 +500,7 @@ export async function executeExit(
     quoteCurrency,
     basisQuote,
     estimatedExitQuote,
+    skipSwap,
   ))
 }
 
@@ -493,6 +516,7 @@ async function executeExitUnlocked(
   quoteCurrency: QuoteCurrency,
   basisQuote: number,
   estimatedExitQuote: number,
+  skipSwap = false,
 ): Promise<ExitResult> {
   console.log(`[exit] executing ${triggerType} for ${positionPubkey.slice(0, 8)}...`)
 
@@ -537,7 +561,7 @@ async function executeExitUnlocked(
   const now = Date.now()
   let state: ExitPendingState | null
   try {
-    state = beginExit({
+    state =     beginExit({
       positionPubkey,
       triggerType,
       triggerPnlPercent: pnlPercent,
@@ -569,6 +593,7 @@ async function executeExitUnlocked(
       preUsdcBalance: preUsdcBalance.toString(),
       preSwapTokenBalances: Object.fromEntries([...preSwapTokenBalances].map(([mint, balance]) => [mint, balance.toString()])),
       rentRefundSol: 0,
+      skipSwap,
       stage: 'pending_remove',
       removeSignatures: [],
       swapSignatures: [],
@@ -603,6 +628,10 @@ async function executeExitUnlocked(
       })
     }
     return result
+  }
+
+  if (skipSwap) {
+    return completeExitWithoutSwap(connection, wallet, state, result)
   }
 
   state.stage = 'swap_pending'
@@ -726,6 +755,44 @@ async function removePositionLiquidity(
     }
     persistExitState(state, 'pending_remove', { errorMessage: message })
     return 'failed'
+  }
+}
+
+async function completeExitWithoutSwap(
+  connection: Connection,
+  wallet: Keypair,
+  state: ExitPendingState,
+  result: ExitResult,
+): Promise<ExitResult> {
+  const quoteIsUsdc = state.quoteCurrency === 'USDC'
+  try {
+    const postSolBalance = await withRpcFallback(rpc => rpc.getBalance(wallet.publicKey), connection)
+    result.solReceived = (postSolBalance - state.preSolBalance) / 1_000_000_000
+    if (quoteIsUsdc) {
+      const postUsdcBalance = await getTokenBalance(connection, wallet.publicKey, USDC_MINT, 2)
+      const baseline = BigInt(state.preUsdcBalance)
+      result.usdcReceived = Number(positiveBalanceDelta(baseline, postUsdcBalance)) / 1e6
+    }
+    const quoteReceived = quoteIsUsdc ? result.usdcReceived : result.solReceived
+    result.swapSig = null
+    finishExit(state, 'completed', 'closed', {
+      removeLiqSig: result.removeLiqSig,
+      swapSig: null,
+      finalSolReceived: result.solReceived,
+      finalQuoteReceived: quoteReceived,
+      errorMessage: null,
+    })
+    result.success = true
+    result.pendingRecovery = false
+    console.log(`[exit] close-only completed without swap: ${quoteIsUsdc ? `${result.usdcReceived.toFixed(2)} USDC` : `${result.solReceived.toFixed(6)} SOL`} returned to wallet`)
+    return result
+  } catch (err) {
+    const message = `close-only settlement pending: ${err instanceof Error ? err.message : 'unknown'}`
+    state.lastError = message
+    result.error = message
+    result.pendingRecovery = true
+    console.log(`[exit] ${message}`)
+    return result
   }
 }
 
@@ -1150,6 +1217,10 @@ async function reconcilePendingExitsUnlocked(connection: Connection, wallet: Key
         })
       }
 
+      if (state.skipSwap) {
+        await completeExitWithoutSwap(connection, wallet, state, result)
+        continue
+      }
       await settleExit(connection, wallet, state, result, true)
     } catch (err) {
       const message = err instanceof Error ? err.message : 'unknown'

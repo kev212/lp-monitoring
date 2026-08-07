@@ -506,8 +506,9 @@ export async function executeOpenPosition(
   connection: Connection,
   wallet: Keypair,
   preview: OpenPositionPreview,
+  skipLock = false,
 ): Promise<OpenPositionResult> {
-  return withWalletExecutionLock(async () => {
+  const work = async (): Promise<OpenPositionResult> => {
     const owner = wallet.publicKey.toBase58()
     await reconcilePendingOpens(connection)
     const lease = getWalletOperation(owner)
@@ -537,93 +538,202 @@ export async function executeOpenPosition(
       addSlippagePercent: sdkSlippagePercentForBins(pool.lbPair.binStep, remainingMoveBins),
     }
 
-    const position = Keypair.generate()
-    const amountRaw = new BN(executedPreview.amountRaw)
-    const createTx = await pool.initializePositionAndAddLiquidityByStrategy({
-      positionPubKey: position.publicKey,
-      user: wallet.publicKey,
-      totalXAmount: executedPreview.quoteSide === 'X' ? amountRaw : new BN(0),
-      totalYAmount: executedPreview.quoteSide === 'Y' ? amountRaw : new BN(0),
-      strategy: {
-        minBinId: executedPreview.minBinId,
-        maxBinId: executedPreview.maxBinId,
-        strategyType: strategyType(executedPreview.strategy),
-        singleSidedX: executedPreview.quoteSide === 'X',
-      },
-      slippage: executedPreview.addSlippagePercent,
-    })
+    return submitOpenPosition(connection, wallet, pool, executedPreview)
+  }
+  return skipLock ? work() : withWalletExecutionLock(work)
+}
 
-    const latest = await connection.getLatestBlockhash('confirmed')
-    createTx.feePayer = wallet.publicKey
-    createTx.recentBlockhash = latest.blockhash
-    createTx.sign(wallet, position)
-    const expectedSignature = bs58.encode(createTx.signature!)
-    const signedTransaction = createTx.serialize()
-    const now = Date.now()
-    const pendingState: PendingOpenState = {
-      version: 1,
-      positionPubkey: position.publicKey.toBase58(),
-      owner,
-      poolPubkey: executedPreview.poolPubkey,
-      quoteCurrency: executedPreview.quoteCurrency,
-      amountRaw: executedPreview.amountRaw,
+export interface RebalanceOpenParams {
+  poolPubkey: string
+  quoteCurrency: QuoteCurrency
+  amountQuote: number
+  rangeWidth: number
+}
+
+async function prepareRebalanceOpenWithPool(
+  connection: Connection,
+  owner: PublicKey,
+  params: RebalanceOpenParams,
+): Promise<{ preview: OpenPositionPreview; pool: DLMM }> {
+  const { pool, poolInfo } = await loadOpenPool(connection, params.poolPubkey)
+  const activeBinId = pool.lbPair.activeId
+  const width = Math.round(params.rangeWidth)
+  if (!Number.isInteger(width) || width < 1) throw new Error('Rebalance range width is invalid')
+  const maxBins = Number(MAX_BINS_PER_POSITION.toString())
+  if (width > maxBins) throw new Error(`Rebalance range ${width} bins exceeds the ${maxBins}-bin position limit`)
+  const minBinId = activeBinId - width + 1
+  const maxBinId = activeBinId
+
+  if (poolInfo.quoteCurrency !== params.quoteCurrency) {
+    throw new Error('Rebalance quote currency does not match the pool')
+  }
+  const amountRaw = parseUiAmountToRaw(
+    formatRawAmount(BigInt(Math.round(params.amountQuote * 10 ** poolInfo.quoteDecimals)), poolInfo.quoteDecimals),
+    poolInfo.quoteDecimals,
+  )
+  if (amountRaw <= 0n) throw new Error('Rebalance amount must be greater than zero')
+
+  const strategyParams = {
+    minBinId,
+    maxBinId,
+    strategyType: strategyType('spot'),
+    singleSidedX: poolInfo.quoteSide === 'X',
+  }
+  const cost = await pool.quoteCreatePosition({ strategy: strategyParams })
+  if (cost.positionCount !== 1) throw new Error(`Range requires ${cost.positionCount} positions; reduce the percentage range`)
+  if (cost.transactionCount !== 1) throw new Error(`Range requires ${cost.transactionCount} setup transactions; reduce the percentage range`)
+  const estimatedPositionCostSol = cost.positionCost + cost.positionReallocCost + cost.bitmapExtensionCost + cost.binArrayCost
+  const addSlippagePercent = sdkSlippagePercentForBins(pool.lbPair.binStep, config.openMaxPriceMoveBins)
+  const nativeBalance = await connection.getBalance(owner)
+  const requiredFeeLamports = BigInt(Math.ceil((estimatedPositionCostSol + config.openSolFeeReserve) * LAMPORTS_PER_SOL))
+
+  if (poolInfo.quoteCurrency === 'SOL') {
+    if (BigInt(nativeBalance) < amountRaw + requiredFeeLamports) {
+      throw new Error(`Insufficient SOL; keep ${config.openSolFeeReserve} SOL plus estimated position rent for fees`)
+    }
+  } else {
+    const quoteBalance = await rawAssociatedTokenBalance(connection, owner, poolInfo.quoteMint)
+    if (quoteBalance < amountRaw) throw new Error('Insufficient USDC balance')
+    if (BigInt(nativeBalance) < requiredFeeLamports) {
+      throw new Error(`Insufficient SOL for rent and fees; keep at least ${config.openSolFeeReserve} SOL reserve`)
+    }
+  }
+
+  return { pool, preview: {
+    ...poolInfo,
+    amountInput: formatRawAmount(amountRaw, poolInfo.quoteDecimals),
+    amountQuote: Number(amountRaw) / 10 ** poolInfo.quoteDecimals,
+    amountRaw: amountRaw.toString(),
+    rangePercent: 0,
+    strategy: 'spot',
+    activeBinId,
+    minBinId,
+    maxBinId,
+    binCount: width,
+    currentPriceQuote: 0,
+    targetPriceQuote: 0,
+    estimatedPositionCostSol,
+    maxPriceMoveBins: config.openMaxPriceMoveBins,
+    addSlippagePercent,
+    observedAt: Date.now(),
+  } }
+}
+
+export async function executeRebalanceOpen(
+  connection: Connection,
+  wallet: Keypair,
+  params: RebalanceOpenParams,
+  skipLock = false,
+): Promise<OpenPositionResult> {
+  const work = async (): Promise<OpenPositionResult> => {
+    const owner = wallet.publicKey.toBase58()
+    await reconcilePendingOpens(connection)
+    const lease = getWalletOperation(owner)
+    if (lease && lease.kind !== 'open') throw new Error(`Wallet is busy with a pending ${lease.kind} operation`)
+    const unresolved = findPendingOpen(owner)
+    if (unresolved) {
+      throw new OpenSubmissionPendingError(unresolved.positionPubkey, unresolved.signature, 'wait for final reconciliation before opening again')
+    }
+
+    const { preview, pool } = await prepareRebalanceOpenWithPool(connection, wallet.publicKey, params)
+    return submitOpenPosition(connection, wallet, pool, preview)
+  }
+  return skipLock ? work() : withWalletExecutionLock(work)
+}
+
+async function submitOpenPosition(
+  connection: Connection,
+  wallet: Keypair,
+  pool: DLMM,
+  executedPreview: OpenPositionPreview,
+): Promise<OpenPositionResult> {
+  const owner = wallet.publicKey.toBase58()
+  const position = Keypair.generate()
+  const amountRaw = new BN(executedPreview.amountRaw)
+  const createTx = await pool.initializePositionAndAddLiquidityByStrategy({
+    positionPubKey: position.publicKey,
+    user: wallet.publicKey,
+    totalXAmount: executedPreview.quoteSide === 'X' ? amountRaw : new BN(0),
+    totalYAmount: executedPreview.quoteSide === 'Y' ? amountRaw : new BN(0),
+    strategy: {
       minBinId: executedPreview.minBinId,
       maxBinId: executedPreview.maxBinId,
-      strategy: executedPreview.strategy,
-      signature: expectedSignature,
-      signedTransaction: signedTransaction.toString('base64'),
-      blockhash: latest.blockhash,
-      lastValidBlockHeight: latest.lastValidBlockHeight,
-      stage: 'prepared',
-      missingAfterExpiryChecks: 0,
-      lastExpiryAbsenceAt: null,
-      createdAt: now,
-      updatedAt: now,
-      lastError: null,
-    }
-    createPendingOpen(position, executedPreview, pendingState)
-
-    let transactionFinalized = false
-    try {
-      const signature = await connection.sendRawTransaction(signedTransaction, {
-        skipPreflight: false,
-        preflightCommitment: 'confirmed',
-        maxRetries: 3,
-      })
-      if (signature !== expectedSignature) throw new Error('RPC returned a signature that does not match the signed transaction')
-      pendingState.stage = 'submitted'
-      updatePendingOpen(pendingState)
-      const confirmation = await withTimeout(
-        connection.confirmTransaction({ signature: expectedSignature, ...latest }, 'finalized'),
-        30_000,
-      )
-      if (confirmation.value.err) {
-        const message = `open transaction failed on-chain: ${JSON.stringify(confirmation.value.err)}`
-        finishOpenAttempt(pendingState, 'failed', message)
-        throw new DefinitiveOpenError(message)
-      }
-      transactionFinalized = true
-      if (!await verifyFinalizedPosition(connection, pendingState)) {
-        throw new Error('transaction finalized but the position account is not yet visible')
-      }
-      finishOpenAttempt(pendingState, 'finalized', null)
-    } catch (err) {
-      if (err instanceof DefinitiveOpenError) throw err
-      if (!findPendingOpen(owner) && positionIsMonitoring(pendingState.positionPubkey)) {
-        console.log(`[open] position ${pendingState.positionPubkey.slice(0, 8)} was finalized by concurrent reconciliation`)
-      } else {
-        throw new OpenSubmissionPendingError(pendingState.positionPubkey, expectedSignature, err, transactionFinalized)
-      }
-    }
-    clearPnlCache()
-    clearPoolCache()
-
-    return {
-      signature: expectedSignature,
-      positionPubkey: position.publicKey.toBase58(),
-      preview: executedPreview,
-    }
+      strategyType: strategyType(executedPreview.strategy),
+      singleSidedX: executedPreview.quoteSide === 'X',
+    },
+    slippage: executedPreview.addSlippagePercent,
   })
+
+  const latest = await connection.getLatestBlockhash('confirmed')
+  createTx.feePayer = wallet.publicKey
+  createTx.recentBlockhash = latest.blockhash
+  createTx.sign(wallet, position)
+  const expectedSignature = bs58.encode(createTx.signature!)
+  const signedTransaction = createTx.serialize()
+  const now = Date.now()
+  const pendingState: PendingOpenState = {
+    version: 1,
+    positionPubkey: position.publicKey.toBase58(),
+    owner,
+    poolPubkey: executedPreview.poolPubkey,
+    quoteCurrency: executedPreview.quoteCurrency,
+    amountRaw: executedPreview.amountRaw,
+    minBinId: executedPreview.minBinId,
+    maxBinId: executedPreview.maxBinId,
+    strategy: executedPreview.strategy,
+    signature: expectedSignature,
+    signedTransaction: signedTransaction.toString('base64'),
+    blockhash: latest.blockhash,
+    lastValidBlockHeight: latest.lastValidBlockHeight,
+    stage: 'prepared',
+    missingAfterExpiryChecks: 0,
+    lastExpiryAbsenceAt: null,
+    createdAt: now,
+    updatedAt: now,
+    lastError: null,
+  }
+  createPendingOpen(position, executedPreview, pendingState)
+
+  let transactionFinalized = false
+  try {
+    const signature = await connection.sendRawTransaction(signedTransaction, {
+      skipPreflight: false,
+      preflightCommitment: 'confirmed',
+      maxRetries: 3,
+    })
+    if (signature !== expectedSignature) throw new Error('RPC returned a signature that does not match the signed transaction')
+    pendingState.stage = 'submitted'
+    updatePendingOpen(pendingState)
+    const confirmation = await withTimeout(
+      connection.confirmTransaction({ signature: expectedSignature, ...latest }, 'finalized'),
+      30_000,
+    )
+    if (confirmation.value.err) {
+      const message = `open transaction failed on-chain: ${JSON.stringify(confirmation.value.err)}`
+      finishOpenAttempt(pendingState, 'failed', message)
+      throw new DefinitiveOpenError(message)
+    }
+    transactionFinalized = true
+    if (!await verifyFinalizedPosition(connection, pendingState)) {
+      throw new Error('transaction finalized but the position account is not yet visible')
+    }
+    finishOpenAttempt(pendingState, 'finalized', null)
+  } catch (err) {
+    if (err instanceof DefinitiveOpenError) throw err
+    if (!findPendingOpen(owner) && positionIsMonitoring(pendingState.positionPubkey)) {
+      console.log(`[open] position ${pendingState.positionPubkey.slice(0, 8)} was finalized by concurrent reconciliation`)
+    } else {
+      throw new OpenSubmissionPendingError(pendingState.positionPubkey, expectedSignature, err, transactionFinalized)
+    }
+  }
+  clearPnlCache()
+  clearPoolCache()
+
+  return {
+    signature: expectedSignature,
+    positionPubkey: position.publicKey.toBase58(),
+    preview: executedPreview,
+  }
 }
 
 export async function reconcilePendingOpens(connection: Connection): Promise<OpenReconcileSummary> {

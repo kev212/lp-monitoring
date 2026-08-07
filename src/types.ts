@@ -64,6 +64,10 @@ export interface PositionRow {
   flipModePendingAttempts: number
   flipModePendingLastError: string | null
   drawdownTpOverrideActive: boolean
+  autoRebalanceEnabled: boolean
+  rebalanceOorSince: number | null
+  rebalanceBusy: boolean
+  rebalanceLastAt: number | null
   createdAt: number
   updatedAt: number
 }
@@ -147,6 +151,7 @@ export interface Config {
   maxDrawdownTpOverride: number
   flipModeInitialTriggerPct: number
   flipModeRepeatStepPct: number
+  rebalanceOorMinutes: number
   openMaxPriceMoveBins: number
   openSolFeeReserve: number
   dbPath: string

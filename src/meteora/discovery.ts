@@ -65,6 +65,10 @@ function rowToPosition(row: any): PositionRow {
     flipModePendingAttempts: row.flip_mode_pending_attempts ?? 0,
     flipModePendingLastError: row.flip_mode_pending_last_error ?? null,
     drawdownTpOverrideActive: row.drawdown_tp_override_active === 1,
+    autoRebalanceEnabled: row.auto_rebalance_enabled === 1,
+    rebalanceOorSince: row.rebalance_oor_since ?? null,
+    rebalanceBusy: row.rebalance_busy === 1,
+    rebalanceLastAt: row.rebalance_last_at ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   }
@@ -229,9 +233,10 @@ export function updatePrecisionCurveEnabled(pubkey: string, enabled: boolean, cu
          precision_curve_last_active_bin = CASE WHEN ? = 1 THEN ? ELSE precision_curve_last_active_bin END,
          precision_curve_busy = 0,
          flip_mode_enabled = CASE WHEN ? = 1 THEN 0 ELSE flip_mode_enabled END,
+         auto_rebalance_enabled = CASE WHEN ? = 1 THEN 0 ELSE auto_rebalance_enabled END,
          updated_at = ?
      WHERE position_pubkey = ?`
-  ).run(enabled ? 1 : 0, enabled ? 1 : 0, currentActiveBin, enabled ? 1 : 0, now, pubkey)
+  ).run(enabled ? 1 : 0, enabled ? 1 : 0, currentActiveBin, enabled ? 1 : 0, enabled ? 1 : 0, now, pubkey)
 }
 
 export function updatePrecisionCurveBusy(pubkey: string, busy: boolean): void {
@@ -277,9 +282,47 @@ export function updateFlipModeEnabled(pubkey: string, enabled: boolean): void {
          flip_mode_busy = 0,
          precision_curve_enabled = CASE WHEN ? = 1 THEN 0 ELSE precision_curve_enabled END,
          precision_curve_busy = CASE WHEN ? = 1 THEN 0 ELSE precision_curve_busy END,
+         auto_rebalance_enabled = CASE WHEN ? = 1 THEN 0 ELSE auto_rebalance_enabled END,
+         rebalance_oor_since = CASE WHEN ? = 1 THEN NULL ELSE rebalance_oor_since END,
          updated_at = ?
      WHERE position_pubkey = ?`
-  ).run(enabled ? 1 : 0, enabled ? 1 : 0, enabled ? 1 : 0, Date.now(), pubkey)
+  ).run(enabled ? 1 : 0, enabled ? 1 : 0, enabled ? 1 : 0, enabled ? 1 : 0, enabled ? 1 : 0, Date.now(), pubkey)
+}
+
+export function updateAutoRebalanceEnabled(pubkey: string, enabled: boolean): void {
+  getDb().prepare(
+    `UPDATE positions
+     SET auto_rebalance_enabled = ?,
+         rebalance_oor_since = CASE WHEN ? = 1 THEN NULL ELSE rebalance_oor_since END,
+         rebalance_busy = 0,
+         flip_mode_enabled = CASE WHEN ? = 1 THEN 0 ELSE flip_mode_enabled END,
+         flip_mode_busy = CASE WHEN ? = 1 THEN 0 ELSE flip_mode_busy END,
+         precision_curve_enabled = CASE WHEN ? = 1 THEN 0 ELSE precision_curve_enabled END,
+         precision_curve_busy = CASE WHEN ? = 1 THEN 0 ELSE precision_curve_busy END,
+         updated_at = ?
+     WHERE position_pubkey = ?`
+  ).run(enabled ? 1 : 0, enabled ? 1 : 0, enabled ? 1 : 0, enabled ? 1 : 0, enabled ? 1 : 0, enabled ? 1 : 0, Date.now(), pubkey)
+}
+
+export function updateRebalanceOorSince(pubkey: string, since: number | null): void {
+  getDb().prepare('UPDATE positions SET rebalance_oor_since = ?, updated_at = ? WHERE position_pubkey = ?')
+    .run(since, Date.now(), pubkey)
+}
+
+export function updateRebalanceBusy(pubkey: string, busy: boolean): void {
+  getDb().prepare('UPDATE positions SET rebalance_busy = ?, updated_at = ? WHERE position_pubkey = ?')
+    .run(busy ? 1 : 0, Date.now(), pubkey)
+}
+
+export function updateRebalanceState(pubkey: string, lastAt: number): void {
+  getDb().prepare(
+    `UPDATE positions
+     SET rebalance_last_at = ?,
+         rebalance_busy = 0,
+         rebalance_oor_since = NULL,
+         updated_at = ?
+     WHERE position_pubkey = ?`
+  ).run(lastAt, Date.now(), pubkey)
 }
 
 export function updateFlipModeBusy(pubkey: string, busy: boolean): void {

@@ -61,6 +61,7 @@ export const config: Config = {
   maxDrawdownTpOverride: envNum('MAX_DRAWDOWN_TP_OVERRIDE', 2),
   flipModeInitialTriggerPct: envNum('FLIP_MODE_INITIAL_TRIGGER_PCT', 40),
   flipModeRepeatStepPct: envNum('FLIP_MODE_REPEAT_STEP_PCT', 10),
+  rebalanceOorMinutes: envNum('REBALANCE_OOR_MINUTES', 5),
   openMaxPriceMoveBins,
   openSolFeeReserve: envNum('OPEN_SOL_FEE_RESERVE', 0.02),
   dbPath: envStr('DB_PATH', './monitoring-lp.sqlite'),

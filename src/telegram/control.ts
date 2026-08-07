@@ -45,6 +45,7 @@ export type DashboardAction =
   | { type: 'risk_cancel'; token: string }
   | { type: 'precision' }
   | { type: 'flip' }
+  | { type: 'rebalance' }
 
 type PendingOpenInput =
   | PendingBase & { kind: 'pool'; strategy: OpenLiquidityStrategy }
@@ -89,6 +90,7 @@ interface DashboardRender {
 interface TelegramControlMenus {
   showPrecision: (chatId: number | string) => void
   showFlip: (chatId: number | string) => void
+  showAutoRebalance: (chatId: number | string) => void
 }
 
 export function isTelegramAuthorized(
@@ -157,6 +159,7 @@ export function parseDashboardAction(data: string | undefined): DashboardAction 
   if (parts.length === 3 && parts[1] === 'rx' && parts[2]) return { type: 'risk_cancel', token: parts[2] }
   if (parts.length === 2 && parts[1] === 'precision') return { type: 'precision' }
   if (parts.length === 2 && parts[1] === 'flip') return { type: 'flip' }
+  if (parts.length === 2 && parts[1] === 'rebal') return { type: 'rebalance' }
   return null
 }
 
@@ -394,7 +397,11 @@ class TelegramDashboardController {
       this.menus.showPrecision(message.chat.id)
       return
     }
-    this.menus.showFlip(message.chat.id)
+    if (action.type === 'flip') {
+      this.menus.showFlip(message.chat.id)
+      return
+    }
+    this.menus.showAutoRebalance(message.chat.id)
   }
 
   private async buildDashboard(requestedPage: number): Promise<DashboardRender> {
@@ -444,7 +451,7 @@ class TelegramDashboardController {
         const pnl = valuation ? positionPnlPercent(position, valuation) : position.lastPnlPercent
         const value = valuation?.estimatedExitQuote ?? position.lastEstimatedExitQuote
         const indicator = pnl === null ? '⚪' : pnl > 0 ? '🟢' : pnl < 0 ? '🔴' : '⚪'
-        const modes = [position.precisionCurveEnabled ? 'Precision' : '', position.flipModeEnabled ? 'Flip' : '', position.flipModePendingAdd ? 'FlipPending' : ''].filter(Boolean).join(', ') || 'off'
+        const modes = [position.precisionCurveEnabled ? 'Precision' : '', position.flipModeEnabled ? 'Flip' : '', position.flipModePendingAdd ? 'FlipPending' : '', position.autoRebalanceEnabled ? 'Rebalance' : ''].filter(Boolean).join(', ') || 'off'
         const exceptionalStatus = ['opening', 'exiting', 'error'].includes(position.status) ? ` · ${position.status.toUpperCase()}` : ''
         lines.push(`${first + index + 1}. ${indicator} ${label}${exceptionalStatus}`)
         lines.push(...formatDashboardPositionLines(
@@ -470,6 +477,7 @@ class TelegramDashboardController {
         { text: '🎛️ Precision Curve', callback_data: 'lpd:precision' },
         { text: '🔁 Flip Mode', callback_data: 'lpd:flip' },
       ],
+      [{ text: '🔄 Auto Rebalance', callback_data: 'lpd:rebal' }],
     ]
     if (pageCount > 1) {
       const nav: TelegramBot.InlineKeyboardButton[] = []

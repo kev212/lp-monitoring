@@ -26,6 +26,10 @@ import {
   updateFlipModePendingAttempt,
   updateFlipModePendingAmount,
   clearFlipModePendingAdd,
+  updateAutoRebalanceEnabled,
+  updateRebalanceOorSince,
+  updateRebalanceBusy,
+  updateRebalanceState,
 } from './meteora/discovery.js'
 import {
   getAllPositionsForWallet,
@@ -41,6 +45,8 @@ import {
   reconcilePendingExits,
 } from './meteora/exit.js'
 import { reconcilePendingOpens } from './meteora/open.js'
+import { executeRebalanceOpen } from './meteora/open.js'
+import { isOorAbove, rebalanceTimerStatus } from './meteora/rebalance.js'
 import { executeDirectionalPrecisionCurve, THRESHOLD_RATIO, THRESHOLD_MIN, RECOVERY_MS } from './meteora/precisionCurve.js'
 import { calculateFlipProgressPct, executeFlipMode, retryPendingFlipAdd } from './meteora/flipMode.js'
 import { evaluateTrigger, type BinData } from './risk/rules.js'
@@ -127,6 +133,17 @@ export async function startBot(): Promise<void> {
   await reconcilePendingExits(getConnection(), wallet)
   await flushExitCompletionNotifications()
   await reconcilePendingOpens(getConnection())
+  for (const position of loadKnownPositions().filter(p => p.rebalanceBusy && p.status === 'closed')) {
+    updateRebalanceBusy(position.positionPubkey, false)
+    const pair = `${position.tokenXSymbol || position.tokenXMint.slice(0, 4)}/${position.tokenYSymbol || position.tokenYMint.slice(0, 4)}`
+    console.log(`[rebalance] ${pair} | interrupted rebalance recovered; position closed with funds in wallet`)
+    sendNotification(
+      `⚠️ <b>Auto Rebalance Interrupted</b>\n\n` +
+      `<b>${pair}</b>\n` +
+      `Position was closed during a rebalance but the process stopped before reopening.\n` +
+      `Funds are safe in the wallet. Reopen manually or wait for discovery to register a new position.`
+    )
+  }
   lastExitRecoveryAt = Date.now()
   const riskSettings = getRiskSettings()
   sendNotification(formatBotStart(walletPubkey.toBase58(), 0, riskSettings))
@@ -602,6 +619,13 @@ async function monitorSinglePosition(
       pendingTriggers.delete(pos.positionPubkey)
       if (pos.triggerConfirmations > 0) updatePositionConfirmations(pos.positionPubkey, 0)
       console.log(`[monitor] ${tokenLabel} | reshape busy/recovery — PnL exits paused`)
+      return
+    }
+
+    const rebalanceHandled = await maybeRunAutoRebalance(pos, valuation)
+    if (rebalanceHandled) {
+      pendingTriggers.delete(pos.positionPubkey)
+      if (pos.triggerConfirmations > 0) updatePositionConfirmations(pos.positionPubkey, 0)
       return
     }
 
@@ -1082,6 +1106,126 @@ async function maybeRunFlipMode(
       `<b>${tokenLabel}</b>\n` +
       `Reason: <code>${message}</code>\n` +
       `Bot will retry on the next valid cycle.`
+    )
+    return true
+  }
+}
+
+async function maybeRunAutoRebalance(
+  pos: PositionRow,
+  valuation: ValuationResult,
+): Promise<boolean> {
+  const tokenLabel = `${pos.tokenXSymbol || pos.tokenXMint.slice(0, 4)}/${pos.tokenYSymbol || pos.tokenYMint.slice(0, 4)}`
+
+  if (!pos.autoRebalanceEnabled) {
+    if (pos.rebalanceOorSince !== null) updateRebalanceOorSince(pos.positionPubkey, null)
+    return false
+  }
+
+  if (getWalletOperation(pos.owner)) {
+    console.log(`[rebalance] ${tokenLabel} | durable wallet operation pending — paused`)
+    return true
+  }
+
+  if (pos.rebalanceBusy) {
+    console.log(`[rebalance] ${tokenLabel} | busy — skip this cycle`)
+    return true
+  }
+
+  if (valuation.lowerBinId === undefined || valuation.upperBinId === undefined || valuation.poolActiveBinId === undefined) {
+    return false
+  }
+
+  if (!isOorAbove(valuation.poolActiveBinId, valuation.upperBinId)) {
+    if (pos.rebalanceOorSince !== null) updateRebalanceOorSince(pos.positionPubkey, null)
+    return false
+  }
+
+  const now = Date.now()
+  if (pos.rebalanceOorSince === null) {
+    updateRebalanceOorSince(pos.positionPubkey, now)
+    console.log(`[rebalance] ${tokenLabel} | OOR above detected (active=${valuation.poolActiveBinId} > upper=${valuation.upperBinId}) — waiting ${config.rebalanceOorMinutes} min`)
+    return false
+  }
+
+  const timer = rebalanceTimerStatus(pos.rebalanceOorSince, now, config.rebalanceOorMinutes)
+  if (timer === 'waiting') return false
+  if (timer === 'none') {
+    updateRebalanceOorSince(pos.positionPubkey, null)
+    return false
+  }
+
+  const rangeWidth = valuation.upperBinId - valuation.lowerBinId + 1
+  const pnlPercent = pnlFromValuation(valuation, pos).pnlPercent
+  updateRebalanceBusy(pos.positionPubkey, true)
+  console.log(`[rebalance] ${tokenLabel} | executing: close without swap then reopen with upper bin == active bin ${valuation.poolActiveBinId}`)
+  sendNotification(
+    `🔄 <b>Auto Rebalance — Starting</b>\n\n` +
+    `<b>${tokenLabel}</b>\n` +
+    `OOR above for <b>${config.rebalanceOorMinutes} min</b>\n` +
+    `Active bin: <b>${valuation.poolActiveBinId}</b> (range ${valuation.lowerBinId}-${valuation.upperBinId})\n` +
+    `Action: close position (no swap), reopen ${rangeWidth} bins with upper bin == current bin, deposit <b>${pos.basisQuote.toFixed(4)} ${pos.quoteCurrency}</b>.`
+  )
+
+  try {
+    const { exitResult, openResult } = await withWalletExecutionLock(async () => {
+      const closeResult = await executeExit(
+        getConnection(),
+        getWallet(),
+        pos.positionPubkey,
+        pos.poolPubkey,
+        pos.tokenXMint,
+        pos.tokenYMint,
+        'MANUAL',
+        pnlPercent,
+        pos.quoteCurrency,
+        pos.basisQuote,
+        valuation.estimatedExitQuote,
+        true,
+        true,
+      )
+      if (!closeResult.success || closeResult.pendingRecovery) {
+        throw new Error(closeResult.error || 'rebalance close pending reconciliation')
+      }
+      return {
+        exitResult: closeResult,
+        openResult: await executeRebalanceOpen(
+          getConnection(),
+          getWallet(),
+          {
+            poolPubkey: pos.poolPubkey,
+            quoteCurrency: pos.quoteCurrency,
+            amountQuote: pos.basisQuote,
+            rangeWidth,
+          },
+          true,
+        ),
+      }
+    })
+
+    console.log(`[rebalance] ${tokenLabel} | closed ${pos.positionPubkey.slice(0, 8)} (${exitResult.removeLiqSig?.slice(0, 8) || 'n/a'}) and reopened as ${openResult.positionPubkey.slice(0, 8)}`)
+    sendNotification(
+      `✅ <b>Auto Rebalance Complete</b>\n\n` +
+      `<b>${tokenLabel}</b>\n` +
+      `Old position closed (no swap): <code>${pos.positionPubkey.slice(0, 8)}..</code>\n` +
+      `New position: <code>${openResult.positionPubkey}</code>\n` +
+      `Range: <b>${openResult.preview.minBinId}-${openResult.preview.maxBinId}</b>\n` +
+      `Deposit: <b>${openResult.preview.amountQuote.toFixed(4)} ${pos.quoteCurrency}</b>\n` +
+      `Close: ${exitResult.removeLiqSig ? `<a href="https://solscan.io/tx/${exitResult.removeLiqSig}">${exitResult.removeLiqSig.slice(0, 6)}..${exitResult.removeLiqSig.slice(-4)}</a>` : '-'}\n` +
+      `Open: <a href="https://solscan.io/tx/${openResult.signature}">${openResult.signature.slice(0, 6)}..${openResult.signature.slice(-4)}</a>`
+    )
+    updateRebalanceState(pos.positionPubkey, Date.now())
+    updateAutoRebalanceEnabled(openResult.positionPubkey, true)
+    return true
+  } catch (err) {
+    updateRebalanceBusy(pos.positionPubkey, false)
+    const message = err instanceof Error ? err.message : 'unknown error'
+    console.log(`[rebalance] ${tokenLabel} | failed: ${message}`)
+    sendNotification(
+      `⚠️ <b>Auto Rebalance Failed</b>\n\n` +
+      `<b>${tokenLabel}</b>\n` +
+      `Reason: <code>${message}</code>\n\n` +
+      `If the position was already closed, its funds are safe in the wallet. Bot will retry on the next valid cycle.`
     )
     return true
   }

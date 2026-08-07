@@ -49,6 +49,10 @@ export function initSchema(db: Database.Database): void {
       flip_mode_pending_attempts INTEGER NOT NULL DEFAULT 0,
       flip_mode_pending_last_error TEXT,
       drawdown_tp_override_active INTEGER NOT NULL DEFAULT 0,
+      auto_rebalance_enabled INTEGER NOT NULL DEFAULT 0,
+      rebalance_oor_since INTEGER,
+      rebalance_busy INTEGER NOT NULL DEFAULT 0,
+      rebalance_last_at INTEGER,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
@@ -283,5 +287,21 @@ export function initSchema(db: Database.Database): void {
   const hasFlipModePendingLastError = cols.some((c: any) => c.name === 'flip_mode_pending_last_error')
   if (!hasFlipModePendingLastError) {
     db.exec("ALTER TABLE positions ADD COLUMN flip_mode_pending_last_error TEXT")
+  }
+  const hasAutoRebalanceEnabled = cols.some((c: any) => c.name === 'auto_rebalance_enabled')
+  if (!hasAutoRebalanceEnabled) {
+    db.exec("ALTER TABLE positions ADD COLUMN auto_rebalance_enabled INTEGER NOT NULL DEFAULT 0")
+  }
+  const hasRebalanceOorSince = cols.some((c: any) => c.name === 'rebalance_oor_since')
+  if (!hasRebalanceOorSince) {
+    db.exec("ALTER TABLE positions ADD COLUMN rebalance_oor_since INTEGER")
+  }
+  const hasRebalanceBusy = cols.some((c: any) => c.name === 'rebalance_busy')
+  if (!hasRebalanceBusy) {
+    db.exec("ALTER TABLE positions ADD COLUMN rebalance_busy INTEGER NOT NULL DEFAULT 0")
+  }
+  const hasRebalanceLastAt = cols.some((c: any) => c.name === 'rebalance_last_at')
+  if (!hasRebalanceLastAt) {
+    db.exec("ALTER TABLE positions ADD COLUMN rebalance_last_at INTEGER")
   }
 }
