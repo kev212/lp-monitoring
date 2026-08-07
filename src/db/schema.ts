@@ -104,6 +104,8 @@ export function initSchema(db: Database.Database): void {
       trailing_enabled INTEGER NOT NULL DEFAULT 1,
       trailing_activation_pct REAL NOT NULL,
       trailing_stop_drop_pct REAL NOT NULL,
+      rebalance_tp_percent REAL,
+      rebalance_sl_percent REAL,
       revision INTEGER NOT NULL DEFAULT 0,
       updated_at INTEGER NOT NULL
     );
@@ -303,5 +305,15 @@ export function initSchema(db: Database.Database): void {
   const hasRebalanceLastAt = cols.some((c: any) => c.name === 'rebalance_last_at')
   if (!hasRebalanceLastAt) {
     db.exec("ALTER TABLE positions ADD COLUMN rebalance_last_at INTEGER")
+  }
+
+  const riskCols = db.prepare("PRAGMA table_info('risk_settings')").all() as any[]
+  const hasRebalanceTpPercent = riskCols.some((c: any) => c.name === 'rebalance_tp_percent')
+  if (!hasRebalanceTpPercent) {
+    db.exec("ALTER TABLE risk_settings ADD COLUMN rebalance_tp_percent REAL")
+  }
+  const hasRebalanceSlPercent = riskCols.some((c: any) => c.name === 'rebalance_sl_percent')
+  if (!hasRebalanceSlPercent) {
+    db.exec("ALTER TABLE risk_settings ADD COLUMN rebalance_sl_percent REAL")
   }
 }

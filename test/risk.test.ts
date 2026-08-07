@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { buildBinRangeDisplay, formatCompactPrice } from '../src/telegram/binDisplay.js'
 import { formatDashboardPositionLines, formatOpeningDashboardLines, formatPnlUsd, parseRiskInput } from '../src/telegram/control.js'
-import { validateRiskSettings } from '../src/risk/settings.js'
+import { effectiveRiskSettings, validateRiskSettings } from '../src/risk/settings.js'
 import { evaluateTrigger } from '../src/risk/rules.js'
 import type { PositionRow } from '../src/types.js'
 
@@ -104,15 +104,83 @@ test('validates global risk inputs', () => {
   assert.equal(parseRiskInput('tp', '8'), 8)
   assert.equal(parseRiskInput('trail_arm', '3'), 3)
   assert.equal(parseRiskInput('trail_drop', '1%'), 1)
+  assert.equal(parseRiskInput('rebal_tp', '6'), 6)
+  assert.equal(parseRiskInput('rebal_sl', '-10'), -10)
   assert.equal(parseRiskInput('sl', '12'), null)
   assert.equal(parseRiskInput('tp', '1e2'), null)
+  assert.equal(parseRiskInput('rebal_tp', '0'), null)
+  assert.equal(parseRiskInput('rebal_tp', '1500'), null)
+  assert.equal(parseRiskInput('rebal_sl', '5'), null)
+  assert.equal(parseRiskInput('rebal_sl', '-150'), null)
   assert.throws(() => validateRiskSettings({
     slPercent: -12,
     tpPercent: 8,
     trailingEnabled: true,
     trailingActivationPct: 1,
     trailingStopDropPct: 1,
+    rebalanceTpPercent: null,
+    rebalanceSlPercent: null,
   }))
+  assert.throws(() => validateRiskSettings({
+    slPercent: -12,
+    tpPercent: 8,
+    trailingEnabled: true,
+    trailingActivationPct: 1,
+    trailingStopDropPct: 1,
+    rebalanceTpPercent: 5,
+    rebalanceSlPercent: 3,
+  }))
+})
+
+test('applies rebalance TP/SL only to Auto Rebalance positions with global fallback', () => {
+  const settings = {
+    slPercent: -25,
+    tpPercent: 5,
+    trailingEnabled: true,
+    trailingActivationPct: 3,
+    trailingStopDropPct: 1,
+    rebalanceTpPercent: 3,
+    rebalanceSlPercent: -10,
+    revision: 1,
+    updatedAt: 1,
+  }
+
+  assert.deepEqual(effectiveRiskSettings(settings, { autoRebalanceEnabled: false }), settings)
+  const rebalanceSettings = effectiveRiskSettings(settings, { autoRebalanceEnabled: true })
+  assert.equal(rebalanceSettings.tpPercent, 3)
+  assert.equal(rebalanceSettings.slPercent, -10)
+
+  const unset = { ...settings, rebalanceTpPercent: null, rebalanceSlPercent: null }
+  const fallback = effectiveRiskSettings(unset, { autoRebalanceEnabled: true })
+  assert.equal(fallback.tpPercent, 5)
+  assert.equal(fallback.slPercent, -25)
+})
+
+test('excludes BIN_RANGE close for Auto Rebalance positions', () => {
+  const binData = { upperBinId: 100, poolActiveBinId: 95 }
+  const basePosition = {
+    status: 'monitoring',
+    drawdownTpOverrideActive: false,
+    trailingActivated: false,
+    peakPnlPercent: 0,
+    triggerConfirmations: 0,
+  } as PositionRow
+  const settings = {
+    slPercent: -20,
+    tpPercent: 20,
+    trailingEnabled: false,
+    trailingActivationPct: 3,
+    trailingStopDropPct: 1,
+    revision: 1,
+    updatedAt: 1,
+  }
+
+  const normal = evaluateTrigger({ ...basePosition, autoRebalanceEnabled: false }, 6, binData, settings, false)
+  assert.equal(normal.shouldTrigger, true)
+  assert.equal(normal.triggerType, 'BIN_RANGE')
+
+  const rebalance = evaluateTrigger({ ...basePosition, autoRebalanceEnabled: true }, 6, binData, settings, false)
+  assert.equal(rebalance.shouldTrigger, false)
 })
 
 test('trailing remains eligible when bin-range distance is outside its window', () => {
@@ -129,6 +197,8 @@ test('trailing remains eligible when bin-range distance is outside its window', 
     trailingEnabled: true,
     trailingActivationPct: 3,
     trailingStopDropPct: 1,
+    rebalanceTpPercent: null,
+    rebalanceSlPercent: null,
     revision: 1,
     updatedAt: 1,
   }, false)
@@ -151,6 +221,8 @@ test('disabled trailing cannot trigger', () => {
     trailingEnabled: false,
     trailingActivationPct: 3,
     trailingStopDropPct: 1,
+    rebalanceTpPercent: null,
+    rebalanceSlPercent: null,
     revision: 1,
     updatedAt: 1,
   }, false)

@@ -1,6 +1,6 @@
 import { config } from '../config.js'
 import { getDb } from '../db/client.js'
-import type { GlobalRiskSettings, RiskSettingField } from '../types.js'
+import type { GlobalRiskSettings, PositionRow, RiskSettingField } from '../types.js'
 
 export interface RiskSettingsPatch {
   slPercent?: number
@@ -8,6 +8,8 @@ export interface RiskSettingsPatch {
   trailingEnabled?: boolean
   trailingActivationPct?: number
   trailingStopDropPct?: number
+  rebalanceTpPercent?: number | null
+  rebalanceSlPercent?: number | null
 }
 
 export interface RiskSettingsActor {
@@ -22,6 +24,8 @@ export function defaultRiskSettings(): Omit<GlobalRiskSettings, 'revision' | 'up
     trailingEnabled: true,
     trailingActivationPct: config.trailingActivationPct,
     trailingStopDropPct: config.trailingStopDropPct,
+    rebalanceTpPercent: null,
+    rebalanceSlPercent: null,
   }
 }
 
@@ -38,6 +42,16 @@ export function validateRiskSettings(settings: Omit<GlobalRiskSettings, 'revisio
   if (!Number.isFinite(settings.trailingStopDropPct) || settings.trailingStopDropPct <= 0 || settings.trailingStopDropPct >= settings.trailingActivationPct) {
     throw new Error('Trailing drop must be positive and lower than the trailing arm')
   }
+  if (settings.rebalanceTpPercent !== null) {
+    if (!Number.isFinite(settings.rebalanceTpPercent) || settings.rebalanceTpPercent <= 0 || settings.rebalanceTpPercent > 1000) {
+      throw new Error('Rebalance Take Profit must be greater than 0% and at most 1000%')
+    }
+  }
+  if (settings.rebalanceSlPercent !== null) {
+    if (!Number.isFinite(settings.rebalanceSlPercent) || settings.rebalanceSlPercent >= 0 || settings.rebalanceSlPercent <= -100) {
+      throw new Error('Rebalance Stop Loss must be greater than -100% and less than 0%')
+    }
+  }
 }
 
 function rowToRiskSettings(row: any): GlobalRiskSettings {
@@ -47,6 +61,12 @@ function rowToRiskSettings(row: any): GlobalRiskSettings {
     trailingEnabled: row.trailing_enabled === 1,
     trailingActivationPct: Number(row.trailing_activation_pct),
     trailingStopDropPct: Number(row.trailing_stop_drop_pct),
+    rebalanceTpPercent: row.rebalance_tp_percent === null || row.rebalance_tp_percent === undefined
+      ? null
+      : Number(row.rebalance_tp_percent),
+    rebalanceSlPercent: row.rebalance_sl_percent === null || row.rebalance_sl_percent === undefined
+      ? null
+      : Number(row.rebalance_sl_percent),
     revision: Number(row.revision),
     updatedAt: Number(row.updated_at),
   }
@@ -65,14 +85,17 @@ function ensureRiskSettings(): GlobalRiskSettings {
   return db.transaction(() => {
     const inserted = db.prepare(`
       INSERT OR IGNORE INTO risk_settings
-        (id, sl_percent, tp_percent, trailing_enabled, trailing_activation_pct, trailing_stop_drop_pct, revision, updated_at)
-      VALUES (1, ?, ?, ?, ?, ?, 0, ?)
+        (id, sl_percent, tp_percent, trailing_enabled, trailing_activation_pct, trailing_stop_drop_pct,
+         rebalance_tp_percent, rebalance_sl_percent, revision, updated_at)
+      VALUES (1, ?, ?, ?, ?, ?, ?, ?, 0, ?)
     `).run(
       defaults.slPercent,
       defaults.tpPercent,
       defaults.trailingEnabled ? 1 : 0,
       defaults.trailingActivationPct,
       defaults.trailingStopDropPct,
+      defaults.rebalanceTpPercent,
+      defaults.rebalanceSlPercent,
       now,
     )
     if (inserted.changes === 1) {
@@ -90,12 +113,26 @@ export function getRiskSettings(): GlobalRiskSettings {
   return ensureRiskSettings()
 }
 
-export function riskSettingValue(settings: GlobalRiskSettings, field: RiskSettingField): number | boolean {
+export function riskSettingValue(settings: GlobalRiskSettings, field: RiskSettingField): number | boolean | null {
   if (field === 'sl') return settings.slPercent
   if (field === 'tp') return settings.tpPercent
   if (field === 'trail_arm') return settings.trailingActivationPct
   if (field === 'trail_drop') return settings.trailingStopDropPct
+  if (field === 'rebal_tp') return settings.rebalanceTpPercent
+  if (field === 'rebal_sl') return settings.rebalanceSlPercent
   return settings.trailingEnabled
+}
+
+export function effectiveRiskSettings(
+  settings: GlobalRiskSettings,
+  position: Pick<PositionRow, 'autoRebalanceEnabled'>,
+): GlobalRiskSettings {
+  if (!position.autoRebalanceEnabled) return settings
+  return {
+    ...settings,
+    tpPercent: settings.rebalanceTpPercent ?? settings.tpPercent,
+    slPercent: settings.rebalanceSlPercent ?? settings.slPercent,
+  }
 }
 
 export function updateGlobalRiskSettings(patch: RiskSettingsPatch, actor: RiskSettingsActor = {}): GlobalRiskSettings {
@@ -106,6 +143,8 @@ export function updateGlobalRiskSettings(patch: RiskSettingsPatch, actor: RiskSe
     trailingEnabled: patch.trailingEnabled ?? current.trailingEnabled,
     trailingActivationPct: patch.trailingActivationPct ?? current.trailingActivationPct,
     trailingStopDropPct: patch.trailingStopDropPct ?? current.trailingStopDropPct,
+    rebalanceTpPercent: patch.rebalanceTpPercent === undefined ? current.rebalanceTpPercent : patch.rebalanceTpPercent,
+    rebalanceSlPercent: patch.rebalanceSlPercent === undefined ? current.rebalanceSlPercent : patch.rebalanceSlPercent,
   }
   validateRiskSettings(nextValues)
 
@@ -114,6 +153,8 @@ export function updateGlobalRiskSettings(patch: RiskSettingsPatch, actor: RiskSe
     || current.trailingEnabled !== nextValues.trailingEnabled
     || current.trailingActivationPct !== nextValues.trailingActivationPct
     || current.trailingStopDropPct !== nextValues.trailingStopDropPct
+    || current.rebalanceTpPercent !== nextValues.rebalanceTpPercent
+    || current.rebalanceSlPercent !== nextValues.rebalanceSlPercent
   if (!changed) return current
 
   const now = Date.now()
@@ -128,6 +169,7 @@ export function updateGlobalRiskSettings(patch: RiskSettingsPatch, actor: RiskSe
       UPDATE risk_settings
       SET sl_percent = ?, tp_percent = ?, trailing_enabled = ?,
           trailing_activation_pct = ?, trailing_stop_drop_pct = ?,
+          rebalance_tp_percent = ?, rebalance_sl_percent = ?,
           revision = ?, updated_at = ?
       WHERE id = 1 AND revision = ?
     `).run(
@@ -136,6 +178,8 @@ export function updateGlobalRiskSettings(patch: RiskSettingsPatch, actor: RiskSe
       nextValues.trailingEnabled ? 1 : 0,
       nextValues.trailingActivationPct,
       nextValues.trailingStopDropPct,
+      nextValues.rebalanceTpPercent,
+      nextValues.rebalanceSlPercent,
       nextRevision,
       now,
       current.revision,

@@ -50,7 +50,7 @@ import { isOorAbove, rebalanceTimerStatus } from './meteora/rebalance.js'
 import { executeDirectionalPrecisionCurve, THRESHOLD_RATIO, THRESHOLD_MIN, RECOVERY_MS } from './meteora/precisionCurve.js'
 import { calculateFlipProgressPct, executeFlipMode, retryPendingFlipAdd } from './meteora/flipMode.js'
 import { evaluateTrigger, type BinData } from './risk/rules.js'
-import { getRiskSettings } from './risk/settings.js'
+import { effectiveRiskSettings, getRiskSettings } from './risk/settings.js'
 import {
   sendNotification,
   sendNotificationAsync,
@@ -629,7 +629,7 @@ async function monitorSinglePosition(
       return
     }
 
-    const decision = evaluateTrigger(pos, pnlPercent, binData, riskSettings)
+    const decision = evaluateTrigger(pos, pnlPercent, binData, effectiveRiskSettings(riskSettings, pos))
     if (decision.shouldTrigger && decision.triggerType) {
       let triggerType = decision.triggerType
       // LP Agent is diagnostic only; on-chain valuation remains authoritative.
@@ -703,7 +703,7 @@ async function monitorSinglePosition(
           }
         }
 
-        const latestRiskSettings = getRiskSettings()
+        const latestRiskSettings = effectiveRiskSettings(getRiskSettings(), latestPosition)
         const freshDecision = evaluateTrigger(
           latestPosition,
           freshPnlPct,

@@ -53,8 +53,10 @@ export function evaluateTrigger(
     reason = `TP hit: ${currentPnlPercent.toFixed(2)}% >= ${tp}%${overrideNote}`
   }
   // Priority 3: BIN_RANGE — auto close when PnL > threshold & close to upper bin.
+  // Excluded for Auto Rebalance positions: the mode handles out-of-range movement itself.
   else {
-    if (config.binRangeCloseEnabled &&
+    if (!position.autoRebalanceEnabled &&
+        config.binRangeCloseEnabled &&
         binData?.upperBinId !== undefined &&
         binData?.poolActiveBinId !== undefined &&
         currentPnlPercent > config.binRangePnlThreshold) {
