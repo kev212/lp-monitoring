@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { buildRebalanceRange, decideRebalanceReopen, isOorAbove, rebalanceTimerStatus } from '../src/meteora/rebalance.js'
+import { buildRebalanceRange, decideRebalanceReopen, isOorAbove, rebalanceCloseDisposition, rebalanceTimerStatus } from '../src/meteora/rebalance.js'
 
 const MINUTE = 60_000
 
@@ -39,4 +39,10 @@ test('defers the reopen while the close is still finalizing and aborts on close 
   assert.equal(decideRebalanceReopen('error'), 'abort')
   assert.equal(decideRebalanceReopen(undefined), 'abort')
   assert.equal(decideRebalanceReopen('opening'), 'ignore')
+})
+
+test('classifies a pending close as deferred even when success is false', () => {
+  assert.equal(rebalanceCloseDisposition({ success: false, pendingRecovery: true }), 'deferred')
+  assert.equal(rebalanceCloseDisposition({ success: true, pendingRecovery: false }), 'ok')
+  assert.equal(rebalanceCloseDisposition({ success: false, pendingRecovery: false }), 'failed')
 })

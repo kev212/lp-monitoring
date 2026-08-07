@@ -46,7 +46,7 @@ import {
 } from './meteora/exit.js'
 import { reconcilePendingOpens } from './meteora/open.js'
 import { executeRebalanceOpen } from './meteora/open.js'
-import { isOorAbove, listRebalanceReopenIntents, persistRebalanceReopenIntent, rebalanceTimerStatus, reconcilePendingRebalanceOpens } from './meteora/rebalance.js'
+import { isOorAbove, listRebalanceReopenIntents, persistRebalanceReopenIntent, rebalanceCloseDisposition, rebalanceTimerStatus, reconcilePendingRebalanceOpens } from './meteora/rebalance.js'
 import { executeDirectionalPrecisionCurve, THRESHOLD_RATIO, THRESHOLD_MIN, RECOVERY_MS } from './meteora/precisionCurve.js'
 import { calculateFlipProgressPct, executeFlipMode, retryPendingFlipAdd } from './meteora/flipMode.js'
 import { evaluateTrigger, type BinData } from './risk/rules.js'
@@ -1187,10 +1187,8 @@ async function maybeRunAutoRebalance(
         true,
         true,
       )
-      if (!closeResult.success) {
-        throw new Error(closeResult.error || 'rebalance close failed')
-      }
-      if (closeResult.pendingRecovery) {
+      const disposition = rebalanceCloseDisposition(closeResult)
+      if (disposition === 'deferred') {
         persistRebalanceReopenIntent(pos.owner, {
           positionPubkey: pos.positionPubkey,
           poolPubkey: pos.poolPubkey,
@@ -1206,6 +1204,9 @@ async function maybeRunAutoRebalance(
           `Reopen otomatis setelah posisi final ditutup.`
         )
         return { deferred: true as const }
+      }
+      if (disposition === 'failed') {
+        throw new Error(closeResult.error || 'rebalance close failed')
       }
       return {
         deferred: false as const,

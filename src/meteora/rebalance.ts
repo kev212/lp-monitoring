@@ -100,6 +100,14 @@ export function decideRebalanceReopen(status: PositionRow['status'] | undefined)
   return 'ignore'
 }
 
+export type RebalanceCloseDisposition = 'deferred' | 'failed' | 'ok'
+
+export function rebalanceCloseDisposition(result: { success: boolean; pendingRecovery: boolean }): RebalanceCloseDisposition {
+  if (result.pendingRecovery) return 'deferred'
+  if (!result.success) return 'failed'
+  return 'ok'
+}
+
 export async function reconcilePendingRebalanceOpens(connection: Connection, wallet: Keypair): Promise<void> {
   await withWalletExecutionLock(async () => {
     const owner = wallet.publicKey.toBase58()
