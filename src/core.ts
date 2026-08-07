@@ -46,7 +46,7 @@ import {
 } from './meteora/exit.js'
 import { reconcilePendingOpens } from './meteora/open.js'
 import { executeRebalanceOpen } from './meteora/open.js'
-import { isOorAbove, rebalanceTimerStatus } from './meteora/rebalance.js'
+import { isOorAbove, listRebalanceReopenIntents, persistRebalanceReopenIntent, rebalanceTimerStatus, reconcilePendingRebalanceOpens } from './meteora/rebalance.js'
 import { executeDirectionalPrecisionCurve, THRESHOLD_RATIO, THRESHOLD_MIN, RECOVERY_MS } from './meteora/precisionCurve.js'
 import { calculateFlipProgressPct, executeFlipMode, retryPendingFlipAdd } from './meteora/flipMode.js'
 import { evaluateTrigger, type BinData } from './risk/rules.js'
@@ -133,7 +133,9 @@ export async function startBot(): Promise<void> {
   await reconcilePendingExits(getConnection(), wallet)
   await flushExitCompletionNotifications()
   await reconcilePendingOpens(getConnection())
-  for (const position of loadKnownPositions().filter(p => p.rebalanceBusy && p.status === 'closed')) {
+  await reconcilePendingRebalanceOpens(getConnection(), wallet)
+  const pendingRebalancePositions = new Set(listRebalanceReopenIntents().map(intent => intent.positionPubkey))
+  for (const position of loadKnownPositions().filter(p => p.rebalanceBusy && p.status === 'closed' && !pendingRebalancePositions.has(p.positionPubkey))) {
     updateRebalanceBusy(position.positionPubkey, false)
     const pair = `${position.tokenXSymbol || position.tokenXMint.slice(0, 4)}/${position.tokenYSymbol || position.tokenYMint.slice(0, 4)}`
     console.log(`[rebalance] ${pair} | interrupted rebalance recovered; position closed with funds in wallet`)
@@ -159,6 +161,7 @@ export async function startBot(): Promise<void> {
       if (loopNow - lastExitRecoveryAt >= config.exitRecoveryPollMs) {
         lastExitRecoveryAt = loopNow
         await reconcilePendingExits(getConnection(), wallet)
+        await reconcilePendingRebalanceOpens(getConnection(), wallet)
         await flushExitCompletionNotifications()
       }
 
@@ -1168,7 +1171,7 @@ async function maybeRunAutoRebalance(
   )
 
   try {
-    const { exitResult, openResult } = await withWalletExecutionLock(async () => {
+    const outcome = await withWalletExecutionLock(async () => {
       const closeResult = await executeExit(
         getConnection(),
         getWallet(),
@@ -1184,10 +1187,28 @@ async function maybeRunAutoRebalance(
         true,
         true,
       )
-      if (!closeResult.success || closeResult.pendingRecovery) {
-        throw new Error(closeResult.error || 'rebalance close pending reconciliation')
+      if (!closeResult.success) {
+        throw new Error(closeResult.error || 'rebalance close failed')
+      }
+      if (closeResult.pendingRecovery) {
+        persistRebalanceReopenIntent(pos.owner, {
+          positionPubkey: pos.positionPubkey,
+          poolPubkey: pos.poolPubkey,
+          quoteCurrency: pos.quoteCurrency,
+          amountQuote: pos.basisQuote,
+          rangeWidth,
+        })
+        console.log(`[rebalance] ${tokenLabel} | close confirmed — reopen will run once finality reconciliation completes`)
+        sendNotification(
+          `⏳ <b>Auto Rebalance — Close In Progress</b>\n\n` +
+          `<b>${tokenLabel}</b>\n` +
+          `Remove liquidity confirmed; waiting for finality.\n` +
+          `Reopen otomatis setelah posisi final ditutup.`
+        )
+        return { deferred: true as const }
       }
       return {
+        deferred: false as const,
         exitResult: closeResult,
         openResult: await executeRebalanceOpen(
           getConnection(),
@@ -1202,7 +1223,9 @@ async function maybeRunAutoRebalance(
         ),
       }
     })
+    if (outcome.deferred) return true
 
+    const { exitResult, openResult } = outcome
     console.log(`[rebalance] ${tokenLabel} | closed ${pos.positionPubkey.slice(0, 8)} (${exitResult.removeLiqSig?.slice(0, 8) || 'n/a'}) and reopened as ${openResult.positionPubkey.slice(0, 8)}`)
     sendNotification(
       `✅ <b>Auto Rebalance Complete</b>\n\n` +

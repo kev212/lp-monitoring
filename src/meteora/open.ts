@@ -406,6 +406,10 @@ function findPendingOpen(owner: string): PendingOpenState | null {
   return row ? parsePendingOpenState(row.value) : null
 }
 
+export function pendingOpenExists(owner: string): boolean {
+  return findPendingOpen(owner) !== null
+}
+
 function ensureOpenWalletLease(state: PendingOpenState): void {
   const db = getDb()
   db.transaction(() => {

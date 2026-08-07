@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { buildRebalanceRange, isOorAbove, rebalanceTimerStatus } from '../src/meteora/rebalance.js'
+import { buildRebalanceRange, decideRebalanceReopen, isOorAbove, rebalanceTimerStatus } from '../src/meteora/rebalance.js'
 
 const MINUTE = 60_000
 
@@ -29,4 +29,14 @@ test('builds the rebalance range anchored at the active bin with the original wi
   assert.throws(() => buildRebalanceRange(10, 0), /at least 1 bin/)
   assert.throws(() => buildRebalanceRange(10, 100_000), /position limit/)
   assert.throws(() => buildRebalanceRange(10.5, 5), /invalid/)
+})
+
+test('defers the reopen while the close is still finalizing and aborts on close failure', () => {
+  assert.equal(decideRebalanceReopen('monitoring'), 'defer')
+  assert.equal(decideRebalanceReopen('exiting'), 'defer')
+  assert.equal(decideRebalanceReopen('discovering'), 'defer')
+  assert.equal(decideRebalanceReopen('closed'), 'reopen')
+  assert.equal(decideRebalanceReopen('error'), 'abort')
+  assert.equal(decideRebalanceReopen(undefined), 'abort')
+  assert.equal(decideRebalanceReopen('opening'), 'ignore')
 })
