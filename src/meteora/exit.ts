@@ -962,6 +962,72 @@ async function completeExitWithoutSwap(
   }
 }
 
+async function walletHasNoSwapObligation(
+  connection: Connection,
+  wallet: Keypair,
+  state: ExitPendingState,
+): Promise<boolean> {
+  for (const [mint, rawBaseline] of Object.entries(state.preSwapTokenBalances)) {
+    const balance = await getTokenBalance(connection, wallet.publicKey, mint, 2)
+    const consumed = BigInt(state.swapConsumed[mint] || '0')
+    if (swapObligation(BigInt(rawBaseline), consumed, balance) > 0n) return false
+  }
+  return true
+}
+
+async function completeExitAfterWalletSettlement(
+  connection: Connection,
+  wallet: Keypair,
+  state: ExitPendingState,
+  result: ExitResult,
+  queueCompletionNotification: boolean,
+): Promise<ExitResult> {
+  result.removeSucceeded = true
+  result.rentRefundSol = state.rentRefundSol
+  result.removeLiqSig = state.removeSignatures.at(-1)
+    || state.finalizing.find(finalizing => finalizing.kind === 'remove')?.attempt.signature
+    || result.removeLiqSig
+    || null
+  result.swapSig = state.swapSignatures.at(-1) || null
+
+  let solMeasured = false
+  let quoteMeasured = false
+  try {
+    const postSolBalance = await withRpcTimeout(
+      withRpcFallback(rpc => rpc.getBalance(wallet.publicKey, 'finalized'), connection),
+      EXIT_RPC_TIMEOUT_MS,
+    )
+    result.solReceived = (postSolBalance - state.preSolBalance) / 1_000_000_000
+    solMeasured = true
+    if (state.quoteCurrency === 'USDC') {
+      const postUsdcBalance = await getTokenBalance(connection, wallet.publicKey, USDC_MINT, 2)
+      result.usdcReceived = Number(positiveBalanceDelta(BigInt(state.preUsdcBalance), postUsdcBalance)) / 1e6
+      quoteMeasured = true
+    } else {
+      quoteMeasured = true
+    }
+  } catch (err) {
+    console.log(`[exit] wallet settlement detected but quote receipt measurement is pending: ${err instanceof Error ? err.message : 'unknown'}`)
+  }
+
+  state.finalizing = []
+  state.currentSwap = null
+  state.stage = 'swap_pending'
+  clearExitRetry(state)
+  const quoteReceived = state.quoteCurrency === 'USDC' ? result.usdcReceived : result.solReceived
+  finishExit(state, 'completed', 'closed', {
+    removeLiqSig: result.removeLiqSig,
+    swapSig: result.swapSig,
+    finalSolReceived: solMeasured ? result.solReceived : null,
+    finalQuoteReceived: quoteMeasured ? quoteReceived : null,
+    errorMessage: quoteMeasured ? null : 'completed after wallet settlement; quote receipt not measured',
+  }, queueCompletionNotification && quoteMeasured)
+  result.success = true
+  result.pendingRecovery = false
+  console.log(`[exit] completed from wallet settlement${quoteMeasured ? `, received ${state.quoteCurrency === 'USDC' ? `${result.usdcReceived.toFixed(2)} USDC` : `${result.solReceived.toFixed(6)} SOL`}` : ' (receipt not measured)'}`)
+  return result
+}
+
 async function settleExit(
   connection: Connection,
   wallet: Keypair,
@@ -1238,7 +1304,8 @@ async function reconcilePendingExitsUnlocked(connection: Connection, wallet: Key
          `).run(JSON.stringify(state), Date.now(), row.key, row.value)
          if (migrated.changes !== 1) throw new Error('durable exit state changed during migration')
        }
-       if (state.nextRetryAt > Date.now()) continue
+       const retryDue = state.nextRetryAt <= Date.now()
+       if (!retryDue && (!state.baselineReady || state.removeSignatures.length === 0 || state.currentRemove)) continue
        ensureExitWalletLease(state)
        getDb().prepare('DELETE FROM sync_state WHERE key = ?').run(`exit_wallet:${state.owner}`)
       const result: ExitResult = {
@@ -1257,6 +1324,19 @@ async function reconcilePendingExitsUnlocked(connection: Connection, wallet: Key
        }
 
        if (!await ensureExitBaseline(connection, wallet, state)) continue
+
+       if (state.removeSignatures.length > 0 && !state.currentRemove) {
+         try {
+           if (await walletHasNoSwapObligation(connection, wallet, state)) {
+             await completeExitAfterWalletSettlement(connection, wallet, state, result, true)
+             continue
+           }
+         } catch {
+           // Keep the durable state and continue finality/swap reconciliation.
+         }
+       }
+
+       if (state.nextRetryAt > Date.now()) continue
 
        if (state.finalizing.length > 0) {
         const finalizingAttempts = [...state.finalizing]
