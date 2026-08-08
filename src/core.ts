@@ -43,6 +43,7 @@ import {
   executeExit,
   listPendingExitNotifications,
   reconcilePendingExits,
+  recoverLegacyFailedExits,
 } from './meteora/exit.js'
 import { reconcilePendingOpens } from './meteora/open.js'
 import { executeRebalanceOpen } from './meteora/open.js'
@@ -142,6 +143,7 @@ export async function startBot(): Promise<void> {
   const reshapeRecovery = await reconcileDurableReshapeOperation(getConnection(), ownerStr)
   if (reshapeRecovery === 'review') console.log('[reshape] recovered transaction requires manual position review')
   await reconcilePendingExits(getConnection(), wallet)
+  await recoverLegacyFailedExits(getConnection(), wallet)
   await flushExitCompletionNotifications()
   notifyOpenReconcileFailures(await reconcilePendingOpens(getConnection()))
   await reconcilePendingRebalanceOpens(getConnection(), wallet)
@@ -186,6 +188,7 @@ export async function startBot(): Promise<void> {
           sendNotification('🚨 <b>Reshape Recovery Requires Review</b>\n\nA finalized partial Flip/Precision transaction was recovered after restart. The position was marked error to prevent duplicate wallet mutations.')
         }
         notifyOpenReconcileFailures(await reconcilePendingOpens(getConnection()))
+        await recoverLegacyFailedExits(getConnection(), wallet)
         await discoverInitialPositions(getConnection(), walletPubkey, ownerStr)
       }
 

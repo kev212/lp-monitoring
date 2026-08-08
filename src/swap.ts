@@ -6,6 +6,21 @@ import { confirmSignature } from './solana/confirmation.js'
 import { withRpcFallback } from './solana/connection.js'
 
 const WSOL_MINT = 'So11111111111111111111111111111111111111112'
+const SWAP_RPC_TIMEOUT_MS = 10_000
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: NodeJS.Timeout | undefined
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`swap RPC timeout (${timeoutMs / 1000}s)`)), timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
 
 export function normalizeRawSwapAmount(amount: string): string {
   if (!/^\d+$/.test(amount)) throw new Error('Swap amount must be a raw integer')
@@ -39,9 +54,12 @@ export type SwapAttemptSettlement = (signature: string, status: 'confirmed' | 'f
 
 async function getRawTokenBalance(connection: Connection, wallet: Keypair, mint: string): Promise<bigint | null> {
   try {
-    const accounts = await withRpcFallback(
-      rpc => rpc.getTokenAccountsByOwner(wallet.publicKey, { mint: new PublicKey(mint) }),
-      connection,
+    const accounts = await withTimeout(
+      withRpcFallback(
+        rpc => rpc.getTokenAccountsByOwner(wallet.publicKey, { mint: new PublicKey(mint) }, { commitment: 'finalized' }),
+        connection,
+      ),
+      SWAP_RPC_TIMEOUT_MS,
     )
     if (accounts.value.length > 0) {
       let total = 0n
@@ -131,7 +149,11 @@ async function tryLegacySwap(
       outputMint,
       rawAmount,
     })
-    const sig = await connection.sendTransaction(tx, { skipPreflight: true, maxRetries: 3 })
+    const serialized = Buffer.from(tx.serialize())
+    const sig = await withRpcFallback(
+      rpc => rpc.sendRawTransaction(serialized, { skipPreflight: true, maxRetries: 3 }),
+      connection,
+    )
     if (sig !== sentSig) throw new Error('RPC returned a signature that does not match the signed swap transaction')
     const confirmation = await confirmSignature(
       connection,
@@ -243,7 +265,11 @@ async function attemptSwap(
       outputMint,
       rawAmount,
     })
-    const rpcSignature = await connection.sendTransaction(tx, { skipPreflight: true, maxRetries: 3 })
+    const serialized = Buffer.from(tx.serialize())
+    const rpcSignature = await withRpcFallback(
+      rpc => rpc.sendRawTransaction(serialized, { skipPreflight: true, maxRetries: 3 }),
+      connection,
+    )
     if (rpcSignature !== sentSig) throw new Error('RPC returned a signature that does not match the signed swap transaction')
     const confirmation = await confirmSignature(
       connection,

@@ -2,13 +2,21 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { Connection, Keypair, Transaction, TransactionInstruction } from '@solana/web3.js'
 import bs58 from 'bs58'
-import { collectExitBaselines, positiveBalanceDelta, sendTrackedTransaction } from '../src/meteora/exit.js'
+import { collectExitBaselines, exitRetryDelayMs, positiveBalanceDelta, sendTrackedTransaction, swapObligation } from '../src/meteora/exit.js'
 import { formatExitReconciled } from '../src/telegram.js'
 
 test('isolates only newly received close proceeds from an existing wallet balance', () => {
   assert.equal(positiveBalanceDelta(1_000n, 1_450n), 450n)
   assert.equal(positiveBalanceDelta(1_000n, 1_000n), 0n)
   assert.equal(positiveBalanceDelta(1_000n, 900n), 0n)
+})
+
+test('keeps retry backoff bounded and excludes already-consumed swap input', () => {
+  assert.equal(exitRetryDelayMs(0), 2_000)
+  assert.equal(exitRetryDelayMs(1), 4_000)
+  assert.equal(exitRetryDelayMs(20), 300_000)
+  assert.equal(swapObligation(1_000n, 450n, 1_450n), 0n)
+  assert.equal(swapObligation(1_000n, 450n, 1_600n), 150n)
 })
 
 function signedTestTransaction(wallet: Keypair): Transaction {
