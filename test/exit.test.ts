@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { Connection, Keypair, Transaction, TransactionInstruction } from '@solana/web3.js'
 import bs58 from 'bs58'
-import { collectExitBaselines, exitRetryDelayMs, positiveBalanceDelta, sendTrackedTransaction, swapObligation } from '../src/meteora/exit.js'
+import { collectExitBaselines, exitRetryDelayMs, finalizedSettlementSlot, getTokenBalance, positiveBalanceDelta, sendTrackedTransaction, swapObligation } from '../src/meteora/exit.js'
 import { formatExitReconciled } from '../src/telegram.js'
 
 test('isolates only newly received close proceeds from an existing wallet balance', () => {
@@ -93,6 +93,68 @@ test('aborts baseline collection when an RPC balance read fails', async () => {
   await assert.rejects(
     collectExitBaselines(connection, Keypair.generate().publicKey, 'SOL', []),
     /RPC unavailable/,
+  )
+})
+
+test('withholds settlement until every exit transaction is finalized', async () => {
+  const connection = {
+    getSignatureStatus: async (signature: string) => ({
+      value: signature === 'done'
+        ? { slot: 42, err: null, confirmationStatus: 'finalized' }
+        : { slot: 43, err: null, confirmationStatus: 'confirmed' },
+    }),
+  } as unknown as Connection
+
+  assert.equal(await finalizedSettlementSlot(connection, ['done', 'pending']), null)
+})
+
+test('uses the highest finalized slot as the settlement floor', async () => {
+  const slots: Record<string, number> = { first: 41, second: 43 }
+  const connection = {
+    getSignatureStatus: async (signature: string) => ({
+      value: { slot: slots[signature], err: null, confirmationStatus: 'finalized' },
+    }),
+  } as unknown as Connection
+
+  assert.equal(await finalizedSettlementSlot(connection, ['first', 'second']), 43)
+  assert.equal(await finalizedSettlementSlot(connection, []), 0)
+})
+
+test('rejects settlement gating when an exit transaction failed on-chain', async () => {
+  const connection = {
+    getSignatureStatus: async () => ({
+      value: { slot: 42, err: { InstructionError: [0, 'Custom'] }, confirmationStatus: 'finalized' },
+    }),
+  } as unknown as Connection
+
+  await assert.rejects(
+    finalizedSettlementSlot(connection, ['failed']),
+    /failed on-chain/,
+  )
+})
+
+test('requests token balances at or after the settlement slot', async () => {
+  let seenMinContextSlot = 0
+  const connection = {
+    getTokenAccountsByOwner: async (_owner: unknown, _filter: unknown, config: { minContextSlot?: number }) => {
+      seenMinContextSlot = config.minContextSlot ?? 0
+      return { context: { slot: 50 }, value: [] }
+    },
+  } as unknown as Connection
+
+  const balance = await getTokenBalance(connection, Keypair.generate().publicKey, 'So11111111111111111111111111111111111111112', 1, 42)
+  assert.equal(balance, 0n)
+  assert.equal(seenMinContextSlot, 42)
+})
+
+test('rejects a stale token balance read from a lagging RPC', async () => {
+  const connection = {
+    getTokenAccountsByOwner: async () => ({ context: { slot: 41 }, value: [] }),
+  } as unknown as Connection
+
+  await assert.rejects(
+    getTokenBalance(connection, Keypair.generate().publicKey, 'So11111111111111111111111111111111111111112', 1, 42),
+    /stale token balance read/,
   )
 })
 

@@ -227,7 +227,7 @@ export async function recoverLegacyFailedExits(connection: Connection, wallet: K
       )
       if (account) continue
       const tokensToSwap = exitTokensToSwap(row.token_x_mint, row.token_y_mint, row.quote_currency)
-      const balances = await Promise.all(tokensToSwap.map(mint => getTokenBalance(connection, wallet.publicKey, mint, 2)))
+      const balances = await Promise.all(tokensToSwap.map(mint => getTokenBalance(connection, wallet.publicKey, mint, 2, status.value!.slot)))
       if (balances.some(balance => balance > 0n)) {
         console.log(`[exit] legacy failed exit ${row.position_pubkey.slice(0, 8)} has non-quote balance; leaving it for explicit recovery`)
         continue
@@ -499,23 +499,34 @@ export function swapObligation(baseline: bigint, alreadyConsumed: bigint, curren
   return positiveBalanceDelta(baseline + alreadyConsumed, current)
 }
 
-async function getTokenBalance(
+/**
+ * Read a token balance at finalized commitment, optionally rejecting reads from
+ * an RPC whose context slot predates minContextSlot (i.e. pre-close state).
+ */
+export async function getTokenBalance(
   connection: Connection,
   owner: PublicKey,
   mint: string,
   attempts = 1,
+  minContextSlot = 0,
 ): Promise<bigint> {
   let lastError: unknown
   for (let attempt = 0; attempt < attempts; attempt++) {
     if (attempt > 0) await new Promise<void>(resolve => { setTimeout(resolve, 800) })
     try {
+      const balanceConfig = minContextSlot > 0
+        ? { commitment: 'finalized' as const, minContextSlot }
+        : { commitment: 'finalized' as const }
       const accounts = await withRpcTimeout(
         withRpcFallback(
-          rpc => rpc.getTokenAccountsByOwner(owner, { mint: new PublicKey(mint) }, { commitment: 'finalized' }),
+          rpc => rpc.getTokenAccountsByOwner(owner, { mint: new PublicKey(mint) }, balanceConfig),
           connection,
         ),
         EXIT_RPC_TIMEOUT_MS,
       )
+      if (minContextSlot > 0 && accounts.context.slot < minContextSlot) {
+        throw new Error(`stale token balance read at slot ${accounts.context.slot}, need >= ${minContextSlot}`)
+      }
       let total = 0n
       for (const acc of accounts.value) {
         const view = new DataView(acc.account.data.buffer, acc.account.data.byteOffset + 64, 8)
@@ -528,6 +539,53 @@ async function getTokenBalance(
     }
   }
   throw new Error(`token balance unavailable for ${mint.slice(0, 8)}: ${lastError instanceof Error ? lastError.message : 'RPC error'}`)
+}
+
+/**
+ * SOL balance at finalized commitment with the same stale-read guard as
+ * getTokenBalance.
+ */
+async function getSolBalance(
+  connection: Connection,
+  owner: PublicKey,
+  minContextSlot = 0,
+): Promise<number> {
+  const balanceConfig = minContextSlot > 0
+    ? { commitment: 'finalized' as const, minContextSlot }
+    : { commitment: 'finalized' as const }
+  const balance = await withRpcTimeout(
+    withRpcFallback(
+      rpc => rpc.getBalanceAndContext(owner, balanceConfig),
+      connection,
+    ),
+    EXIT_RPC_TIMEOUT_MS,
+  )
+  if (minContextSlot > 0 && balance.context.slot < minContextSlot) {
+    throw new Error(`stale SOL balance read at slot ${balance.context.slot}, need >= ${minContextSlot}`)
+  }
+  return balance.value
+}
+
+/**
+ * Highest finalized slot across the exit's transactions, or null while any of
+ * them has not reached finality. Settlement reads must be gated on this slot so
+ * a lagging RPC cannot report pre-close balances.
+ */
+export async function finalizedSettlementSlot(connection: Connection, signatures: string[]): Promise<number | null> {
+  let slot = 0
+  for (const signature of signatures) {
+    const status = await withRpcTimeout(
+      withRpcFallback(
+        rpc => rpc.getSignatureStatus(signature, { searchTransactionHistory: true }),
+        connection,
+      ),
+      EXIT_RPC_TIMEOUT_MS,
+    )
+    if (status.value?.err) throw new Error(`exit transaction ${signature.slice(0, 8)} failed on-chain`)
+    if (status.value?.confirmationStatus !== 'finalized') return null
+    slot = Math.max(slot, status.value.slot)
+  }
+  return slot
 }
 
 export async function collectExitBaselines(
@@ -929,13 +987,12 @@ async function completeExitWithoutSwap(
 ): Promise<ExitResult> {
   const quoteIsUsdc = state.quoteCurrency === 'USDC'
   try {
-    const postSolBalance = await withRpcTimeout(
-      withRpcFallback(rpc => rpc.getBalance(wallet.publicKey, 'finalized'), connection),
-      EXIT_RPC_TIMEOUT_MS,
-    )
+    const settlementSlot = await finalizedSettlementSlot(connection, state.removeSignatures)
+    if (settlementSlot === null) throw new Error('remove transactions are not finalized yet')
+    const postSolBalance = await getSolBalance(connection, wallet.publicKey, settlementSlot)
     result.solReceived = (postSolBalance - state.preSolBalance) / 1_000_000_000
     if (quoteIsUsdc) {
-      const postUsdcBalance = await getTokenBalance(connection, wallet.publicKey, USDC_MINT, 2)
+      const postUsdcBalance = await getTokenBalance(connection, wallet.publicKey, USDC_MINT, 2, settlementSlot)
       const baseline = BigInt(state.preUsdcBalance)
       result.usdcReceived = Number(positiveBalanceDelta(baseline, postUsdcBalance)) / 1e6
     }
@@ -966,9 +1023,10 @@ async function walletHasNoSwapObligation(
   connection: Connection,
   wallet: Keypair,
   state: ExitPendingState,
+  minContextSlot: number,
 ): Promise<boolean> {
   for (const [mint, rawBaseline] of Object.entries(state.preSwapTokenBalances)) {
-    const balance = await getTokenBalance(connection, wallet.publicKey, mint, 2)
+    const balance = await getTokenBalance(connection, wallet.publicKey, mint, 2, minContextSlot)
     const consumed = BigInt(state.swapConsumed[mint] || '0')
     if (swapObligation(BigInt(rawBaseline), consumed, balance) > 0n) return false
   }
@@ -981,50 +1039,35 @@ async function completeExitAfterWalletSettlement(
   state: ExitPendingState,
   result: ExitResult,
   queueCompletionNotification: boolean,
+  settlementSlot: number,
 ): Promise<ExitResult> {
   result.removeSucceeded = true
   result.rentRefundSol = state.rentRefundSol
-  result.removeLiqSig = state.removeSignatures.at(-1)
-    || state.finalizing.find(finalizing => finalizing.kind === 'remove')?.attempt.signature
-    || result.removeLiqSig
-    || null
+  result.removeLiqSig = state.removeSignatures.at(-1) || result.removeLiqSig || null
   result.swapSig = state.swapSignatures.at(-1) || null
 
-  let solMeasured = false
-  let quoteMeasured = false
-  try {
-    const postSolBalance = await withRpcTimeout(
-      withRpcFallback(rpc => rpc.getBalance(wallet.publicKey, 'finalized'), connection),
-      EXIT_RPC_TIMEOUT_MS,
-    )
-    result.solReceived = (postSolBalance - state.preSolBalance) / 1_000_000_000
-    solMeasured = true
-    if (state.quoteCurrency === 'USDC') {
-      const postUsdcBalance = await getTokenBalance(connection, wallet.publicKey, USDC_MINT, 2)
-      result.usdcReceived = Number(positiveBalanceDelta(BigInt(state.preUsdcBalance), postUsdcBalance)) / 1e6
-      quoteMeasured = true
-    } else {
-      quoteMeasured = true
-    }
-  } catch (err) {
-    console.log(`[exit] wallet settlement detected but quote receipt measurement is pending: ${err instanceof Error ? err.message : 'unknown'}`)
+  // Receipt measurement must observe post-close state; any RPC failure defers
+  // completion instead of recording a wrong zero receipt.
+  const postSolBalance = await getSolBalance(connection, wallet.publicKey, settlementSlot)
+  result.solReceived = (postSolBalance - state.preSolBalance) / 1_000_000_000
+  if (state.quoteCurrency === 'USDC') {
+    const postUsdcBalance = await getTokenBalance(connection, wallet.publicKey, USDC_MINT, 2, settlementSlot)
+    result.usdcReceived = Number(positiveBalanceDelta(BigInt(state.preUsdcBalance), postUsdcBalance)) / 1e6
   }
 
-  state.finalizing = []
-  state.currentSwap = null
   state.stage = 'swap_pending'
   clearExitRetry(state)
   const quoteReceived = state.quoteCurrency === 'USDC' ? result.usdcReceived : result.solReceived
   finishExit(state, 'completed', 'closed', {
     removeLiqSig: result.removeLiqSig,
     swapSig: result.swapSig,
-    finalSolReceived: solMeasured ? result.solReceived : null,
-    finalQuoteReceived: quoteMeasured ? quoteReceived : null,
-    errorMessage: quoteMeasured ? null : 'completed after wallet settlement; quote receipt not measured',
-  }, queueCompletionNotification && quoteMeasured)
+    finalSolReceived: result.solReceived,
+    finalQuoteReceived: quoteReceived,
+    errorMessage: null,
+  }, queueCompletionNotification)
   result.success = true
   result.pendingRecovery = false
-  console.log(`[exit] completed from wallet settlement${quoteMeasured ? `, received ${state.quoteCurrency === 'USDC' ? `${result.usdcReceived.toFixed(2)} USDC` : `${result.solReceived.toFixed(6)} SOL`}` : ' (receipt not measured)'}`)
+  console.log(`[exit] completed from wallet settlement, received ${state.quoteCurrency === 'USDC' ? `${result.usdcReceived.toFixed(2)} USDC` : `${result.solReceived.toFixed(6)} SOL`}`)
   return result
 }
 
@@ -1061,11 +1104,22 @@ async function settleExit(
       return result
     }
 
+    // Settlement reads must reflect post-close state. A lagging RPC provider can
+    // return pre-close balances for finalized reads, so gate every read on the
+    // slot where the exit's transactions finalized.
+    const settlementSlot = await finalizedSettlementSlot(connection, [...state.removeSignatures, ...state.swapSignatures])
+    if (settlementSlot === null) {
+      result.pendingRecovery = true
+      result.error = 'waiting for exit transactions to finalize'
+      deferExitRetry(state, executionStatusForState(state), result.error)
+      return result
+    }
+
     for (const [mint, rawBaseline] of Object.entries(state.preSwapTokenBalances)) {
       const baseline = BigInt(rawBaseline)
       const consumed = BigInt(state.swapConsumed[mint] || '0')
       const attributedBaseline = baseline + consumed
-      const balance = await getTokenBalance(connection, wallet.publicKey, mint, 2)
+      const balance = await getTokenBalance(connection, wallet.publicKey, mint, 2, settlementSlot)
       const receivedBalance = swapObligation(baseline, consumed, balance)
       if (receivedBalance === 0n) continue
       console.log(`[exit] swap ${receivedBalance.toString()} ${mint.slice(0, 8)} → ${targetLabel}`)
@@ -1126,7 +1180,7 @@ async function settleExit(
         return result
       }
 
-      const finalBalance = await getTokenBalance(connection, wallet.publicKey, mint, 2)
+      const finalBalance = await getTokenBalance(connection, wallet.publicKey, mint, 2, settlementSlot)
         const remaining = swapObligation(baseline, consumed, finalBalance)
       if (remaining > 0n) {
         result.error = `Unswapped balance: ${remaining.toString()} ${mint.slice(0, 8)}`
@@ -1136,13 +1190,10 @@ async function settleExit(
       }
     }
 
-    const postSolBalance = await withRpcTimeout(
-      withRpcFallback(rpc => rpc.getBalance(wallet.publicKey, 'finalized'), connection),
-      EXIT_RPC_TIMEOUT_MS,
-    )
+    const postSolBalance = await getSolBalance(connection, wallet.publicKey, settlementSlot)
     result.solReceived = (postSolBalance - state.preSolBalance) / 1_000_000_000
     if (quoteIsUsdc) {
-      const postUsdcBalance = await getTokenBalance(connection, wallet.publicKey, USDC_MINT, 2)
+      const postUsdcBalance = await getTokenBalance(connection, wallet.publicKey, USDC_MINT, 2, settlementSlot)
       const baseline = BigInt(state.preUsdcBalance)
       result.usdcReceived = Number(positiveBalanceDelta(baseline, postUsdcBalance)) / 1e6
     }
@@ -1325,10 +1376,17 @@ async function reconcilePendingExitsUnlocked(connection: Connection, wallet: Key
 
        if (!await ensureExitBaseline(connection, wallet, state)) continue
 
-       if (state.removeSignatures.length > 0 && !state.currentRemove) {
+       // Fast path: complete exits whose wallet already settled. Only safe once
+       // every remove/swap is finalized and no attempt is still in flight;
+       // otherwise a lagging RPC could report pre-close balances as settled.
+       if (state.removeSignatures.length > 0
+         && !state.currentRemove
+         && !state.currentSwap
+         && state.finalizing.length === 0) {
          try {
-           if (await walletHasNoSwapObligation(connection, wallet, state)) {
-             await completeExitAfterWalletSettlement(connection, wallet, state, result, true)
+           const settlementSlot = await finalizedSettlementSlot(connection, [...state.removeSignatures, ...state.swapSignatures])
+           if (settlementSlot !== null && await walletHasNoSwapObligation(connection, wallet, state, settlementSlot)) {
+             await completeExitAfterWalletSettlement(connection, wallet, state, result, true, settlementSlot)
              continue
            }
          } catch {
