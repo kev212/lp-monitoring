@@ -30,6 +30,7 @@ export const config: Config = {
   solanaRpcUrl: envStr('SOLANA_RPC_URL', 'https://api.mainnet-beta.solana.com'),
   solanaWsUrl: envStr('SOLANA_WS_URL'),
   solanaRpcFallbackUrl: envStr('SOLANA_RPC_FALLBACK_URL'),
+  solanaRpcSecondaryFallbackUrl: envStr('SOLANA_RPC_SECONDARY_FALLBACK_URL', 'https://api.mainnet-beta.solana.com'),
   solanaPrivateKey: envStr('SOLANA_PRIVATE_KEY'),
   jupiterApiKey: envStr('JUPITER_API_KEY'),
   jupiterSwapBaseUrl: envStr('JUPITER_SWAP_BASE_URL', 'https://api.jup.ag/swap/v2'),

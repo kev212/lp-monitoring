@@ -3,6 +3,7 @@ import { getDb } from '../db/client.js'
 import { parseTransactionForPosition, type ParsedEvent } from './parser.js'
 import type { EventType, BasisConfidence, PositionEventRow } from '../types.js'
 import { getTokenPriceInSol } from '../pricing.js'
+import { withRpcFallback } from '../solana/connection.js'
 
 export function getSavedEvents(positionPubkey: string): PositionEventRow[] {
   const db = getDb()
@@ -69,10 +70,9 @@ export async function fetchAndParseHistory(
     let fetched = 0
 
     while (fetched < 200) {
-      const sigs = await connection.getSignaturesForAddress(
-        new PublicKey(positionPubkey),
-        { limit: 100, before },
-        'confirmed'
+      const sigs = await withRpcFallback(
+        rpc => rpc.getSignaturesForAddress(new PublicKey(positionPubkey), { limit: 100, before }, 'confirmed'),
+        connection,
       )
 
       if (sigs.length === 0) break
@@ -82,9 +82,10 @@ export async function fetchAndParseHistory(
 
       for (const sigInfo of batch) {
         try {
-          const tx = await connection.getParsedTransaction(sigInfo.signature, {
-            maxSupportedTransactionVersion: 0,
-          })
+          const tx = await withRpcFallback(
+            rpc => rpc.getParsedTransaction(sigInfo.signature, { maxSupportedTransactionVersion: 0 }),
+            connection,
+          )
           if (!tx) continue
 
           const parsed = parseTransactionForPosition(tx, positionPubkey, ownerStr, tokenXMint, tokenYMint)

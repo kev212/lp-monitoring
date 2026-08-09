@@ -15,6 +15,7 @@ import { deleteOpeningPosition, updatePositionStatus, upsertPosition } from './d
 import { clearPnlCache, getQuoteCurrency } from './valuation.js'
 import { clearPoolCache, getPool, getPoolInfo } from './positions.js'
 import { getRiskSettings } from '../risk/settings.js'
+import { withRpcFallback } from '../solana/connection.js'
 
 const SOL_MINT = 'So11111111111111111111111111111111111111112'
 const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
@@ -218,7 +219,7 @@ export function remainingPriceMoveBins(maxBins: number, observedMoveBins: number
 
 async function rawAssociatedTokenBalance(connection: Connection, owner: PublicKey, mint: string): Promise<bigint> {
   const ata = getAssociatedTokenAddressSync(new PublicKey(mint), owner)
-  const account = await connection.getAccountInfo(ata, 'confirmed')
+  const account = await withRpcFallback(rpc => rpc.getAccountInfo(ata, 'confirmed'), connection)
   if (!account) return 0n
   if (account.data.byteLength < 72) throw new Error('Associated token account data is invalid')
   const view = new DataView(account.data.buffer, account.data.byteOffset + 64, 8)
@@ -306,7 +307,7 @@ async function prepareOpenPositionWithPool(
   const estimatedPositionCostSol = cost.positionCost + cost.positionReallocCost + cost.bitmapExtensionCost + cost.binArrayCost
   const maxPriceMoveBins = config.openMaxPriceMoveBins
   const addSlippagePercent = sdkSlippagePercentForBins(pool.lbPair.binStep, maxPriceMoveBins)
-  const nativeBalance = await connection.getBalance(owner)
+  const nativeBalance = await withRpcFallback(rpc => rpc.getBalance(owner), connection)
   const requiredFeeLamports = BigInt(Math.ceil((estimatedPositionCostSol + config.openSolFeeReserve) * LAMPORTS_PER_SOL))
 
   if (poolInfo.quoteCurrency === 'SOL') {
@@ -487,7 +488,7 @@ function finishOpenAttempt(state: PendingOpenState, stage: TerminalOpenStage, er
 
 async function verifyFinalizedPosition(connection: Connection, state: PendingOpenState): Promise<boolean> {
   const positionAddress = new PublicKey(state.positionPubkey)
-  const account = await connection.getAccountInfo(positionAddress, 'finalized')
+  const account = await withRpcFallback(rpc => rpc.getAccountInfo(positionAddress, 'finalized'), connection)
   if (!account) return false
   if (!account.owner.equals(DLMM_PROGRAM_ID)) throw new Error('finalized position account has an unexpected program owner')
 
@@ -590,7 +591,7 @@ async function prepareRebalanceOpenWithPool(
   if (cost.transactionCount !== 1) throw new Error(`Range requires ${cost.transactionCount} setup transactions; reduce the percentage range`)
   const estimatedPositionCostSol = cost.positionCost + cost.positionReallocCost + cost.bitmapExtensionCost + cost.binArrayCost
   const addSlippagePercent = sdkSlippagePercentForBins(pool.lbPair.binStep, config.openMaxPriceMoveBins)
-  const nativeBalance = await connection.getBalance(owner)
+  const nativeBalance = await withRpcFallback(rpc => rpc.getBalance(owner), connection)
   const requiredFeeLamports = BigInt(Math.ceil((estimatedPositionCostSol + config.openSolFeeReserve) * LAMPORTS_PER_SOL))
 
   if (poolInfo.quoteCurrency === 'SOL') {
@@ -670,7 +671,7 @@ async function submitOpenPosition(
     slippage: executedPreview.addSlippagePercent,
   })
 
-  const latest = await connection.getLatestBlockhash('confirmed')
+  const latest = await withRpcFallback(rpc => rpc.getLatestBlockhash('confirmed'), connection)
   createTx.feePayer = wallet.publicKey
   createTx.recentBlockhash = latest.blockhash
   createTx.sign(wallet, position)
@@ -703,16 +704,16 @@ async function submitOpenPosition(
 
   let transactionFinalized = false
   try {
-    const signature = await connection.sendRawTransaction(signedTransaction, {
+    const signature = await withRpcFallback(rpc => rpc.sendRawTransaction(signedTransaction, {
       skipPreflight: false,
       preflightCommitment: 'confirmed',
       maxRetries: 3,
-    })
+    }), connection)
     if (signature !== expectedSignature) throw new Error('RPC returned a signature that does not match the signed transaction')
     pendingState.stage = 'submitted'
     updatePendingOpen(pendingState)
     const confirmation = await withTimeout(
-      connection.confirmTransaction({ signature: expectedSignature, ...latest }, 'finalized'),
+      withRpcFallback(rpc => rpc.confirmTransaction({ signature: expectedSignature, ...latest }, 'finalized'), connection),
       30_000,
     )
     if (confirmation.value.err) {
@@ -763,7 +764,10 @@ export async function reconcilePendingOpens(connection: Connection): Promise<Ope
         continue
       }
 
-      const status = await connection.getSignatureStatus(pending.signature, { searchTransactionHistory: true })
+      const status = await withRpcFallback(
+        rpc => rpc.getSignatureStatus(pending!.signature, { searchTransactionHistory: true }),
+        connection,
+      )
       if (status.value?.confirmationStatus === 'finalized' && status.value.err) {
         const message = `open transaction failed on-chain: ${JSON.stringify(status.value.err)}`
         finishOpenAttempt(pending, 'failed', message)
@@ -777,7 +781,7 @@ export async function reconcilePendingOpens(connection: Connection): Promise<Ope
         updatePendingOpen(pending)
       }
 
-      const blockHeight = await connection.getBlockHeight('confirmed')
+      const blockHeight = await withRpcFallback(rpc => rpc.getBlockHeight('confirmed'), connection)
       if (!status.value && blockHeight > pending.lastValidBlockHeight) {
         const now = Date.now()
         const canCountAbsence = pending.lastExpiryAbsenceAt === null
@@ -799,10 +803,10 @@ export async function reconcilePendingOpens(connection: Connection): Promise<Ope
           updatePendingOpen(pending)
         }
       } else if (!status.value) {
-        const signature = await connection.sendRawTransaction(Buffer.from(pending.signedTransaction, 'base64'), {
+        const signature = await withRpcFallback(rpc => rpc.sendRawTransaction(Buffer.from(pending!.signedTransaction, 'base64'), {
           skipPreflight: true,
           maxRetries: 0,
-        })
+        }), connection)
         if (signature !== pending.signature) throw new Error('rebroadcast signature does not match durable open intent')
         if (pending.stage === 'prepared') {
           pending = { ...pending, stage: 'submitted', lastError: null }

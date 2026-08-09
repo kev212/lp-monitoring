@@ -3,6 +3,7 @@ import { BN } from '@coral-xyz/anchor'
 import { StrategyType } from '@meteora-ag/dlmm'
 import { getPool, clearPoolCache } from './positions.js'
 import { DurableTransactionPendingError, sendDurableTransaction } from '../executionLock.js'
+import { withRpcFallback } from '../solana/connection.js'
 
 const BASIS_POINTS = new BN(10000)
 const ACTIVE_SIDE_BUFFER_BINS = 2
@@ -90,9 +91,9 @@ function isSolMint(mint: string): boolean {
 async function getTokenBalance(connection: Connection, wallet: Keypair, mint: string): Promise<bigint> {
   if (isSolMint(mint)) {
     try {
-      const accounts = await connection.getTokenAccountsByOwner(
-        wallet.publicKey,
-        { mint: new PublicKey(SOL_MINT) }
+      const accounts = await withRpcFallback(
+        rpc => rpc.getTokenAccountsByOwner(wallet.publicKey, { mint: new PublicKey(SOL_MINT) }),
+        connection,
       )
       let total = 0n
       for (const acc of accounts.value) {
@@ -103,9 +104,9 @@ async function getTokenBalance(connection: Connection, wallet: Keypair, mint: st
     } catch { return 0n }
   }
   try {
-    const accounts = await connection.getTokenAccountsByOwner(
-      wallet.publicKey,
-      { mint: new PublicKey(mint) }
+    const accounts = await withRpcFallback(
+      rpc => rpc.getTokenAccountsByOwner(wallet.publicKey, { mint: new PublicKey(mint) }),
+      connection,
     )
     let total = 0n
     for (const acc of accounts.value) {
@@ -118,7 +119,7 @@ async function getTokenBalance(connection: Connection, wallet: Keypair, mint: st
 
 async function getNativeSolLamports(connection: Connection, wallet: Keypair): Promise<bigint> {
   try {
-    return BigInt(await connection.getBalance(wallet.publicKey))
+    return BigInt(await withRpcFallback(rpc => rpc.getBalance(wallet.publicKey), connection))
   } catch { return 0n }
 }
 
@@ -320,7 +321,10 @@ export async function executeDirectionalPrecisionCurve(
           addTx,
         )
 
-        const txResult = await connection.getTransaction(addSig, { maxSupportedTransactionVersion: 0 })
+        const txResult = await withRpcFallback(
+          rpc => rpc.getTransaction(addSig!, { maxSupportedTransactionVersion: 0 }),
+          connection,
+        )
         if (!txResult || txResult.meta?.err) {
           const errMsg = txResult?.meta?.err
             ? (typeof txResult.meta.err === 'string' ? txResult.meta.err : JSON.stringify(txResult.meta.err))

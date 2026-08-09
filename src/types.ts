@@ -123,6 +123,7 @@ export interface Config {
   solanaRpcUrl: string
   solanaWsUrl: string
   solanaRpcFallbackUrl: string
+  solanaRpcSecondaryFallbackUrl: string
   solanaPrivateKey: string
   jupiterApiKey: string
   jupiterSwapBaseUrl: string

@@ -1,5 +1,6 @@
 import { Connection, PublicKey } from '@solana/web3.js'
 import DLMM from '@meteora-ag/dlmm'
+import { createRpcFailoverConnection } from '../solana/connection.js'
 
 export interface PositionDetail {
   positionPubkey: string
@@ -42,7 +43,7 @@ export async function getPool(connection: Connection, poolPubkey: PublicKey): Pr
   const cached = poolCache.get(key)
   if (cached) return cached
 
-  const pool = await DLMM.create(connection, poolPubkey, { cluster: 'mainnet-beta' })
+  const pool = await DLMM.create(createRpcFailoverConnection(connection), poolPubkey, { cluster: 'mainnet-beta' })
   poolCache.set(key, pool)
   return pool
 }

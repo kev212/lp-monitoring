@@ -82,9 +82,9 @@ export async function confirmSignature(
   let timer: NodeJS.Timeout | undefined
   let websocketError: unknown
   let pollingError: unknown
-  const websocketPromise = connection.confirmTransaction(
-    { ...strategy, abortSignal: controller.signal },
-    commitment,
+  const websocketPromise = withRpcFallback(
+    rpc => rpc.confirmTransaction({ ...strategy, abortSignal: controller.signal }, commitment),
+    connection,
   ).catch(error => {
     websocketError = error
     return new Promise<never>(() => undefined)

@@ -5,6 +5,7 @@ import { clearPoolCache, getPool } from './positions.js'
 import { getSolPriceInUsd } from '../pricing.js'
 import type { PositionRow, TokenSide } from '../types.js'
 import { DurableTransactionPendingError, sendDurableTransaction } from '../executionLock.js'
+import { withRpcFallback } from '../solana/connection.js'
 
 const BASIS_POINTS = new BN(10000)
 const DUST_USD_THRESHOLD = 0.1
@@ -168,9 +169,9 @@ function findTokenOnlyRanges(positionBinData: any[], quoteSide: TokenSide, token
 
 async function getTokenBalance(connection: Connection, wallet: Keypair, mint: string): Promise<bigint> {
   try {
-    const accounts = await connection.getTokenAccountsByOwner(
-      wallet.publicKey,
-      { mint: new PublicKey(mint) }
+    const accounts = await withRpcFallback(
+      rpc => rpc.getTokenAccountsByOwner(wallet.publicKey, { mint: new PublicKey(mint) }),
+      connection,
     )
     let total = 0n
     for (const acc of accounts.value) {
@@ -303,7 +304,10 @@ async function addBackBidAsk(
           })
 
           const sig = await sendAndConfirm(connection, wallet, operationId, addTx)
-          const txResult = await connection.getTransaction(sig, { maxSupportedTransactionVersion: 0 }).catch(() => null)
+          const txResult = await withRpcFallback(
+            rpc => rpc.getTransaction(sig, { maxSupportedTransactionVersion: 0 }),
+            connection,
+          ).catch(() => null)
           if (txResult?.meta?.err) {
             const errMsg = typeof txResult.meta.err === 'string' ? txResult.meta.err : JSON.stringify(txResult.meta.err)
             throw new Error(`add liquidity failed on-chain: ${errMsg}`)
@@ -373,7 +377,10 @@ async function addBackBidAsk(
 
         for (const [j, tx] of addTxs.entries()) {
           const sig = await sendAndConfirm(connection, wallet, operationId, tx)
-          const txResult = await connection.getTransaction(sig, { maxSupportedTransactionVersion: 0 }).catch(() => null)
+          const txResult = await withRpcFallback(
+            rpc => rpc.getTransaction(sig, { maxSupportedTransactionVersion: 0 }),
+            connection,
+          ).catch(() => null)
           if (txResult?.meta?.err) {
             const errMsg = typeof txResult.meta.err === 'string' ? txResult.meta.err : JSON.stringify(txResult.meta.err)
             throw new Error(`add liquidity failed on-chain: ${errMsg}`)

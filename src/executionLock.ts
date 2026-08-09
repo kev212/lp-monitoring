@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import bs58 from 'bs58'
 import { Connection, Keypair, SendTransactionError, Transaction } from '@solana/web3.js'
 import { getDb } from './db/client.js'
+import { withRpcFallback } from './solana/connection.js'
 
 let walletMutationTail: Promise<void> = Promise.resolve()
 
@@ -161,7 +162,7 @@ export async function sendDurableTransaction(
   operationId: string,
   transaction: Transaction,
 ): Promise<string> {
-  const latest = await connection.getLatestBlockhash('confirmed')
+  const latest = await withRpcFallback(rpc => rpc.getLatestBlockhash('confirmed'), connection)
   transaction.feePayer = wallet.publicKey
   transaction.recentBlockhash = latest.blockhash
   transaction.sign(wallet)
@@ -185,14 +186,14 @@ export async function sendDurableTransaction(
   updateWalletOperationLease(owner, lease, pendingLease)
 
   try {
-    const rpcSignature = await connection.sendRawTransaction(signedTransaction, {
+    const rpcSignature = await withRpcFallback(rpc => rpc.sendRawTransaction(signedTransaction, {
       skipPreflight: false,
       preflightCommitment: 'confirmed',
       maxRetries: 3,
-    })
+    }), connection)
     if (rpcSignature !== signature) throw new Error('RPC returned a signature that does not match the signed reshape transaction')
     const confirmation = await withTimeout(
-      connection.confirmTransaction({ signature, ...latest }, 'finalized'),
+      withRpcFallback(rpc => rpc.confirmTransaction({ signature, ...latest }, 'finalized'), connection),
       30_000,
     )
     const current = getWalletOperation(owner)
@@ -275,7 +276,10 @@ export async function reconcileDurableReshapeOperation(connection: Connection, o
   }
 
   const attempt = lease.attempt
-  const status = await connection.getSignatureStatus(attempt.signature, { searchTransactionHistory: true })
+  const status = await withRpcFallback(
+    rpc => rpc.getSignatureStatus(attempt.signature, { searchTransactionHistory: true }),
+    connection,
+  )
   if (status.value?.confirmationStatus === 'finalized') {
     const landed = !status.value.err
     if (landed) lease = { ...lease, mutationCount: (lease.mutationCount || 0) + 1, attempt: null }
@@ -291,7 +295,7 @@ export async function reconcileDurableReshapeOperation(connection: Connection, o
   }
   if (status.value) return 'pending'
 
-  const blockHeight = await connection.getBlockHeight('confirmed')
+  const blockHeight = await withRpcFallback(rpc => rpc.getBlockHeight('confirmed'), connection)
   if (blockHeight > attempt.lastValidBlockHeight) {
     const now = Date.now()
     const canCount = attempt.lastExpiryAbsenceAt === null || now - attempt.lastExpiryAbsenceAt >= 5_000
@@ -322,10 +326,10 @@ export async function reconcileDurableReshapeOperation(connection: Connection, o
     return requiresReview ? 'review' : 'cleared'
   }
 
-  const signature = await connection.sendRawTransaction(Buffer.from(attempt.signedTransaction, 'base64'), {
+  const signature = await withRpcFallback(rpc => rpc.sendRawTransaction(Buffer.from(attempt.signedTransaction, 'base64'), {
     skipPreflight: true,
     maxRetries: 0,
-  })
+  }), connection)
   if (signature !== attempt.signature) throw new Error('reshape rebroadcast signature does not match durable lease')
   return 'pending'
 }
