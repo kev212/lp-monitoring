@@ -7,7 +7,7 @@ import { getDb, listSyncValues } from '../db/client.js'
 import { swapTokensToSol, type SignedSwapAttempt } from '../swap.js'
 import { config } from '../config.js'
 import { confirmSignature } from '../solana/confirmation.js'
-import { withRpcFallback } from '../solana/connection.js'
+import { withRpcFallback, withSignatureStatusFallback } from '../solana/connection.js'
 import type { ExecutionRow, ExitCompletionNotification, ExitStatus, QuoteCurrency, TriggerType } from '../types.js'
 import { updatePositionStatus } from './discovery.js'
 import {
@@ -214,7 +214,7 @@ export async function recoverLegacyFailedExits(connection: Connection, wallet: K
     if (row.owner !== wallet.publicKey.toBase58()) continue
     try {
       const status = await withRpcTimeout(
-        withRpcFallback(
+        withSignatureStatusFallback(
           rpc => rpc.getSignatureStatus(row.remove_liq_sig, { searchTransactionHistory: true }),
           connection,
         ),
@@ -575,10 +575,10 @@ export async function finalizedSettlementSlot(connection: Connection, signatures
   let slot = 0
   for (const signature of signatures) {
     const status = await withRpcTimeout(
-      withRpcFallback(
-        rpc => rpc.getSignatureStatus(signature, { searchTransactionHistory: true }),
-        connection,
-      ),
+        withSignatureStatusFallback(
+          rpc => rpc.getSignatureStatus(signature, { searchTransactionHistory: true }),
+          connection,
+        ),
       EXIT_RPC_TIMEOUT_MS,
     )
     if (status.value?.err) throw new Error(`exit transaction ${signature.slice(0, 8)} failed on-chain`)
@@ -586,6 +586,27 @@ export async function finalizedSettlementSlot(connection: Connection, signatures
     slot = Math.max(slot, status.value.slot)
   }
   return slot
+}
+
+async function positionClosedAtSlot(
+  connection: Connection,
+  positionPubkey: string,
+  minContextSlot: number,
+): Promise<boolean> {
+  const accountConfig = minContextSlot > 0
+    ? { commitment: 'finalized' as const, minContextSlot }
+    : { commitment: 'finalized' as const }
+  const account = await withRpcTimeout(
+    withRpcFallback(
+      rpc => rpc.getAccountInfoAndContext(new PublicKey(positionPubkey), accountConfig),
+      connection,
+    ),
+    RECONCILIATION_PROBE_TIMEOUT_MS,
+  )
+  if (minContextSlot > 0 && account.context.slot < minContextSlot) {
+    throw new Error(`stale position account read at slot ${account.context.slot}, need >= ${minContextSlot}`)
+  }
+  return account.value === null
 }
 
 export async function collectExitBaselines(
@@ -1240,7 +1261,7 @@ async function reconcileFinalizingAttempt(
   let status
   try {
     status = await withRpcTimeout(
-      withRpcFallback(
+      withSignatureStatusFallback(
         rpc => rpc.getSignatureStatus(finalizing.attempt.signature, { searchTransactionHistory: true }),
         connection,
       ),
@@ -1286,7 +1307,7 @@ async function reconcileSignedAttempt(
   }
 
   const status = await withRpcTimeout(
-    withRpcFallback(
+    withSignatureStatusFallback(
       rpc => rpc.getSignatureStatus(attempt.signature, { searchTransactionHistory: true }),
       connection,
     ),
@@ -1385,7 +1406,11 @@ async function reconcilePendingExitsUnlocked(connection: Connection, wallet: Key
          && state.finalizing.length === 0) {
          try {
            const settlementSlot = await finalizedSettlementSlot(connection, [...state.removeSignatures, ...state.swapSignatures])
-           if (settlementSlot !== null && await walletHasNoSwapObligation(connection, wallet, state, settlementSlot)) {
+            if (
+              settlementSlot !== null
+              && await positionClosedAtSlot(connection, state.positionPubkey, settlementSlot)
+              && await walletHasNoSwapObligation(connection, wallet, state, settlementSlot)
+            ) {
              await completeExitAfterWalletSettlement(connection, wallet, state, result, true, settlementSlot)
              continue
            }

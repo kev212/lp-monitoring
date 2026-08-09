@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { Connection, Keypair, Transaction, TransactionInstruction } from '@solana/web3.js'
+import { Connection, Keypair, SendTransactionError, Transaction, TransactionInstruction } from '@solana/web3.js'
 import bs58 from 'bs58'
+import { isAmbiguousDurableSendError } from '../src/executionLock.js'
 import { collectExitBaselines, exitRetryDelayMs, finalizedSettlementSlot, getTokenBalance, positiveBalanceDelta, sendTrackedTransaction, swapObligation } from '../src/meteora/exit.js'
 import { formatExitReconciled } from '../src/telegram.js'
 
@@ -17,6 +18,22 @@ test('keeps retry backoff bounded and excludes already-consumed swap input', () 
   assert.equal(exitRetryDelayMs(20), 300_000)
   assert.equal(swapObligation(1_000n, 450n, 1_450n), 0n)
   assert.equal(swapObligation(1_000n, 450n, 1_600n), 150n)
+})
+
+test('keeps durable attempts for ambiguous send errors', () => {
+  const alreadyProcessed = new SendTransactionError({
+    action: 'send',
+    signature: '',
+    transactionMessage: 'Transaction was already processed',
+  })
+  const simulationFailure = new SendTransactionError({
+    action: 'simulate',
+    signature: '',
+    transactionMessage: 'custom program error: 0x1',
+  })
+
+  assert.equal(isAmbiguousDurableSendError(alreadyProcessed), true)
+  assert.equal(isAmbiguousDurableSendError(simulationFailure), false)
 })
 
 function signedTestTransaction(wallet: Keypair): Transaction {

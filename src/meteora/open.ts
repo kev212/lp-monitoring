@@ -15,7 +15,8 @@ import { deleteOpeningPosition, updatePositionStatus, upsertPosition } from './d
 import { clearPnlCache, getQuoteCurrency } from './valuation.js'
 import { clearPoolCache, getPool, getPoolInfo } from './positions.js'
 import { getRiskSettings } from '../risk/settings.js'
-import { withRpcFallback } from '../solana/connection.js'
+import { confirmSignature } from '../solana/confirmation.js'
+import { withRpcFallback, withSignatureStatusFallback } from '../solana/connection.js'
 
 const SOL_MINT = 'So11111111111111111111111111111111111111112'
 const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
@@ -118,20 +119,6 @@ export class OpenSubmissionPendingError extends Error {
 }
 
 class DefinitiveOpenError extends Error {}
-
-async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
-  let timer: NodeJS.Timeout | undefined
-  try {
-    return await Promise.race([
-      promise,
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`confirm timeout (${timeoutMs / 1000}s)`)), timeoutMs)
-      }),
-    ])
-  } finally {
-    if (timer) clearTimeout(timer)
-  }
-}
 
 export interface SingleSideRangeInput {
   activeBinId: number
@@ -712,8 +699,10 @@ async function submitOpenPosition(
     if (signature !== expectedSignature) throw new Error('RPC returned a signature that does not match the signed transaction')
     pendingState.stage = 'submitted'
     updatePendingOpen(pendingState)
-    const confirmation = await withTimeout(
-      withRpcFallback(rpc => rpc.confirmTransaction({ signature: expectedSignature, ...latest }, 'finalized'), connection),
+    const confirmation = await confirmSignature(
+      connection,
+      { signature: expectedSignature, ...latest },
+      'finalized',
       30_000,
     )
     if (confirmation.value.err) {
@@ -764,7 +753,7 @@ export async function reconcilePendingOpens(connection: Connection): Promise<Ope
         continue
       }
 
-      const status = await withRpcFallback(
+      const status = await withSignatureStatusFallback(
         rpc => rpc.getSignatureStatus(pending!.signature, { searchTransactionHistory: true }),
         connection,
       )

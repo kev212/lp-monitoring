@@ -3,7 +3,7 @@ import type {
   RpcResponseAndContext,
   SignatureResult,
 } from '@solana/web3.js'
-import { withRpcFallback } from './connection.js'
+import { withRpcFallback, withSignatureStatusFallback } from './connection.js'
 
 export type ConfirmationCommitment = 'confirmed' | 'finalized'
 
@@ -51,7 +51,7 @@ async function pollSignature(
 
   while (Date.now() - startedAt < timeoutMs) {
     try {
-      const response = await withRpcFallback(
+      const response = await withSignatureStatusFallback(
         rpc => rpc.getSignatureStatus(strategy.signature, { searchTransactionHistory: true }),
         connection,
       )

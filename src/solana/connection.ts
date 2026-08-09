@@ -6,6 +6,21 @@ let _fallback: Connection | null = null
 let _secondaryFallback: Connection | null = null
 let _activeIsPrimary = true
 const FAILOVER_PROVIDERS = Symbol('failoverProviders')
+const SUBSCRIPTION_METHODS = new Set<PropertyKey>([
+  'onAccountChange',
+  'removeAccountChangeListener',
+  'onProgramAccountChange',
+  'removeProgramAccountChangeListener',
+  'onLogs',
+  'removeOnLogsListener',
+  'onSlotChange',
+  'removeSlotChangeListener',
+  'onSignature',
+  'onSignatureWithOptions',
+  'removeSignatureListener',
+  'onRootChange',
+  'removeRootChangeListener',
+])
 
 type FailoverConnection = Connection & {
   [FAILOVER_PROVIDERS]?: Connection[]
@@ -132,6 +147,9 @@ export function createRpcFailoverConnection(
       if (property === FAILOVER_PROVIDERS) return providers
       const value = Reflect.get(target, property, target)
       if (typeof value !== 'function') return value
+      // Subscription IDs belong to one WebSocket connection; do not fail over
+      // registration/removal across providers.
+      if (SUBSCRIPTION_METHODS.has(property)) return value.bind(target)
       return (...args: unknown[]) => invokeWithFailover(providers, property, args)
     },
   }) as FailoverConnection
@@ -148,11 +166,21 @@ async function runWithRpcFallback<T>(
   fn: (connection: Connection) => Promise<T>,
   providers: Connection[],
   skipFallback?: (error: unknown) => boolean,
+  retryResult?: (result: T) => boolean,
 ): Promise<T> {
   let lastError: unknown
+  let lastResult: T | undefined
+  let hasResult = false
   for (const [index, provider] of providers.entries()) {
     try {
-      return await fn(provider)
+      const result = await fn(provider)
+      lastResult = result
+      hasResult = true
+      if (retryResult?.(result) && index < providers.length - 1) {
+        console.log(`[connection] ${providerLabel(provider)} returned an incomplete RPC response, retrying ${providerLabel(providers[index + 1])}`)
+        continue
+      }
+      return result
     } catch (error) {
       if (skipFallback?.(error)) throw error
       lastError = error
@@ -161,6 +189,7 @@ async function runWithRpcFallback<T>(
       }
     }
   }
+  if (hasResult) return lastResult as T
   throw lastError instanceof Error ? lastError : new Error('all configured Solana RPC providers failed')
 }
 
@@ -187,6 +216,27 @@ export async function withRpcFallback<T>(
     ? getSecondaryFallbackConnection()
     : secondaryFallback || null
   return runWithRpcFallback(fn, providerCandidates(primary, configuredFallback, configuredSecondaryFallback))
+}
+
+/** Retry signature lookups when a provider returns no local status record. */
+export async function withSignatureStatusFallback<T extends { value: unknown }>(
+  fn: (connection: Connection) => Promise<T>,
+  primary: Connection = getConnection(),
+  fallback?: Connection | null,
+  secondaryFallback?: Connection | null,
+): Promise<T> {
+  const configuredFallback = fallback === undefined && isConfiguredConnection(primary)
+    ? getFallbackConnection()
+    : fallback || null
+  const configuredSecondaryFallback = secondaryFallback === undefined && isConfiguredConnection(primary)
+    ? getSecondaryFallbackConnection()
+    : secondaryFallback || null
+  return runWithRpcFallback(
+    fn,
+    providerCandidates(primary, configuredFallback, configuredSecondaryFallback),
+    undefined,
+    result => result.value === null,
+  )
 }
 
 export function switchConnection(): void {

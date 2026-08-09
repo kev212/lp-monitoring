@@ -2,11 +2,38 @@ import { randomUUID } from 'node:crypto'
 import bs58 from 'bs58'
 import { Connection, Keypair, SendTransactionError, Transaction } from '@solana/web3.js'
 import { getDb } from './db/client.js'
-import { withRpcFallback } from './solana/connection.js'
+import { confirmSignature } from './solana/confirmation.js'
+import { withRpcFallback, withSignatureStatusFallback } from './solana/connection.js'
 
 let walletMutationTail: Promise<void> = Promise.resolve()
 
 export type WalletOperationKind = 'open' | 'exit' | 'reshape'
+
+export function isAmbiguousDurableSendError(error: unknown): boolean {
+  if (!(error instanceof SendTransactionError)) return false
+  const message = `${error.message} ${error.transactionError.message}`.toLowerCase()
+  return [
+    'already processed',
+    'already confirmed',
+    'already finalized',
+    'already in use',
+    'duplicate',
+    'blockhash not found',
+    'block height exceeded',
+    'too many requests',
+    'rate limit',
+    '429',
+    'timeout',
+    'timed out',
+    'aborted',
+    'connection',
+    'network',
+    'fetch failed',
+    'socket',
+    'service unavailable',
+    'node is behind',
+  ].some(fragment => message.includes(fragment))
+}
 
 export interface WalletOperationLease {
   kind: WalletOperationKind
@@ -141,20 +168,6 @@ function updateWalletOperationLease(owner: string, expected: WalletOperationLeas
   if (result.changes !== 1) throw new Error('durable wallet operation lease changed concurrently')
 }
 
-async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
-  let timer: NodeJS.Timeout | undefined
-  try {
-    return await Promise.race([
-      promise,
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`confirm timeout (${timeoutMs / 1000}s)`)), timeoutMs)
-      }),
-    ])
-  } finally {
-    if (timer) clearTimeout(timer)
-  }
-}
-
 export async function sendDurableTransaction(
   connection: Connection,
   wallet: Keypair,
@@ -192,8 +205,10 @@ export async function sendDurableTransaction(
       maxRetries: 3,
     }), connection)
     if (rpcSignature !== signature) throw new Error('RPC returned a signature that does not match the signed reshape transaction')
-    const confirmation = await withTimeout(
-      withRpcFallback(rpc => rpc.confirmTransaction({ signature, ...latest }, 'finalized'), connection),
+    const confirmation = await confirmSignature(
+      connection,
+      { signature, ...latest },
+      'finalized',
       30_000,
     )
     const current = getWalletOperation(owner)
@@ -213,7 +228,7 @@ export async function sendDurableTransaction(
   } catch (err) {
     const current = getWalletOperation(owner)
     if (current?.kind === 'reshape' && current.operationId === operationId && current.attempt?.signature === signature) {
-      if (err instanceof SendTransactionError) {
+      if (err instanceof SendTransactionError && !isAmbiguousDurableSendError(err)) {
         updateWalletOperationLease(owner, current, { ...current, attempt: null })
         throw err
       }
@@ -276,7 +291,7 @@ export async function reconcileDurableReshapeOperation(connection: Connection, o
   }
 
   const attempt = lease.attempt
-  const status = await withRpcFallback(
+  const status = await withSignatureStatusFallback(
     rpc => rpc.getSignatureStatus(attempt.signature, { searchTransactionHistory: true }),
     connection,
   )
