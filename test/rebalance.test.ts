@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { buildRebalanceRange, decideRebalanceOpenAttempt, isOorAbove, rebalanceCloseDisposition, rebalanceTimerStatus } from '../src/meteora/rebalance.js'
+import { buildRebalanceRange, decideRebalanceOpenAttempt, isOorAbove, isTerminalRebalanceOpenError, rebalanceCloseDisposition, rebalanceTimerStatus } from '../src/meteora/rebalance.js'
 
 const MINUTE = 60_000
 
@@ -92,4 +92,11 @@ test('classifies a pending close as deferred even when success is false', () => 
   assert.equal(rebalanceCloseDisposition({ success: false, pendingRecovery: true }), 'deferred')
   assert.equal(rebalanceCloseDisposition({ success: true, pendingRecovery: false }), 'ok')
   assert.equal(rebalanceCloseDisposition({ success: false, pendingRecovery: false }), 'failed')
+})
+
+test('stops retrying deterministic range-cost failures but retries transient errors', () => {
+  assert.equal(isTerminalRebalanceOpenError(new Error('Range requires 2 setup transactions; reduce the percentage range')), true)
+  assert.equal(isTerminalRebalanceOpenError(new Error('Range requires 2 positions; reduce the percentage range')), true)
+  assert.equal(isTerminalRebalanceOpenError(new Error('Insufficient SOL; keep 0.02 SOL plus estimated position rent for fees')), false)
+  assert.equal(isTerminalRebalanceOpenError(new Error('RPC request failed')), false)
 })

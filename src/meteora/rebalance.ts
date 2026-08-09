@@ -122,6 +122,11 @@ export function deleteRebalanceReopenIntent(owner: string): void {
   getDb().prepare('DELETE FROM sync_state WHERE key = ?').run(`${REBALANCE_REOPEN_PREFIX}${owner}`)
 }
 
+export function isTerminalRebalanceOpenError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  return /^Range requires \d+ (?:positions|setup transactions); reduce the percentage range$/.test(message)
+}
+
 export type RebalanceCloseDisposition = 'deferred' | 'failed' | 'ok'
 
 export function rebalanceCloseDisposition(result: { success: boolean; pendingRecovery: boolean }): RebalanceCloseDisposition {
@@ -251,6 +256,18 @@ export async function reconcilePendingRebalanceOpens(connection: Connection, wal
           continue
         }
         const message = err instanceof Error ? err.message : 'unknown error'
+        if (isTerminalRebalanceOpenError(err)) {
+          deleteRebalanceReopenIntent(owner)
+          updateRebalanceBusy(intent.positionPubkey, false)
+          console.log(`[rebalance] reopen ${pair} stopped: ${message}`)
+          sendNotification(
+            `🛑 <b>Auto Rebalance Reopen Stopped</b>\n\n` +
+            `Position: <code>${intent.positionPubkey}</code>\n` +
+            `Reason: <code>${message}</code>\n\n` +
+            `Funds are safe in the wallet. Reopen manually with a narrower range.`
+          )
+          continue
+        }
         console.log(`[rebalance] reopen ${pair} attempt failed: ${message}`)
         sendNotification(
           `⚠️ <b>Auto Rebalance Reopen Retrying</b>\n\n` +
