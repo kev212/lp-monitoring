@@ -3,7 +3,7 @@ import test from 'node:test'
 import { Connection, Keypair, SendTransactionError, Transaction, TransactionInstruction } from '@solana/web3.js'
 import bs58 from 'bs58'
 import { isAmbiguousDurableSendError } from '../src/executionLock.js'
-import { collectExitBaselines, exitRetryDelayMs, finalizedSettlementSlot, getTokenBalance, positiveBalanceDelta, sendTrackedTransaction, swapObligation } from '../src/meteora/exit.js'
+import { collectExitBaselines, exitRetryDelayMs, finalizedSettlementSlot, getTokenBalance, positiveBalanceDelta, sendTrackedTransaction, shouldResolveClosedExitWithoutFinalSignature, swapObligation } from '../src/meteora/exit.js'
 import { formatExitReconciled } from '../src/telegram.js'
 
 test('isolates only newly received close proceeds from an existing wallet balance', () => {
@@ -148,6 +148,22 @@ test('rejects settlement gating when an exit transaction failed on-chain', async
     finalizedSettlementSlot(connection, ['failed']),
     /failed on-chain/,
   )
+})
+
+test('stops a manually closed exit only after its finality review timeout', () => {
+  const createdAt = 1_000
+  const input = {
+    createdAt,
+    now: createdAt + 60_000,
+    reviewTimeoutMs: 60_000,
+    settlementSlot: null,
+    positionClosed: true,
+  }
+
+  assert.equal(shouldResolveClosedExitWithoutFinalSignature(input), true)
+  assert.equal(shouldResolveClosedExitWithoutFinalSignature({ ...input, now: createdAt + 59_999 }), false)
+  assert.equal(shouldResolveClosedExitWithoutFinalSignature({ ...input, positionClosed: false }), false)
+  assert.equal(shouldResolveClosedExitWithoutFinalSignature({ ...input, settlementSlot: 42 }), false)
 })
 
 test('requests token balances at or after the settlement slot', async () => {

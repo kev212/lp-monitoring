@@ -10,6 +10,7 @@ import { confirmSignature } from '../solana/confirmation.js'
 import { withRpcFallback, withSignatureStatusFallback } from '../solana/connection.js'
 import type { ExecutionRow, ExitCompletionNotification, ExitStatus, QuoteCurrency, TriggerType } from '../types.js'
 import { updatePositionStatus } from './discovery.js'
+import { sendNotification } from '../telegram.js'
 import {
   getWalletOperation,
   releaseWalletOperation,
@@ -586,6 +587,18 @@ export async function finalizedSettlementSlot(connection: Connection, signatures
     slot = Math.max(slot, status.value.slot)
   }
   return slot
+}
+
+export function shouldResolveClosedExitWithoutFinalSignature(input: {
+  createdAt: number
+  now: number
+  reviewTimeoutMs: number
+  settlementSlot: number | null
+  positionClosed: boolean
+}): boolean {
+  return input.settlementSlot === null
+    && input.positionClosed
+    && input.now - input.createdAt >= input.reviewTimeoutMs
 }
 
 async function positionClosedAtSlot(
@@ -1413,8 +1426,30 @@ async function reconcilePendingExitsUnlocked(connection: Connection, wallet: Key
             ) {
              await completeExitAfterWalletSettlement(connection, wallet, state, result, true, settlementSlot)
              continue
-           }
-         } catch {
+            }
+            if (shouldResolveClosedExitWithoutFinalSignature({
+              createdAt: state.createdAt,
+              now: Date.now(),
+              reviewTimeoutMs: config.exitFinalityReviewTimeoutMs,
+              settlementSlot,
+              positionClosed: settlementSlot === null && await positionClosedAtSlot(connection, state.positionPubkey, 0),
+            })) {
+              const message = 'position account is closed but exit transaction finality is unavailable; closed manually or externally without attributed settlement'
+              finishExit(state, 'failed', 'closed', {
+                removeLiqSig: result.removeLiqSig,
+                swapSig: result.swapSig,
+                errorMessage: message,
+              })
+              console.log(`[exit] ${state.positionPubkey.slice(0, 8)} ${message}`)
+              sendNotification(
+                `⚠️ <b>Exit Closed Outside Bot</b>\n\n` +
+                `Position: <code>${state.positionPubkey}</code>\n` +
+                `The position was already closed on-chain, but the bot could not verify the exit transaction or attribute proceeds.\n\n` +
+                `No swap was attempted. Review wallet balances manually.`
+              )
+              continue
+            }
+          } catch {
            // Keep the durable state and continue finality/swap reconciliation.
          }
        }
