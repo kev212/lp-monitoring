@@ -4,8 +4,10 @@ import {
   canReopenAfterWin,
   classifyOpenFailure,
   decideRunnerClose,
+  entryDriftFromPrices,
   evaluateIngestGate,
   evaluateOpenGate,
+  gmgnUnavailableGate,
   isPriceInRange,
   isTerminalOpenError,
   isWinTrigger,
@@ -133,6 +135,22 @@ test('closes follow-up only when TVL or volume trips and PnL is positive', () =>
   assert.equal(shouldCloseFollowup({ ...base, totalTvlUsd: 50_000, vol5mUsd: 99_999 }), true)
   assert.equal(shouldCloseFollowup({ ...base, totalTvlUsd: 50_000, vol5mUsd: 100_000 }), false)
   assert.equal(shouldCloseFollowup({ ...base, totalTvlUsd: 50_000, vol5mUsd: null }), false)
+})
+
+test('computes entry drift for quote-Y and inverted quote-X prices', () => {
+  assert.ok(entryDriftFromPrices({
+    quoteSide: 'Y',
+    currentPoolPrice: 1.05,
+    lowerBinPrice: 0.6,
+    upperBinPrice: 1,
+  }) > 0.04)
+  assert.ok(entryDriftFromPrices({
+    quoteSide: 'X',
+    currentPoolPrice: 1 / 1.05,
+    lowerBinPrice: 1,
+    upperBinPrice: 1.4,
+  }) > 0.04)
+  assert.equal(gmgnUnavailableGate().retryable, true)
 })
 
 test('parses alert payloads and ignores busy mint or disabled agent', () => {

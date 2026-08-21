@@ -92,7 +92,13 @@ export function evaluateIngestGate(input: {
   return { ok: true }
 }
 
-export function evaluateOpenGate(input: RunnerOpenGateInput): { ok: true } | { ok: false; reason: string } {
+export type OpenGateResult = { ok: true } | { ok: false; reason: string; retryable?: boolean }
+
+export function gmgnUnavailableGate(): OpenGateResult {
+  return { ok: false, reason: 'gmgn unavailable', retryable: true }
+}
+
+export function evaluateOpenGate(input: RunnerOpenGateInput): OpenGateResult {
   if (input.marketCapUsd === null || !Number.isFinite(input.marketCapUsd) || input.marketCapUsd < input.minMcapUsd) {
     return { ok: false, reason: 'mcap below minimum' }
   }
@@ -144,6 +150,20 @@ export function classifyOpenFailure(error: unknown, retryCount: number, maxRetry
 export function priceAboveUpperRatio(currentPriceQuote: number, upperBinPriceQuote: number): number {
   if (!(upperBinPriceQuote > 0) || !Number.isFinite(currentPriceQuote)) return 0
   return (currentPriceQuote - upperBinPriceQuote) / upperBinPriceQuote
+}
+
+export function entryDriftFromPrices(input: {
+  quoteSide: 'X' | 'Y'
+  currentPoolPrice: number
+  lowerBinPrice: number
+  upperBinPrice: number
+}): number {
+  if (!(input.currentPoolPrice > 0)) return 0
+  if (input.quoteSide === 'Y') {
+    return priceAboveUpperRatio(input.currentPoolPrice, input.upperBinPrice)
+  }
+  if (!(input.lowerBinPrice > 0)) return 0
+  return priceAboveUpperRatio(1 / input.currentPoolPrice, 1 / input.lowerBinPrice)
 }
 
 export function shouldChaseEntryDrift(input: {

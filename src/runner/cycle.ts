@@ -21,6 +21,8 @@ export interface RunnerCycle {
   lastVol5mUsd: number | null
   lastFollowupAt: number
   lastError: string | null
+  lastHandledExitPubkey: string | null
+  chaseCancelNotified: boolean
 }
 
 const PREFIX = 'runner_cycle:'
@@ -50,6 +52,8 @@ export function createRunnerCycle(owner: string, mint: string, symbol: string): 
     lastVol5mUsd: null,
     lastFollowupAt: 0,
     lastError: null,
+    lastHandledExitPubkey: null,
+    chaseCancelNotified: false,
   }
 }
 
@@ -86,6 +90,8 @@ export function listRunnerCycles(): RunnerCycle[] {
         lastVol5mUsd: parsed.lastVol5mUsd ?? null,
         lastFollowupAt: parsed.lastFollowupAt || 0,
         lastError: parsed.lastError || null,
+        lastHandledExitPubkey: parsed.lastHandledExitPubkey || null,
+        chaseCancelNotified: parsed.chaseCancelNotified === true,
       }]
     } catch {
       return []

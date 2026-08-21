@@ -13,6 +13,7 @@ import {
   decideRunnerClose,
   evaluateIngestGate,
   evaluateOpenGate,
+  gmgnUnavailableGate,
   isPriceInRange,
   isWinTrigger,
   parseRunnerAlertPayload,
@@ -84,6 +85,8 @@ export async function tickRunnerAgent(connection: Connection, wallet: Keypair): 
 export async function notifyRunnerExit(positionPubkey: string, triggerType: TriggerType): Promise<void> {
   const cycle = findCycleByPosition(positionPubkey)
   if (!cycle) return
+  if (cycle.lastHandledExitPubkey === positionPubkey) return
+  cycle.lastHandledExitPubkey = positionPubkey
   if (isWinTrigger(triggerType)) cycle.winCount += 1
   const decision = decideRunnerClose(triggerType, cycle.winCount, config.runnerMaxWins)
   if (decision === 'chase_first') {
@@ -110,11 +113,7 @@ async function advanceWaitingPool(connection: Connection, wallet: Keypair, cycle
     return
   }
   const pools = await refreshPools(connection, cycle)
-  if (pools.length === 0) return
-  if (!selectSolOpenPool(pools)) {
-    finishCycle(cycle, 'no SOL DLMM pool')
-    return
-  }
+  if (!selectSolOpenPool(pools)) return
   await openForCycle(connection, wallet, cycle, 'first')
 }
 
@@ -129,8 +128,10 @@ async function monitorFirst(connection: Connection, wallet: Keypair, cycle: Runn
   }
   const position = loadKnownPositions().find(row => row.positionPubkey === cycle.positionPubkey)
   if (!position) return
-  if (position.status === 'closed' || position.status === 'error') {
-    finishCycle(cycle, `position ${position.status}`)
+  if (position.status === 'exiting' || position.status === 'opening') return
+  if (position.status === 'closed') return
+  if (position.status === 'error') {
+    finishCycle(cycle, 'position error')
     return
   }
   const activeBinId = await readActiveBin(connection, position.poolPubkey)
@@ -138,12 +139,13 @@ async function monitorFirst(connection: Connection, wallet: Keypair, cycle: Runn
   if (bins && activeBinId !== null && isPriceInRange(activeBinId, bins.lowerBinId, bins.upperBinId)) {
     if (!cycle.firstEverInRange) {
       cycle.firstEverInRange = true
+      cycle.chaseCancelNotified = false
       saveRunnerCycle(cycle)
     }
     return
   }
   if (!bins || activeBinId === null) return
-  const drift = await entryDriftPct(connection, position.poolPubkey, bins.upperBinId)
+  const drift = await entryDriftPct(connection, position.poolPubkey, bins.lowerBinId, bins.upperBinId)
   if (drift === null || !shouldChaseEntryDrift({
     cycleStage: 'open_first',
     firstChaseCount: cycle.firstChaseCount,
@@ -165,8 +167,10 @@ async function monitorFollowup(connection: Connection, wallet: Keypair, cycle: R
   }
   const position = loadKnownPositions().find(row => row.positionPubkey === cycle.positionPubkey)
   if (!position) return
-  if (position.status === 'closed' || position.status === 'error') {
-    finishCycle(cycle, `position ${position.status}`)
+  if (position.status === 'exiting' || position.status === 'opening') return
+  if (position.status === 'closed') return
+  if (position.status === 'error') {
+    finishCycle(cycle, 'position error')
     return
   }
   const pools = await refreshPools(connection, cycle, false)
@@ -208,9 +212,15 @@ async function chaseFirst(
 ): Promise<void> {
   const live = await liveOpenGate(connection, cycle)
   if (!live.ok) {
-    sendNotification(`⏸ <b>Runner Chase Cancelled</b>\n\n<b>${cycle.symbol}</b>\nReason: <code>${live.reason}</code>\nHolding until price re-enters range.`)
+    if (live.retryable) return
+    if (!cycle.chaseCancelNotified) {
+      cycle.chaseCancelNotified = true
+      saveRunnerCycle(cycle)
+      sendNotification(`⏸ <b>Runner Chase Cancelled</b>\n\n<b>${cycle.symbol}</b>\nReason: <code>${live.reason}</code>\nHolding until price re-enters range.`)
+    }
     return
   }
+  cycle.chaseCancelNotified = false
   const owner = wallet.publicKey.toBase58()
   if (getWalletOperation(owner) || pendingOpenExists(owner)) return
   const result = await executeExit(
@@ -239,6 +249,11 @@ async function openForCycle(connection: Connection, wallet: Keypair, cycle: Runn
   if (getWalletOperation(owner) || pendingOpenExists(owner)) return
   const live = await liveOpenGate(connection, cycle)
   if (!live.ok) {
+    if (live.retryable) {
+      cycle.lastError = live.reason
+      saveRunnerCycle(cycle)
+      return
+    }
     if (kind === 'followup') finishCycle(cycle, live.reason)
     else if (cycle.stage === 'waiting_pool' || !cycle.positionPubkey) finishCycle(cycle, live.reason)
     else sendNotification(`⏸ <b>Runner Open Gate</b>\n\n<b>${cycle.symbol}</b>\nReason: <code>${live.reason}</code>`)
@@ -278,6 +293,8 @@ async function openForCycle(connection: Connection, wallet: Keypair, cycle: Runn
     cycle.stage = kind === 'followup' ? 'open_followup' : 'open_first'
     cycle.waitingSince = null
     cycle.lastError = null
+    cycle.firstOpenRetryCount = 0
+    cycle.chaseCancelNotified = false
     saveRunnerCycle(cycle)
     sendNotification(
       `✅ <b>Runner Open ${kind === 'first' ? 'First' : 'Follow-up'}</b>\n\n` +
@@ -310,15 +327,18 @@ async function openForCycle(connection: Connection, wallet: Keypair, cycle: Runn
   }
 }
 
-async function liveOpenGate(connection: Connection, cycle: RunnerCycle): Promise<{ ok: true } | { ok: false; reason: string }> {
+async function liveOpenGate(connection: Connection, cycle: RunnerCycle): Promise<import('./gates.js').OpenGateResult> {
   const snapshot = await fetchGmgnSnapshot(cycle.mint)
   const pools = await refreshPools(connection, cycle, false)
   cycle.lastTvlUsd = sumDlmmTvl(pools)
-  cycle.lastVol5mUsd = snapshot?.volume5mUsd ?? cycle.lastVol5mUsd
+  if (snapshot?.volume5mUsd !== undefined && snapshot.volume5mUsd !== null) {
+    cycle.lastVol5mUsd = snapshot.volume5mUsd
+  }
   saveRunnerCycle(cycle)
+  if (!snapshot) return gmgnUnavailableGate()
   return evaluateOpenGate({
-    marketCapUsd: snapshot?.marketCapUsd ?? null,
-    athMarketCapUsd: snapshot?.athMarketCapUsd ?? null,
+    marketCapUsd: snapshot.marketCapUsd,
+    athMarketCapUsd: snapshot.athMarketCapUsd,
     totalTvlUsd: cycle.lastTvlUsd,
     minMcapUsd: config.runnerMinMcapUsd,
     maxAthDrop: config.runnerMaxAthDrop,

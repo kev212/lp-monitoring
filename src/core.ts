@@ -182,8 +182,8 @@ export async function startBot(): Promise<void> {
         lastExitRecoveryAt = loopNow
         await reconcilePendingExits(getConnection(), wallet)
         await reconcilePendingRebalanceOpens(getConnection(), wallet)
-        await tickRunnerAgent(getConnection(), wallet)
         await flushExitCompletionNotifications()
+        await tickRunnerAgent(getConnection(), wallet)
       }
 
       // Periodic discovery — every 5 menit
