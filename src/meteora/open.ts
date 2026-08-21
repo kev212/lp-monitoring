@@ -95,6 +95,8 @@ interface OpenAttemptState {
   createdAt: number
   updatedAt: number
   lastError: string | null
+  runnerCycleId: string | null
+  runnerMint: string | null
 }
 
 type PendingOpenState = OpenAttemptState & { stage: PendingOpenStage }
@@ -116,6 +118,18 @@ export class OpenSubmissionPendingError extends Error {
     super(`open submission ${signature} requires reconciliation: ${cause instanceof Error ? cause.message : String(cause)}`)
     this.name = 'OpenSubmissionPendingError'
   }
+}
+
+export interface RunnerOpenRecovery {
+  positionPubkey: string
+  poolPubkey: string
+  status: 'opening' | 'monitoring' | 'exiting' | 'closed' | 'error'
+  pending: boolean
+}
+
+export interface OpenExecutionContext {
+  runnerCycleId?: string
+  runnerMint?: string
 }
 
 class DefinitiveOpenError extends Error {}
@@ -388,7 +402,11 @@ function parsePendingOpenState(value: string): PendingOpenState {
   ) {
     throw new Error('durable open state is malformed')
   }
-  return state as PendingOpenState
+  return {
+    ...state,
+    runnerCycleId: state.runnerCycleId || null,
+    runnerMint: state.runnerMint || null,
+  } as PendingOpenState
 }
 
 function findPendingOpen(owner: string): PendingOpenState | null {
@@ -403,6 +421,37 @@ export function pendingOpenExists(owner: string): boolean {
 export function getPendingOpen(owner: string): { positionPubkey: string; poolPubkey: string } | null {
   const pending = findPendingOpen(owner)
   return pending ? { positionPubkey: pending.positionPubkey, poolPubkey: pending.poolPubkey } : null
+}
+
+function positionForRunnerRecovery(positionPubkey: string, owner: string, mint: string): RunnerOpenRecovery['status'] | null {
+  const row = getDb().prepare(`
+    SELECT status, owner, token_x_mint, token_y_mint
+    FROM positions
+    WHERE position_pubkey = ?
+  `).get(positionPubkey) as { status?: string; owner?: string; token_x_mint?: string; token_y_mint?: string } | undefined
+  if (!row || row.owner !== owner || (row.token_x_mint !== mint && row.token_y_mint !== mint)) return null
+  if (!['opening', 'monitoring', 'exiting', 'closed', 'error'].includes(row.status || '')) return null
+  return row.status as RunnerOpenRecovery['status']
+}
+
+export function getRunnerOpenRecovery(owner: string, cycleId: string, mint: string): RunnerOpenRecovery | null {
+  const pending = findPendingOpen(owner)
+  if (pending?.runnerCycleId === cycleId && pending.runnerMint === mint) {
+    const status = positionForRunnerRecovery(pending.positionPubkey, owner, mint)
+    if (status) return { positionPubkey: pending.positionPubkey, poolPubkey: pending.poolPubkey, status, pending: true }
+  }
+  for (const row of listSyncValues(OPEN_ATTEMPT_PREFIX).reverse()) {
+    try {
+      const state = JSON.parse(row.value) as Partial<OpenAttemptState>
+      if (state.runnerCycleId !== cycleId || state.runnerMint !== mint || state.owner !== owner || state.stage !== 'finalized') continue
+      if (!state.positionPubkey || !state.poolPubkey) continue
+      const status = positionForRunnerRecovery(state.positionPubkey, owner, mint)
+      if (status) return { positionPubkey: state.positionPubkey, poolPubkey: state.poolPubkey, status, pending: false }
+    } catch {
+      // Ignore unrelated or malformed historical open attempts.
+    }
+  }
+  return null
 }
 
 function ensureOpenWalletLease(state: PendingOpenState): void {
@@ -506,6 +555,7 @@ export async function executeOpenPosition(
   wallet: Keypair,
   preview: OpenPositionPreview,
   skipLock = false,
+  context?: OpenExecutionContext,
 ): Promise<OpenPositionResult> {
   const work = async (): Promise<OpenPositionResult> => {
     const owner = wallet.publicKey.toBase58()
@@ -537,7 +587,7 @@ export async function executeOpenPosition(
       addSlippagePercent: sdkSlippagePercentForBins(pool.lbPair.binStep, remainingMoveBins),
     }
 
-    return submitOpenPosition(connection, wallet, pool, executedPreview)
+    return submitOpenPosition(connection, wallet, pool, executedPreview, context)
   }
   return skipLock ? work() : withWalletExecutionLock(work)
 }
@@ -645,6 +695,7 @@ async function submitOpenPosition(
   wallet: Keypair,
   pool: DLMM,
   executedPreview: OpenPositionPreview,
+  context?: OpenExecutionContext,
 ): Promise<OpenPositionResult> {
   const owner = wallet.publicKey.toBase58()
   const position = Keypair.generate()
@@ -691,6 +742,8 @@ async function submitOpenPosition(
     createdAt: now,
     updatedAt: now,
     lastError: null,
+    runnerCycleId: context?.runnerCycleId || null,
+    runnerMint: context?.runnerMint || null,
   }
   createPendingOpen(position, executedPreview, pendingState)
 

@@ -57,6 +57,26 @@ if (runnerAgentEnabled && !runnerAlertSecret) {
   throw new Error('RUNNER_ALERT_SECRET is required when RUNNER_AGENT_ENABLED=true')
 }
 
+const runnerSafetyValues: Array<[string, number, (value: number) => boolean]> = [
+  ['RUNNER_MIN_MCAP_USD', envNum('RUNNER_MIN_MCAP_USD', 150_000), value => value > 0],
+  ['RUNNER_MIN_HOLDERS', envNum('RUNNER_MIN_HOLDERS', 1_000), value => Number.isInteger(value) && value >= 0],
+  ['RUNNER_MIN_FEE_SOL', envNum('RUNNER_MIN_FEE_SOL', 20), value => value >= 0],
+  ['RUNNER_MAX_ATH_DROP', envNum('RUNNER_MAX_ATH_DROP', 0.5), value => value >= 0 && value < 1],
+  ['RUNNER_MAX_DLMM_TVL_USD', envNum('RUNNER_MAX_DLMM_TVL_USD', 100_000), value => value >= 0],
+  ['RUNNER_REOPEN_MIN_VOL_5M_USD', envNum('RUNNER_REOPEN_MIN_VOL_5M_USD', 150_000), value => value >= 0],
+  ['RUNNER_EXIT_MIN_VOL_5M_USD', envNum('RUNNER_EXIT_MIN_VOL_5M_USD', 100_000), value => value >= 0],
+  ['RUNNER_POOL_WAIT_MS', envNum('RUNNER_POOL_WAIT_MS', 900_000), value => Number.isInteger(value) && value > 0],
+  ['RUNNER_POOL_POLL_MS', envNum('RUNNER_POOL_POLL_MS', 15_000), value => Number.isInteger(value) && value > 0],
+  ['RUNNER_FOLLOWUP_POLL_MS', envNum('RUNNER_FOLLOWUP_POLL_MS', 5_000), value => Number.isInteger(value) && value > 0],
+  ['RUNNER_GPA_REFRESH_MS', envNum('RUNNER_GPA_REFRESH_MS', 60_000), value => Number.isInteger(value) && value > 0],
+  ['RUNNER_FIRST_OPEN_RETRY_MAX', envNum('RUNNER_FIRST_OPEN_RETRY_MAX', 3), value => Number.isInteger(value) && value >= 1],
+  ['RUNNER_FIRST_CHASE_MAX', envNum('RUNNER_FIRST_CHASE_MAX', 3), value => Number.isInteger(value) && value >= 1],
+  ['RUNNER_ENTRY_DRIFT_PCT', envNum('RUNNER_ENTRY_DRIFT_PCT', 0.04), value => value >= 0 && value < 1],
+]
+for (const [name, value, valid] of runnerSafetyValues) {
+  if (!Number.isFinite(value) || !valid(value)) throw new Error(`${name} has an unsafe value`)
+}
+
 export const config: Config = {
   solanaRpcUrl: envStr('SOLANA_RPC_URL', 'https://api.mainnet-beta.solana.com'),
   solanaWsUrl: envStr('SOLANA_WS_URL'),

@@ -8,6 +8,7 @@ export interface RunnerAlertPayload {
   chainId: string
   mint: string
   symbol: string
+  eventId?: string
   volumeUsd: number
   marketCapUsd: number
   athMarketCapUsd: number
@@ -48,20 +49,26 @@ export function combinePoolDiscovery(input: {
   hydrated: DiscoveredDlmmPool[]
   failedAddresses: string[]
   lookupFailed: boolean
+  authoritativeRefresh?: boolean
 }): PoolDiscoveryResult {
-  const knownAddresses = [...new Set([...input.previousKnown, ...input.discoveredAddresses, ...input.hydrated.map(pool => pool.poolPubkey)])]
+  const baseAddresses = input.authoritativeRefresh ? [] : input.previousKnown
+  const knownAddresses = [...new Set([...baseAddresses, ...input.discoveredAddresses, ...input.hydrated.map(pool => pool.poolPubkey)])]
   const incomplete = input.lookupFailed || input.failedAddresses.length > 0 || input.hydrated.length < knownAddresses.length
   return { pools: input.hydrated, knownAddresses, incomplete }
 }
 
 export function isDuplicateAlert(lastAlertedAt: number | null, alertedAt: number): boolean {
-  return lastAlertedAt !== null && alertedAt <= lastAlertedAt
+  return lastAlertedAt !== null && normalizeAlertedAtMs(alertedAt) <= normalizeAlertedAtMs(lastAlertedAt)
 }
 
 export function isStaleAlert(alertedAt: number, now: number, maxAgeMs = 3_600_000): boolean {
   if (!Number.isFinite(alertedAt)) return true
-  const alertMs = alertedAt > 1e12 ? alertedAt : alertedAt * 1000
+  const alertMs = normalizeAlertedAtMs(alertedAt)
   return now - alertMs > maxAgeMs || alertMs - now > 300_000
+}
+
+export function normalizeAlertedAtMs(alertedAt: number): number {
+  return alertedAt > 1e12 ? alertedAt : alertedAt * 1000
 }
 
 export function parseRunnerAlertPayload(body: unknown): RunnerAlertPayload | { error: string } {
@@ -70,9 +77,11 @@ export function parseRunnerAlertPayload(body: unknown): RunnerAlertPayload | { e
   const chainId = typeof raw.chainId === 'string' ? raw.chainId : ''
   const mint = typeof raw.mint === 'string' ? raw.mint.trim() : ''
   const symbol = typeof raw.symbol === 'string' ? raw.symbol : ''
+  const eventId = raw.eventId === undefined ? undefined : typeof raw.eventId === 'string' && raw.eventId.trim() ? raw.eventId.trim() : ''
   if (!chainId) return { error: 'chainId is required' }
   if (!mint) return { error: 'mint is required' }
   if (!symbol) return { error: 'symbol is required' }
+  if (eventId === '') return { error: 'eventId is invalid' }
   const marketCapUsd = numberOrNaN(raw.marketCapUsd)
   const athMarketCapUsd = numberOrNaN(raw.athMarketCapUsd)
   const holders = numberOrNaN(raw.holders)
@@ -82,10 +91,14 @@ export function parseRunnerAlertPayload(body: unknown): RunnerAlertPayload | { e
   if (![marketCapUsd, athMarketCapUsd, holders, totalFeeSol, volumeUsd, alertedAt].every(Number.isFinite)) {
     return { error: 'numeric fields are invalid' }
   }
+  if (marketCapUsd < 0 || athMarketCapUsd < 0 || holders < 0 || !Number.isInteger(holders) || totalFeeSol < 0 || volumeUsd < 0) {
+    return { error: 'numeric fields are out of range' }
+  }
   return {
     chainId,
     mint,
     symbol,
+    ...(eventId ? { eventId } : {}),
     volumeUsd,
     marketCapUsd,
     athMarketCapUsd,
@@ -140,6 +153,9 @@ export function evaluateOpenGate(input: RunnerOpenGateInput): OpenGateResult {
   if (input.marketCapUsd / input.athMarketCapUsd <= input.maxAthDrop) {
     return { ok: false, reason: 'ath drop too large' }
   }
+  if (!Number.isFinite(input.totalTvlUsd) || input.totalTvlUsd < 0) {
+    return { ok: false, reason: 'dlmm tvl invalid', retryable: true }
+  }
   if (input.totalTvlUsd > input.maxDlmmTvlUsd) {
     return { ok: false, reason: 'dlmm tvl too high' }
   }
@@ -147,11 +163,12 @@ export function evaluateOpenGate(input: RunnerOpenGateInput): OpenGateResult {
 }
 
 export function sumDlmmTvl(pools: DiscoveredDlmmPool[]): number {
-  return pools.reduce((sum, pool) => sum + (Number.isFinite(pool.tvlUsd) ? pool.tvlUsd : 0), 0)
+  if (pools.some(pool => !Number.isFinite(pool.tvlUsd) || pool.tvlUsd < 0)) return Number.NaN
+  return pools.reduce((sum, pool) => sum + pool.tvlUsd, 0)
 }
 
 export function selectSolOpenPool(pools: DiscoveredDlmmPool[]): DiscoveredDlmmPool | null {
-  const eligible = pools.filter(pool => !pool.blacklisted && quoteIsSol(pool.tokenXMint, pool.tokenYMint))
+  const eligible = pools.filter(pool => !pool.blacklisted && Number.isFinite(pool.tvlUsd) && pool.tvlUsd >= 0 && quoteIsSol(pool.tokenXMint, pool.tokenYMint))
   if (eligible.length === 0) return null
   return eligible.reduce((best, pool) => pool.tvlUsd > best.tvlUsd ? pool : best)
 }
@@ -230,14 +247,14 @@ export function isWinTrigger(triggerType: TriggerType): boolean {
 }
 
 export function shouldCloseFollowup(input: {
-  totalTvlUsd: number
+  totalTvlUsd: number | null
   vol5mUsd: number | null
   pnlPercent: number
   maxDlmmTvlUsd: number
   exitMinVol5mUsd: number
 }): boolean {
   if (!(input.pnlPercent > 0)) return false
-  if (input.totalTvlUsd > input.maxDlmmTvlUsd) return true
+  if (input.totalTvlUsd !== null && input.totalTvlUsd > input.maxDlmmTvlUsd) return true
   if (input.vol5mUsd !== null && input.vol5mUsd < input.exitMinVol5mUsd) return true
   return false
 }
@@ -258,11 +275,10 @@ export function canReopenAfterWin(input: {
 }
 
 function numberOrNaN(value: unknown): number {
-  return typeof value === 'number' ? value : Number(value)
+  return typeof value === 'number' && Number.isFinite(value) ? value : Number.NaN
 }
 
 function optionalNumber(value: unknown): number | null {
   if (value === undefined || value === null || value === '') return null
-  const n = typeof value === 'number' ? value : Number(value)
-  return Number.isFinite(n) ? n : null
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
 }

@@ -70,6 +70,9 @@ test('skips open when ATH drop exceeds 50% or DLMM TVL is above 100k', () => {
   assert.equal(missingAth.ok, false)
   const lowMcap = evaluateOpenGate({ ...base, marketCapUsd: 149_999, athMarketCapUsd: 400_000, totalTvlUsd: 0 })
   assert.equal(lowMcap.ok, false)
+  const invalidTvl = evaluateOpenGate({ ...base, marketCapUsd: 200_001, athMarketCapUsd: 400_000, totalTvlUsd: Number.NaN })
+  assert.equal(invalidTvl.ok, false)
+  if (!invalidTvl.ok) assert.equal(invalidTvl.retryable, true)
 })
 
 test('sums all DLMM TVL including USDC pools and picks the highest SOL pool', () => {
@@ -82,6 +85,7 @@ test('sums all DLMM TVL including USDC pools and picks the highest SOL pool', ()
   ]
   assert.equal(sumDlmmTvl(pools), 179_000)
   assert.equal(selectSolOpenPool(pools)?.poolPubkey, 'sol-high')
+  assert.equal(Number.isNaN(sumDlmmTvl([{ ...pools[0], tvlUsd: Number.NaN }])), true)
 })
 
 test('treats range-cost errors as terminal and pending opens as non-retry submits', () => {
@@ -166,10 +170,13 @@ test('parses GMGN openapi token info and ranking fallbacks', () => {
       price: { price: 0.2, volume_5m: 180_000 },
     },
   })
+  assert.ok(parsed)
   assert.equal(parsed.marketCapUsd, 200_000)
   assert.equal(parsed.athMarketCapUsd, 400_000)
   assert.equal(parsed.volume5mUsd, 180_000)
   assert.equal(parsed.holders, 2500)
+  assert.equal(parseGmgnTokenInfo({ code: 100, data: {} }), null)
+  assert.equal(parseGmgnTokenInfo({ data: { price: { volume_5m: null }, holder_count: null } }), null)
 })
 
 test('keeps known pool addresses and marks partial metadata as incomplete', () => {
@@ -182,6 +189,15 @@ test('keeps known pool addresses and marks partial metadata as incomplete', () =
   })
   assert.equal(result.incomplete, true)
   assert.deepEqual(result.knownAddresses.sort(), ['a', 'b', 'c'])
+  const refreshed = combinePoolDiscovery({
+    previousKnown: ['obsolete'],
+    discoveredAddresses: ['fresh'],
+    hydrated: [{ poolPubkey: 'fresh', tokenXMint: 'Mint', tokenYMint: SOL_MINT, tvlUsd: 10, blacklisted: false }],
+    failedAddresses: [],
+    lookupFailed: false,
+    authoritativeRefresh: true,
+  })
+  assert.deepEqual(refreshed.knownAddresses, ['fresh'])
 })
 
 test('rejects duplicate and stale runner alerts', () => {
@@ -195,6 +211,10 @@ test('rejects duplicate and stale runner alerts', () => {
 test('parses alert payloads and ignores busy mint or disabled agent', () => {
   const parsed = parseRunnerAlertPayload(payload)
   assert.equal('error' in parsed, false)
+  assert.equal('error' in parseRunnerAlertPayload({ ...payload, volumeUsd: '200000' }), true)
+  const withEvent = parseRunnerAlertPayload({ ...payload, eventId: 'alert-1' })
+  assert.equal('error' in withEvent, false)
+  if (!('error' in withEvent)) assert.equal(withEvent.eventId, 'alert-1')
   const disabled = evaluateIngestGate({
     enabled: false,
     secretOk: true,

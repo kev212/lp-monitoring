@@ -1,8 +1,13 @@
-import { deleteSyncValue, getSyncValue, listSyncValues, setSyncValue } from '../db/client.js'
-import type { RunnerCycleStage } from './gates.js'
+import { randomUUID } from 'node:crypto'
+import { deleteSyncValue, getDb, getSyncValue, listSyncValues, setSyncValue } from '../db/client.js'
+import { normalizeAlertedAtMs } from './gates.js'
+import type { RunnerAlertPayload, RunnerCycleStage } from './gates.js'
 
 export interface RunnerCycle {
   version: 1
+  cycleId: string
+  eventId: string
+  revision: number
   owner: string
   mint: string
   symbol: string
@@ -27,6 +32,7 @@ export interface RunnerCycle {
 
 const PREFIX = 'runner_cycle:'
 const ALERT_SEEN_PREFIX = 'runner_alert_seen:'
+const ALERT_EVENT_PREFIX = 'runner_alert_event:'
 
 export function runnerCycleKey(owner: string, mint: string): string {
   return `${PREFIX}${owner}:${mint}`
@@ -35,6 +41,9 @@ export function runnerCycleKey(owner: string, mint: string): string {
 export function createRunnerCycle(owner: string, mint: string, symbol: string): RunnerCycle {
   return {
     version: 1,
+    cycleId: randomUUID(),
+    eventId: '',
+    revision: 0,
     owner,
     mint,
     symbol,
@@ -58,12 +67,56 @@ export function createRunnerCycle(owner: string, mint: string, symbol: string): 
   }
 }
 
-export function saveRunnerCycle(cycle: RunnerCycle): void {
-  setSyncValue(runnerCycleKey(cycle.owner, cycle.mint), JSON.stringify(cycle))
+export function saveRunnerCycle(cycle: RunnerCycle): boolean {
+  const db = getDb()
+  const key = runnerCycleKey(cycle.owner, cycle.mint)
+  const current = db.prepare('SELECT value FROM sync_state WHERE key = ?').get(key) as { value: string } | undefined
+  if (current) {
+    let parsed: Partial<RunnerCycle>
+    try { parsed = JSON.parse(current.value) as Partial<RunnerCycle> } catch { return false }
+    if ((parsed.cycleId && parsed.cycleId !== cycle.cycleId) || (parsed.revision ?? 0) !== cycle.revision) return false
+  } else if (cycle.revision !== 0) {
+    return false
+  }
+  cycle.revision += 1
+  setSyncValue(key, JSON.stringify(cycle))
+  return true
 }
 
-export function deleteRunnerCycle(owner: string, mint: string): void {
-  deleteSyncValue(runnerCycleKey(owner, mint))
+export function deleteRunnerCycle(owner: string, mint: string, cycleId?: string): boolean {
+  const key = runnerCycleKey(owner, mint)
+  if (!cycleId) {
+    deleteSyncValue(key)
+    return true
+  }
+  const result = getDb().prepare(`
+    DELETE FROM sync_state
+    WHERE key = ?
+      AND (json_extract(value, '$.cycleId') = ? OR (json_extract(value, '$.cycleId') IS NULL AND ? LIKE 'legacy:%'))
+  `).run(key, cycleId, cycleId)
+  return result.changes === 1
+}
+
+export function createRunnerCycleAtomically(cycle: RunnerCycle, payload: RunnerAlertPayload, eventId: string): boolean {
+  const db = getDb()
+  const cycleKey = runnerCycleKey(cycle.owner, cycle.mint)
+  const eventKey = `${ALERT_EVENT_PREFIX}${cycle.owner}:${eventId}`
+  const alertedAtMs = normalizeAlertedAtMs(payload.alertedAt)
+  const inserted = db.transaction(() => {
+    if (db.prepare('SELECT 1 FROM sync_state WHERE key = ?').get(cycleKey)) return false
+    if (db.prepare('SELECT 1 FROM sync_state WHERE key = ?').get(eventKey)) return false
+    cycle.eventId = eventId
+    cycle.revision = 1
+    const now = Date.now()
+    db.prepare('INSERT OR REPLACE INTO sync_state (key, value, updated_at) VALUES (?, ?, ?)')
+      .run(`${ALERT_SEEN_PREFIX}${cycle.owner}:${cycle.mint}`, String(alertedAtMs), now)
+    db.prepare('INSERT INTO sync_state (key, value, updated_at) VALUES (?, ?, ?)')
+      .run(eventKey, JSON.stringify({ eventId, mint: cycle.mint, alertedAtMs, createdAt: now }), now)
+    db.prepare('INSERT INTO sync_state (key, value, updated_at) VALUES (?, ?, ?)')
+      .run(cycleKey, JSON.stringify(cycle), now)
+    return true
+  })()
+  return inserted
 }
 
 export function listRunnerCycles(): RunnerCycle[] {
@@ -73,6 +126,9 @@ export function listRunnerCycles(): RunnerCycle[] {
       if (parsed.version !== 1 || !parsed.owner || !parsed.mint || !parsed.stage) return []
       return [{
         version: 1,
+        cycleId: parsed.cycleId || `legacy:${parsed.owner}:${parsed.mint}`,
+        eventId: parsed.eventId || '',
+        revision: Number.isSafeInteger(parsed.revision) ? parsed.revision as number : 0,
         owner: parsed.owner,
         mint: parsed.mint,
         symbol: parsed.symbol || '',
@@ -123,5 +179,5 @@ export function getLastAlertedAt(owner: string, mint: string): number | null {
 }
 
 export function rememberAlertedAt(owner: string, mint: string, alertedAt: number): void {
-  setSyncValue(`${ALERT_SEEN_PREFIX}${owner}:${mint}`, String(alertedAt))
+  setSyncValue(`${ALERT_SEEN_PREFIX}${owner}:${mint}`, String(normalizeAlertedAtMs(alertedAt)))
 }

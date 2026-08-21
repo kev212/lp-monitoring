@@ -3,7 +3,7 @@ import { config } from '../config.js'
 import { getWalletOperation } from '../executionLock.js'
 import { loadKnownPositions } from '../meteora/discovery.js'
 import { executeExit } from '../meteora/exit.js'
-import { executeOpenPosition, getPendingOpen, OpenSubmissionPendingError, pendingOpenExists, prepareOpenPosition } from '../meteora/open.js'
+import { executeOpenPosition, getRunnerOpenRecovery, OpenSubmissionPendingError, pendingOpenExists, prepareOpenPosition } from '../meteora/open.js'
 import { getFreshPool } from '../meteora/positions.js'
 import { sendNotification } from '../telegram.js'
 import type { QuoteCurrency, TriggerType } from '../types.js'
@@ -25,7 +25,7 @@ import {
   sumDlmmTvl,
   tvlIncompleteGate,
 } from './gates.js'
-import { busyRunnerStages, createRunnerCycle, deleteRunnerCycle, findCycleByPosition, getLastAlertedAt, listRunnerCycles, rememberAlertedAt, saveRunnerCycle, type RunnerCycle } from './cycle.js'
+import { busyRunnerStages, createRunnerCycle, createRunnerCycleAtomically, deleteRunnerCycle, findCycleByPosition, getLastAlertedAt, listRunnerCycles, saveRunnerCycle, type RunnerCycle } from './cycle.js'
 import { fetchGmgnSnapshot } from './gmgn.js'
 import { discoverMintPools, entryDriftPct, readActiveBin } from './resolvePool.js'
 
@@ -37,6 +37,11 @@ export function ingestRunnerAlert(body: unknown, secretOk: boolean, owner: strin
   if (!config.runnerAgentEnabled) return { status: 503, message: 'runner agent disabled' }
   const parsed = parseRunnerAlertPayload(body)
   if ('error' in parsed) return { status: 400, message: parsed.error }
+  try {
+    new PublicKey(parsed.mint)
+  } catch {
+    return { status: 400, message: 'mint is not a valid Solana public key' }
+  }
   if (isStaleAlert(parsed.alertedAt, Date.now())) {
     return { status: 202, message: 'stale alert' }
   }
@@ -64,9 +69,11 @@ export function ingestRunnerAlert(body: unknown, secretOk: boolean, owner: strin
     }
     return { status: gate.status, message: gate.reason }
   }
+  const eventId = parsed.eventId || `${parsed.mint}:${parsed.alertedAt}:${parsed.volumeUsd}:${parsed.marketCapUsd}:${parsed.reason}`
   const cycle = createRunnerCycle(owner, parsed.mint, parsed.symbol)
-  rememberAlertedAt(owner, parsed.mint, parsed.alertedAt)
-  saveRunnerCycle(cycle)
+  if (!createRunnerCycleAtomically(cycle, parsed, eventId)) {
+    return { status: 202, message: 'duplicate alert' }
+  }
   sendNotification(
     `🚨 <b>Runner Alert</b>\n\n<b>${parsed.symbol}</b>\nMint: <code>${parsed.mint}</code>\nMcap: <b>$${Math.round(parsed.marketCapUsd).toLocaleString()}</b>\nHolders: <b>${parsed.holders}</b>\nWaiting for DLMM pool.`
   )
@@ -85,7 +92,11 @@ export async function tickRunnerAgent(connection: Connection, wallet: Keypair): 
     } catch (err) {
       const message = err instanceof Error ? err.message : 'unknown'
       cycle.lastError = message
-      saveRunnerCycle(cycle)
+      if (!cycle.positionPubkey && Date.now() - (cycle.waitingSince || cycle.createdAt) >= config.runnerPoolWaitMs) {
+        finishCycle(cycle, `${message}; no-position retry timeout`)
+      } else {
+        saveRunnerCycle(cycle)
+      }
       console.log(`[runner] ${cycle.symbol} tick failed: ${message}`)
     }
   }
@@ -102,6 +113,7 @@ export async function notifyRunnerExit(positionPubkey: string, triggerType: Trig
     cycle.firstChaseCount += 1
     cycle.stage = 'open_first'
     cycle.positionPubkey = null
+    cycle.waitingSince = Date.now()
     saveRunnerCycle(cycle)
     sendNotification(`🔁 <b>Runner Chase</b>\n\n<b>${cycle.symbol}</b>\nChase ${cycle.firstChaseCount}/${config.runnerFirstChaseMax} — opening again as first position.`)
     return
@@ -109,6 +121,7 @@ export async function notifyRunnerExit(positionPubkey: string, triggerType: Trig
   if (decision === 'reopen_eval') {
     cycle.stage = 'reopen_eval'
     cycle.positionPubkey = null
+    cycle.waitingSince = Date.now()
     saveRunnerCycle(cycle)
     sendNotification(`✅ <b>Runner Win ${cycle.winCount}/${config.runnerMaxWins}</b>\n\n<b>${cycle.symbol}</b>\nTrigger: <code>${triggerType}</code>`)
     return
@@ -117,6 +130,12 @@ export async function notifyRunnerExit(positionPubkey: string, triggerType: Trig
 }
 
 async function advanceWaitingPool(connection: Connection, wallet: Keypair, cycle: RunnerCycle): Promise<void> {
+  const bound = bindCyclePosition(wallet.publicKey.toBase58(), cycle, 'first')
+  if (bound !== 'open') {
+    if (bound === 'closed') finishCycle(cycle, 'recovered position is closed')
+    else if (bound === 'error') finishCycle(cycle, 'recovered position requires review')
+    return
+  }
   const waited = Date.now() - (cycle.waitingSince || cycle.createdAt)
   if (waited >= config.runnerPoolWaitMs) {
     finishCycle(cycle, 'pool wait timeout')
@@ -128,6 +147,12 @@ async function advanceWaitingPool(connection: Connection, wallet: Keypair, cycle
 }
 
 async function advanceReopen(connection: Connection, wallet: Keypair, cycle: RunnerCycle): Promise<void> {
+  const bound = bindCyclePosition(wallet.publicKey.toBase58(), cycle, 'followup')
+  if (bound !== 'open') {
+    if (bound === 'closed') finishCycle(cycle, 'recovered position is closed')
+    else if (bound === 'error') finishCycle(cycle, 'recovered position requires review')
+    return
+  }
   await openForCycle(connection, wallet, cycle, 'followup')
 }
 
@@ -135,7 +160,15 @@ async function monitorFirst(connection: Connection, wallet: Keypair, cycle: Runn
   const bound = bindCyclePosition(wallet.publicKey.toBase58(), cycle, 'first')
   if (bound === 'wait') return
   if (bound === 'missing') {
-    retryOrFinishOpen(cycle)
+    finishCycle(cycle, 'position disappeared during open reconciliation; review wallet before reopening')
+    return
+  }
+  if (bound === 'closed') {
+    finishCycle(cycle, 'position is closed')
+    return
+  }
+  if (bound === 'error') {
+    finishCycle(cycle, 'position requires review')
     return
   }
   if (!cycle.positionPubkey) {
@@ -144,7 +177,7 @@ async function monitorFirst(connection: Connection, wallet: Keypair, cycle: Runn
   }
   const position = loadKnownPositions().find(row => row.positionPubkey === cycle.positionPubkey)
   if (!position) {
-    retryOrFinishOpen(cycle)
+    finishCycle(cycle, 'position disappeared; review wallet before reopening')
     return
   }
   if (position.status === 'exiting' || position.status === 'opening') return
@@ -183,7 +216,15 @@ async function monitorFollowup(connection: Connection, wallet: Keypair, cycle: R
   const bound = bindCyclePosition(wallet.publicKey.toBase58(), cycle, 'followup')
   if (bound === 'wait') return
   if (bound === 'missing') {
-    retryOrFinishOpen(cycle)
+    finishCycle(cycle, 'position disappeared during open reconciliation; review wallet before reopening')
+    return
+  }
+  if (bound === 'closed') {
+    finishCycle(cycle, 'position is closed')
+    return
+  }
+  if (bound === 'error') {
+    finishCycle(cycle, 'position requires review')
     return
   }
   if (!cycle.positionPubkey) {
@@ -192,7 +233,7 @@ async function monitorFollowup(connection: Connection, wallet: Keypair, cycle: R
   }
   const position = loadKnownPositions().find(row => row.positionPubkey === cycle.positionPubkey)
   if (!position) {
-    retryOrFinishOpen(cycle)
+    finishCycle(cycle, 'position disappeared; review wallet before reopening')
     return
   }
   if (position.status === 'exiting' || position.status === 'opening') return
@@ -209,7 +250,7 @@ async function monitorFollowup(connection: Connection, wallet: Keypair, cycle: R
   saveRunnerCycle(cycle)
   const pnl = position.lastPnlPercent
   if (pnl === null) return
-  const tvlUsd = discovery.incomplete ? 0 : sumDlmmTvl(discovery.pools)
+  const tvlUsd = discovery.incomplete ? null : sumDlmmTvl(discovery.pools)
   if (shouldCloseFollowup({
     totalTvlUsd: tvlUsd,
     vol5mUsd: liveVolume,
@@ -278,11 +319,19 @@ async function chaseFirst(
 
 async function openForCycle(connection: Connection, wallet: Keypair, cycle: RunnerCycle, kind: 'first' | 'followup'): Promise<void> {
   const owner = wallet.publicKey.toBase58()
+  if (cycle.cycleId.startsWith('legacy:') && !cycle.positionPubkey) {
+    finishCycle(cycle, 'legacy runner cycle has no durable open identity; review wallet before reopening')
+    return
+  }
   if (getWalletOperation(owner) || pendingOpenExists(owner)) return
   const live = await liveOpenGate(connection, cycle)
   if (!live.gate.ok) {
     if (live.gate.retryable) {
       cycle.lastError = live.gate.reason
+      if (!cycle.positionPubkey && Date.now() - (cycle.waitingSince || cycle.createdAt) >= config.runnerPoolWaitMs) {
+        finishCycle(cycle, `${live.gate.reason}; no-position retry timeout`)
+        return
+      }
       saveRunnerCycle(cycle)
       return
     }
@@ -319,7 +368,10 @@ async function openForCycle(connection: Connection, wallet: Keypair, cycle: Runn
       config.runnerRangePercent,
       config.runnerStrategy,
     )
-    const result = await executeOpenPosition(connection, wallet, preview)
+    const result = await executeOpenPosition(connection, wallet, preview, false, {
+      runnerCycleId: cycle.cycleId,
+      runnerMint: cycle.mint,
+    })
     cycle.poolPubkey = pool.poolPubkey
     cycle.positionPubkey = result.positionPubkey
     cycle.stage = kind === 'followup' ? 'open_followup' : 'open_first'
@@ -390,7 +442,11 @@ async function refreshPools(connection: Connection, cycle: RunnerCycle, force = 
   const now = Date.now()
   const interval = cycle.knownPoolPubkeys.length === 0 ? config.runnerPoolPollMs : config.runnerGpaRefreshMs
   const shouldGpa = force || now - cycle.lastGpaAt >= interval
-  const discovery = await discoverMintPools(connection, cycle.mint, cycle.knownPoolPubkeys, shouldGpa)
+  const discovery = await withRunnerTimeout(
+    discoverMintPools(connection, cycle.mint, cycle.knownPoolPubkeys, shouldGpa),
+    15_000,
+    'pool discovery timeout',
+  )
   cycle.knownPoolPubkeys = discovery.knownAddresses
   if (shouldGpa) cycle.lastGpaAt = now
   if (!discovery.incomplete) cycle.lastTvlUsd = sumDlmmTvl(discovery.pools)
@@ -398,50 +454,27 @@ async function refreshPools(connection: Connection, cycle: RunnerCycle, force = 
   return discovery
 }
 
-function bindCyclePosition(owner: string, cycle: RunnerCycle, kind: 'first' | 'followup'): 'ready' | 'wait' | 'missing' | 'open' {
-  const pending = getPendingOpen(owner)
+function bindCyclePosition(owner: string, cycle: RunnerCycle, kind: 'first' | 'followup'): 'ready' | 'wait' | 'missing' | 'closed' | 'error' | 'open' {
   if (!cycle.positionPubkey) {
-    if (pending) {
-      cycle.positionPubkey = pending.positionPubkey
-      cycle.poolPubkey = pending.poolPubkey
+    const recovery = getRunnerOpenRecovery(owner, cycle.cycleId, cycle.mint)
+    if (recovery) {
+      cycle.positionPubkey = recovery.positionPubkey
+      cycle.poolPubkey = recovery.poolPubkey
       cycle.stage = kind === 'followup' ? 'open_followup' : 'open_first'
       saveRunnerCycle(cycle)
-      return 'wait'
-    }
-    const used = new Set(listRunnerCycles().flatMap(item => item.positionPubkey ? [item.positionPubkey] : []))
-    const recovered = loadKnownPositions().find(position =>
-      (position.tokenXMint === cycle.mint || position.tokenYMint === cycle.mint)
-      && ['opening', 'monitoring', 'exiting'].includes(position.status)
-      && !used.has(position.positionPubkey)
-    )
-    if (recovered) {
-      cycle.positionPubkey = recovered.positionPubkey
-      cycle.poolPubkey = recovered.poolPubkey
-      cycle.stage = kind === 'followup' ? 'open_followup' : 'open_first'
-      saveRunnerCycle(cycle)
-      return recovered.status === 'monitoring' ? 'ready' : 'wait'
+      if (recovery.status === 'closed') return 'closed'
+      if (recovery.status === 'error') return 'error'
+      return recovery.status === 'monitoring' ? 'ready' : 'wait'
     }
     return 'open'
   }
-  if (pending?.positionPubkey === cycle.positionPubkey) return 'wait'
   const position = loadKnownPositions().find(row => row.positionPubkey === cycle.positionPubkey)
   if (!position) return 'missing'
+  if (position.owner !== owner || (position.tokenXMint !== cycle.mint && position.tokenYMint !== cycle.mint)) return 'error'
   if (position.status === 'opening' || position.status === 'exiting') return 'wait'
-  if (position.status === 'closed') return 'wait'
-  if (position.status === 'error') return 'missing'
+  if (position.status === 'closed') return 'closed'
+  if (position.status === 'error') return 'error'
   return 'ready'
-}
-
-function retryOrFinishOpen(cycle: RunnerCycle): void {
-  const classified = classifyOpenFailure(new Error(cycle.lastError || 'open reconciliation failed'), cycle.firstOpenRetryCount, config.runnerFirstOpenRetryMax)
-  cycle.positionPubkey = null
-  if (classified === 'terminal' || classified === 'give_up') {
-    finishCycle(cycle, cycle.lastError || 'open reconciliation failed')
-    return
-  }
-  cycle.firstOpenRetryCount += 1
-  saveRunnerCycle(cycle)
-  sendNotification(`⚠️ <b>Runner Open Retry ${cycle.firstOpenRetryCount}/${config.runnerFirstOpenRetryMax}</b>\n\n<b>${cycle.symbol}</b>\nReason: <code>open reconciliation failed</code>`)
 }
 
 async function readPositionBins(connection: Connection, poolPubkey: string, positionPubkey: string): Promise<{ lowerBinId: number; upperBinId: number } | null> {
@@ -458,11 +491,25 @@ async function readPositionBins(connection: Connection, poolPubkey: string, posi
 }
 
 function finishCycle(cycle: RunnerCycle, reason: string): void {
-  deleteRunnerCycle(cycle.owner, cycle.mint)
+  deleteRunnerCycle(cycle.owner, cycle.mint, cycle.cycleId)
   sendNotification(`🛑 <b>Runner Cycle Done</b>\n\n<b>${cycle.symbol}</b>\nMint: <code>${cycle.mint}</code>\nWins: <b>${cycle.winCount}/${config.runnerMaxWins}</b>\nReason: <code>${reason}</code>`)
   console.log(`[runner] ${cycle.symbol} cycle done: ${reason}`)
 }
 
 export function runnerHasWork(): boolean {
   return busyRunnerStages(listRunnerCycles()).length > 0
+}
+
+async function withRunnerTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
 }

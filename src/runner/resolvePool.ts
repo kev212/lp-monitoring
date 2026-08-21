@@ -10,7 +10,7 @@ const TOKEN_Y_MINT_OFFSET = 120
 
 interface DatapiPool {
   address?: string
-  tvl?: number
+  tvl?: unknown
   is_blacklisted?: boolean
   token_x?: { address?: string }
   token_y?: { address?: string }
@@ -27,7 +27,8 @@ export async function discoverMintPools(connection: Connection, mint: string, kn
       console.log(`[runner] pool lookup failed: ${err instanceof Error ? err.message : 'unknown'}`)
     }
   }
-  const addresses = [...new Set([...knownPoolPubkeys, ...discoveredAddresses])]
+  const authoritativeRefresh = forceGpa && !lookupFailed
+  const addresses = [...new Set(authoritativeRefresh ? discoveredAddresses : [...knownPoolPubkeys, ...discoveredAddresses])]
   const hydrated: DiscoveredDlmmPool[] = []
   const failedAddresses: string[] = []
   await Promise.all(addresses.map(async address => {
@@ -38,12 +39,20 @@ export async function discoverMintPools(connection: Connection, mint: string, kn
     }
     const tokenXMint = meta.token_x?.address || ''
     const tokenYMint = meta.token_y?.address || ''
-    if (tokenXMint !== mint && tokenYMint !== mint) return
+    const tvl = nonNegativeFiniteNumber(meta.tvl)
+    if (tokenXMint !== mint && tokenYMint !== mint) {
+      failedAddresses.push(address)
+      return
+    }
+    if (tvl === null) {
+      failedAddresses.push(address)
+      return
+    }
     hydrated.push({
       poolPubkey: meta.address || address,
       tokenXMint,
       tokenYMint,
-      tvlUsd: Number(meta.tvl) || 0,
+      tvlUsd: tvl,
       blacklisted: meta.is_blacklisted === true,
     })
   }))
@@ -53,7 +62,14 @@ export async function discoverMintPools(connection: Connection, mint: string, kn
     hydrated,
     failedAddresses,
     lookupFailed,
+    authoritativeRefresh,
   })
+}
+
+function nonNegativeFiniteNumber(value: unknown): number | null {
+  if (value === null || value === undefined || value === '' || typeof value === 'boolean') return null
+  const number = typeof value === 'number' ? value : typeof value === 'string' ? Number(value.trim()) : Number.NaN
+  return Number.isFinite(number) && number >= 0 ? number : null
 }
 
 export async function entryDriftPct(connection: Connection, poolPubkey: string, lowerBinId: number, upperBinId: number): Promise<number | null> {

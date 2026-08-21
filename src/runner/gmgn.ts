@@ -8,9 +8,13 @@ export interface GmgnSnapshot {
   holders: number | null
 }
 
-export function parseGmgnTokenInfo(payload: unknown): GmgnSnapshot {
-  const root = asRecord(payload) ?? {}
-  const data = asRecord(root.data) ?? root
+export function parseGmgnTokenInfo(payload: unknown): GmgnSnapshot | null {
+  const root = asRecord(payload)
+  if (!root) return null
+  const code = root.code
+  if (code !== undefined && code !== 0) return null
+  const data = root.data === undefined ? root : asRecord(root.data)
+  if (!data) return null
   const price = asRecord(data.price) ?? {}
   const supply = pickNumber(data, ['circulating_supply', 'circulatingSupply', 'total_supply'])
   const spot = pickNumber(price, ['price']) ?? pickNumber(data, ['price'])
@@ -23,6 +27,7 @@ export function parseGmgnTokenInfo(payload: unknown): GmgnSnapshot {
     ?? pickNumber(data, ['volume_5m', 'volume5m', 'volume_5min'])
     ?? pickNested(data.volume, ['5m', 'm5'])
   const holders = pickNumber(data, ['holder_count', 'holders', 'holderCount'])
+  if ([marketCapUsd, athMarketCapUsd, volume5mUsd, holders].every(value => value === null)) return null
   return { marketCapUsd, athMarketCapUsd, volume5mUsd, holders }
 }
 
@@ -58,7 +63,9 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 
 function pickNumber(data: Record<string, unknown>, keys: string[]): number | null {
   for (const key of keys) {
-    const n = Number(data[key])
+    const value = data[key]
+    if (value === null || value === undefined || value === '' || typeof value === 'boolean' || Array.isArray(value)) continue
+    const n = typeof value === 'number' ? value : typeof value === 'string' ? Number(value.trim()) : Number.NaN
     if (Number.isFinite(n)) return n
   }
   return null
