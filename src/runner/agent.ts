@@ -3,7 +3,7 @@ import { config } from '../config.js'
 import { getWalletOperation } from '../executionLock.js'
 import { loadKnownPositions } from '../meteora/discovery.js'
 import { executeExit } from '../meteora/exit.js'
-import { executeOpenPosition, getRunnerOpenRecovery, OpenSubmissionPendingError, pendingOpenExists, prepareOpenPosition } from '../meteora/open.js'
+import { executeOpenPosition, getRunnerOpenRecovery, markRunnerOpenExitHandled, OpenSubmissionPendingError, pendingOpenExists, prepareOpenPosition } from '../meteora/open.js'
 import { getFreshPool } from '../meteora/positions.js'
 import { sendNotification } from '../telegram.js'
 import type { QuoteCurrency, TriggerType } from '../types.js'
@@ -106,6 +106,7 @@ export async function notifyRunnerExit(positionPubkey: string, triggerType: Trig
   const cycle = findCycleByPosition(positionPubkey)
   if (!cycle) return
   if (cycle.lastHandledExitPubkey === positionPubkey) return
+  markRunnerOpenExitHandled(positionPubkey)
   cycle.lastHandledExitPubkey = positionPubkey
   if (isWinTrigger(triggerType)) cycle.winCount += 1
   const decision = decideRunnerClose(triggerType, cycle.winCount, config.runnerMaxWins)
@@ -456,7 +457,7 @@ async function refreshPools(connection: Connection, cycle: RunnerCycle, force = 
 
 function bindCyclePosition(owner: string, cycle: RunnerCycle, kind: 'first' | 'followup'): 'ready' | 'wait' | 'missing' | 'closed' | 'error' | 'open' {
   if (!cycle.positionPubkey) {
-    const recovery = getRunnerOpenRecovery(owner, cycle.cycleId, cycle.mint)
+    const recovery = getRunnerOpenRecovery(owner, cycle.cycleId, cycle.mint, cycle.lastHandledExitPubkey)
     if (recovery) {
       cycle.positionPubkey = recovery.positionPubkey
       cycle.poolPubkey = recovery.poolPubkey

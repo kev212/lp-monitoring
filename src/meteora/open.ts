@@ -8,7 +8,7 @@ import {
   PublicKey,
 } from '@solana/web3.js'
 import { config } from '../config.js'
-import { getDb, listSyncValues } from '../db/client.js'
+import { getDb, listSyncValues, setSyncValue } from '../db/client.js'
 import { getWalletOperation, walletOperationKey, withWalletExecutionLock } from '../executionLock.js'
 import type { QuoteCurrency } from '../types.js'
 import { deleteOpeningPosition, updatePositionStatus, upsertPosition } from './discovery.js'
@@ -97,6 +97,7 @@ interface OpenAttemptState {
   lastError: string | null
   runnerCycleId: string | null
   runnerMint: string | null
+  runnerExitHandled?: boolean
 }
 
 type PendingOpenState = OpenAttemptState & { stage: PendingOpenStage }
@@ -434,7 +435,7 @@ function positionForRunnerRecovery(positionPubkey: string, owner: string, mint: 
   return row.status as RunnerOpenRecovery['status']
 }
 
-export function getRunnerOpenRecovery(owner: string, cycleId: string, mint: string): RunnerOpenRecovery | null {
+export function getRunnerOpenRecovery(owner: string, cycleId: string, mint: string, ignoredPositionPubkey: string | null = null): RunnerOpenRecovery | null {
   const pending = findPendingOpen(owner)
   if (pending?.runnerCycleId === cycleId && pending.runnerMint === mint) {
     const status = positionForRunnerRecovery(pending.positionPubkey, owner, mint)
@@ -445,6 +446,8 @@ export function getRunnerOpenRecovery(owner: string, cycleId: string, mint: stri
       const state = JSON.parse(row.value) as Partial<OpenAttemptState>
       if (state.runnerCycleId !== cycleId || state.runnerMint !== mint || state.owner !== owner || state.stage !== 'finalized') continue
       if (!state.positionPubkey || !state.poolPubkey) continue
+      if (state.positionPubkey === ignoredPositionPubkey) continue
+      if (state.runnerExitHandled === true) continue
       const status = positionForRunnerRecovery(state.positionPubkey, owner, mint)
       if (status) return { positionPubkey: state.positionPubkey, poolPubkey: state.poolPubkey, status, pending: false }
     } catch {
@@ -452,6 +455,19 @@ export function getRunnerOpenRecovery(owner: string, cycleId: string, mint: stri
     }
   }
   return null
+}
+
+export function markRunnerOpenExitHandled(positionPubkey: string): void {
+  const key = `${OPEN_ATTEMPT_PREFIX}${positionPubkey}`
+  const row = getDb().prepare('SELECT value FROM sync_state WHERE key = ?').get(key) as { value: string } | undefined
+  if (!row) return
+  try {
+    const state = JSON.parse(row.value) as Partial<OpenAttemptState>
+    if (state.stage !== 'finalized' || !state.runnerCycleId) return
+    setSyncValue(key, JSON.stringify({ ...state, runnerExitHandled: true, updatedAt: Date.now() }))
+  } catch {
+    // A malformed historical attempt cannot be safely rebound.
+  }
 }
 
 function ensureOpenWalletLease(state: PendingOpenState): void {

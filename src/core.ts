@@ -1,4 +1,4 @@
-import { Connection, PublicKey } from '@solana/web3.js'
+import { Connection, Keypair, PublicKey } from '@solana/web3.js'
 import { config } from './config.js'
 import { getConnection, withValuationFallback } from './solana/connection.js'
 import { loadWallet, getWallet } from './solana/wallet.js'
@@ -82,6 +82,7 @@ let exitCooldowns = new Map<string, number>()
 let lastDiscoveryTime = 0
 let monitorRetries = new Map<string, number>()
 const pendingTriggers = new Map<string, { triggerType: TriggerType; timestamp: number; pnlAtTrigger: number }>()
+let runnerMaintenanceInFlight = false
 const DISCOVERY_INTERVAL_MS = 1 * 60 * 1000 // 1 menit
 const MAX_MONITOR_RETRIES = 5
 const PRECISION_CURVE_COOLDOWN_MS = 5_000
@@ -133,6 +134,19 @@ function notifyOpenReconcileFailures(summary: { failed: number }): void {
   )
 }
 
+async function runRunnerMaintenance(connection: Connection, wallet: Keypair): Promise<void> {
+  if (runnerMaintenanceInFlight) return
+  runnerMaintenanceInFlight = true
+  try {
+    notifyOpenReconcileFailures(await reconcilePendingOpens(connection))
+    await tickRunnerAgent(connection, wallet)
+  } catch (err) {
+    console.log(`[runner] maintenance failed: ${err instanceof Error ? err.message : 'unknown'}`)
+  } finally {
+    runnerMaintenanceInFlight = false
+  }
+}
+
 export async function startBot(): Promise<void> {
   console.log('[app] starting monitoring-lp...')
   running = true
@@ -181,7 +195,7 @@ export async function startBot(): Promise<void> {
         await reconcilePendingExits(getConnection(), wallet)
         await reconcilePendingRebalanceOpens(getConnection(), wallet)
         await flushExitCompletionNotifications()
-        await tickRunnerAgent(getConnection(), wallet)
+        void runRunnerMaintenance(getConnection(), wallet)
       }
 
       // Periodic discovery — every 5 menit
@@ -193,7 +207,6 @@ export async function startBot(): Promise<void> {
         if (reshapeRecovery === 'review') {
           sendNotification('🚨 <b>Reshape Recovery Requires Review</b>\n\nA finalized partial Flip/Precision transaction was recovered after restart. The position was marked error to prevent duplicate wallet mutations.')
         }
-        notifyOpenReconcileFailures(await reconcilePendingOpens(getConnection()))
         await recoverLegacyFailedExits(getConnection(), wallet)
         await discoverInitialPositions(getConnection(), walletPubkey, ownerStr)
       }

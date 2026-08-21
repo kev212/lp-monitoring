@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { randomUUID } from 'node:crypto'
+import { getDb } from '../src/db/client.js'
 import {
   canReopenAfterWin,
   classifyOpenFailure,
@@ -23,6 +25,7 @@ import {
   sumDlmmTvl,
 } from '../src/runner/gates.js'
 import { parseGmgnTokenInfo } from '../src/runner/gmgn.js'
+import { getRunnerOpenRecovery, markRunnerOpenExitHandled } from '../src/meteora/open.js'
 
 const payload = {
   chainId: 'sol',
@@ -206,6 +209,41 @@ test('rejects duplicate and stale runner alerts', () => {
   const now = Date.now()
   assert.equal(isStaleAlert(Math.floor(now / 1000), now), false)
   assert.equal(isStaleAlert(Math.floor(now / 1000) - 7200, now), true)
+})
+
+test('ignores the intentionally closed open when a runner cycle reopens', () => {
+  const db = getDb()
+  const owner = `recovery-test-${randomUUID()}`
+  const cycleId = randomUUID()
+  const positionPubkey = `position-${randomUUID()}`
+  const openKey = `open_attempt:${positionPubkey}`
+  db.prepare(`
+    INSERT INTO positions (
+      position_pubkey, pool_pubkey, token_x_mint, token_y_mint, owner,
+      status, last_seen_at, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, 'closed', ?, ?, ?)
+  `).run(positionPubkey, 'pool-test', 'runner-mint', SOL_MINT, owner, Date.now(), Date.now(), Date.now())
+  db.prepare('INSERT INTO sync_state (key, value, updated_at) VALUES (?, ?, ?)').run(
+    openKey,
+    JSON.stringify({
+      positionPubkey,
+      poolPubkey: 'pool-test',
+      owner,
+      runnerCycleId: cycleId,
+      runnerMint: 'runner-mint',
+      stage: 'finalized',
+    }),
+    Date.now(),
+  )
+  try {
+    assert.equal(getRunnerOpenRecovery(owner, cycleId, 'runner-mint', positionPubkey), null)
+    assert.equal(getRunnerOpenRecovery(owner, cycleId, 'runner-mint')?.status, 'closed')
+    markRunnerOpenExitHandled(positionPubkey)
+    assert.equal(getRunnerOpenRecovery(owner, cycleId, 'runner-mint'), null)
+  } finally {
+    db.prepare('DELETE FROM sync_state WHERE key = ?').run(openKey)
+    db.prepare('DELETE FROM positions WHERE position_pubkey = ?').run(positionPubkey)
+  }
 })
 
 test('parses alert payloads and ignores busy mint or disabled agent', () => {
