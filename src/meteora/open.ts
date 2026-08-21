@@ -202,6 +202,15 @@ export function calculateSingleSideRange(input: SingleSideRangeInput): {
   }
 }
 
+export function binIdFromUiPrice(input: {
+  price: number
+  min: boolean
+  toPricePerLamport: (price: number) => number
+  getBinIdFromPrice: (price: number, min: boolean) => number
+}): number {
+  return input.getBinIdFromPrice(Number(input.toPricePerLamport(input.price)), input.min)
+}
+
 export function parseUiAmountToRaw(input: string, decimals: number): bigint {
   const normalized = input.trim()
   if (normalized.includes(',') || normalized.includes('$') || /\s/.test(normalized)) {
@@ -312,7 +321,12 @@ async function prepareOpenPositionWithPool(
     activePoolPrice,
     quoteSide: poolInfo.quoteSide,
     rangePercent,
-    getBinIdFromPrice: (price, min) => pool.getBinIdFromPrice(price, min),
+    getBinIdFromPrice: (price, min) => binIdFromUiPrice({
+      price,
+      min,
+      toPricePerLamport: value => Number(pool.toPricePerLamport(value)),
+      getBinIdFromPrice: (value, isMin) => pool.getBinIdFromPrice(value, isMin),
+    }),
   })
   const binCount = range.maxBinId - range.minBinId + 1
   const maxBins = Number(MAX_BINS_PER_POSITION.toString())

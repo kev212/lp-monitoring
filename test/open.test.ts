@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   calculateSingleSideRange,
+  binIdFromUiPrice,
   formatRawAmount,
   OpenSubmissionPendingError,
   parseUiAmountToRaw,
@@ -46,6 +47,36 @@ test('builds a quote-X single-side range strictly above the active bin', () => {
   assert.ok(range.maxBinId > range.minBinId)
   assert.equal(range.currentPriceQuote, 0.5)
   assert.equal(range.targetPriceQuote, 0.45)
+})
+
+test('converts UI prices back to lamport prices before resolving bins', () => {
+  const seen: number[] = []
+  const resolved = binIdFromUiPrice({
+    price: 0.6,
+    min: true,
+    toPricePerLamport: price => price / 1_000,
+    getBinIdFromPrice: price => {
+      seen.push(price)
+      return 48
+    },
+  })
+  assert.equal(resolved, 48)
+  assert.equal(seen[0], 0.0006)
+
+  const range = calculateSingleSideRange({
+    activeBinId: 100,
+    activePoolPrice: 1,
+    quoteSide: 'Y',
+    rangePercent: 40,
+    getBinIdFromPrice: (price, min) => {
+      const lamportPrice = price / 1_000
+      const exact = 100 + Math.log(lamportPrice / 0.001) / Math.log(1.01)
+      return min ? Math.floor(exact) : Math.ceil(exact)
+    },
+  })
+  assert.equal(range.minBinId, 48)
+  assert.equal(range.maxBinId, 99)
+  assert.equal(range.maxBinId - range.minBinId + 1, 52)
 })
 
 test('parses UI token amounts without floating-point rounding', () => {
