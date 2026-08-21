@@ -5,10 +5,13 @@ import {
   classifyOpenFailure,
   decideRunnerClose,
   entryDriftFromPrices,
+  combinePoolDiscovery,
   evaluateIngestGate,
   evaluateOpenGate,
   gmgnUnavailableGate,
+  isDuplicateAlert,
   isPriceInRange,
+  isStaleAlert,
   isTerminalOpenError,
   isWinTrigger,
   parseRunnerAlertPayload,
@@ -19,6 +22,7 @@ import {
   SOL_MINT,
   sumDlmmTvl,
 } from '../src/runner/gates.js'
+import { parseGmgnTokenInfo } from '../src/runner/gmgn.js'
 
 const payload = {
   chainId: 'sol',
@@ -151,6 +155,41 @@ test('computes entry drift for quote-Y and inverted quote-X prices', () => {
     upperBinPrice: 1.4,
   }) > 0.04)
   assert.equal(gmgnUnavailableGate().retryable, true)
+})
+
+test('parses GMGN openapi token info and ranking fallbacks', () => {
+  const parsed = parseGmgnTokenInfo({
+    data: {
+      circulating_supply: 1_000_000,
+      holder_count: 2500,
+      ath_price: 0.4,
+      price: { price: 0.2, volume_5m: 180_000 },
+    },
+  })
+  assert.equal(parsed.marketCapUsd, 200_000)
+  assert.equal(parsed.athMarketCapUsd, 400_000)
+  assert.equal(parsed.volume5mUsd, 180_000)
+  assert.equal(parsed.holders, 2500)
+})
+
+test('keeps known pool addresses and marks partial metadata as incomplete', () => {
+  const result = combinePoolDiscovery({
+    previousKnown: ['a', 'b'],
+    discoveredAddresses: ['b', 'c'],
+    hydrated: [{ poolPubkey: 'a', tokenXMint: 'Mint', tokenYMint: SOL_MINT, tvlUsd: 10, blacklisted: false }],
+    failedAddresses: ['b'],
+    lookupFailed: false,
+  })
+  assert.equal(result.incomplete, true)
+  assert.deepEqual(result.knownAddresses.sort(), ['a', 'b', 'c'])
+})
+
+test('rejects duplicate and stale runner alerts', () => {
+  assert.equal(isDuplicateAlert(100, 100), true)
+  assert.equal(isDuplicateAlert(100, 101), false)
+  const now = Date.now()
+  assert.equal(isStaleAlert(Math.floor(now / 1000), now), false)
+  assert.equal(isStaleAlert(Math.floor(now / 1000) - 7200, now), true)
 })
 
 test('parses alert payloads and ignores busy mint or disabled agent', () => {

@@ -1038,7 +1038,7 @@ async function completeExitWithoutSwap(
       finalSolReceived: result.solReceived,
       finalQuoteReceived: quoteReceived,
       errorMessage: null,
-    })
+    }, true)
     result.success = true
     result.pendingRecovery = false
     console.log(`[exit] close-only completed without swap: ${quoteIsUsdc ? `${result.usdcReceived.toFixed(2)} USDC` : `${result.solReceived.toFixed(6)} SOL`} returned to wallet`)

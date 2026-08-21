@@ -400,6 +400,11 @@ export function pendingOpenExists(owner: string): boolean {
   return findPendingOpen(owner) !== null
 }
 
+export function getPendingOpen(owner: string): { positionPubkey: string; poolPubkey: string } | null {
+  const pending = findPendingOpen(owner)
+  return pending ? { positionPubkey: pending.positionPubkey, poolPubkey: pending.poolPubkey } : null
+}
+
 function ensureOpenWalletLease(state: PendingOpenState): void {
   const db = getDb()
   db.transaction(() => {

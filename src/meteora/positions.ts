@@ -48,6 +48,12 @@ export async function getPool(connection: Connection, poolPubkey: PublicKey): Pr
   return pool
 }
 
+export async function getFreshPool(connection: Connection, poolPubkey: PublicKey): Promise<DLMM> {
+  const pool = await getPool(connection, poolPubkey)
+  await pool.refetchStates()
+  return pool
+}
+
 export function clearPoolCache(): void {
   poolCache = new Map()
   poolInfoCache = new Map()

@@ -3,6 +3,7 @@ import { config } from '../config.js'
 import { ingestRunnerAlert } from './agent.js'
 import { getWallet } from '../solana/wallet.js'
 
+const MAX_BODY_BYTES = 64_000
 let server: http.Server | null = null
 
 export function startRunnerAlertServer(): void {
@@ -27,12 +28,17 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     return
   }
   const secretOk = (req.headers['x-runner-secret'] || '') === config.runnerAlertSecret
-  let raw = ''
+  if (!secretOk) {
+    req.resume()
+    res.writeHead(401, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ ok: false, message: 'invalid secret' }))
+    return
+  }
   try {
-    raw = await readBody(req)
+    const raw = await readBody(req, MAX_BODY_BYTES)
     const body = raw ? JSON.parse(raw) : {}
     const owner = getWallet().publicKey.toBase58()
-    const result = ingestRunnerAlert(body, secretOk, owner)
+    const result = ingestRunnerAlert(body, true, owner)
     res.writeHead(result.status, { 'content-type': 'application/json' })
     res.end(JSON.stringify({ ok: result.status === 202, message: result.message }))
   } catch (err) {
@@ -41,10 +47,20 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   }
 }
 
-function readBody(req: http.IncomingMessage): Promise<string> {
+function readBody(req: http.IncomingMessage, maxBytes: number): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = []
-    req.on('data', chunk => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)))
+    let size = 0
+    req.on('data', chunk => {
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+      size += buf.length
+      if (size > maxBytes) {
+        req.destroy()
+        reject(new Error('payload too large'))
+        return
+      }
+      chunks.push(buf)
+    })
     req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')))
     req.on('error', reject)
   })

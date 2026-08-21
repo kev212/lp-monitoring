@@ -36,6 +36,34 @@ export interface DiscoveredDlmmPool {
   blacklisted: boolean
 }
 
+export interface PoolDiscoveryResult {
+  pools: DiscoveredDlmmPool[]
+  knownAddresses: string[]
+  incomplete: boolean
+}
+
+export function combinePoolDiscovery(input: {
+  previousKnown: string[]
+  discoveredAddresses: string[]
+  hydrated: DiscoveredDlmmPool[]
+  failedAddresses: string[]
+  lookupFailed: boolean
+}): PoolDiscoveryResult {
+  const knownAddresses = [...new Set([...input.previousKnown, ...input.discoveredAddresses, ...input.hydrated.map(pool => pool.poolPubkey)])]
+  const incomplete = input.lookupFailed || input.failedAddresses.length > 0 || input.hydrated.length < knownAddresses.length
+  return { pools: input.hydrated, knownAddresses, incomplete }
+}
+
+export function isDuplicateAlert(lastAlertedAt: number | null, alertedAt: number): boolean {
+  return lastAlertedAt !== null && alertedAt <= lastAlertedAt
+}
+
+export function isStaleAlert(alertedAt: number, now: number, maxAgeMs = 3_600_000): boolean {
+  if (!Number.isFinite(alertedAt)) return true
+  const alertMs = alertedAt > 1e12 ? alertedAt : alertedAt * 1000
+  return now - alertMs > maxAgeMs || alertMs - now > 300_000
+}
+
 export function parseRunnerAlertPayload(body: unknown): RunnerAlertPayload | { error: string } {
   if (!body || typeof body !== 'object') return { error: 'payload must be an object' }
   const raw = body as Record<string, unknown>
@@ -96,6 +124,10 @@ export type OpenGateResult = { ok: true } | { ok: false; reason: string; retryab
 
 export function gmgnUnavailableGate(): OpenGateResult {
   return { ok: false, reason: 'gmgn unavailable', retryable: true }
+}
+
+export function tvlIncompleteGate(): OpenGateResult {
+  return { ok: false, reason: 'dlmm tvl incomplete', retryable: true }
 }
 
 export function evaluateOpenGate(input: RunnerOpenGateInput): OpenGateResult {
@@ -219,7 +251,7 @@ export function canReopenAfterWin(input: {
 }): { ok: true } | { ok: false; reason: string } {
   if (input.winCount >= input.maxWins) return { ok: false, reason: 'win cap reached' }
   if (!input.openGate.ok) return input.openGate
-  if (input.vol5mUsd === null || input.vol5mUsd <= input.minVol5mUsd) {
+  if (input.vol5mUsd === null || !Number.isFinite(input.vol5mUsd) || input.vol5mUsd <= input.minVol5mUsd) {
     return { ok: false, reason: 'vol 5m below reopen minimum' }
   }
   return { ok: true }

@@ -116,11 +116,9 @@ function formatQuoteLog(value: number, quoteCurrency: QuoteCurrency): string {
 
 async function flushExitCompletionNotifications(): Promise<void> {
   for (const notification of listPendingExitNotifications()) {
+    await notifyRunnerExit(notification.positionPubkey, notification.triggerType)
     const delivered = await sendNotificationAsync(formatExitReconciled(notification))
-    if (delivered) {
-      acknowledgeExitCompletionNotification(notification.executionId)
-      await notifyRunnerExit(notification.positionPubkey, notification.triggerType)
-    }
+    if (delivered) acknowledgeExitCompletionNotification(notification.executionId)
   }
 }
 

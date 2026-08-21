@@ -26,6 +26,7 @@ export interface RunnerCycle {
 }
 
 const PREFIX = 'runner_cycle:'
+const ALERT_SEEN_PREFIX = 'runner_alert_seen:'
 
 export function runnerCycleKey(owner: string, mint: string): string {
   return `${PREFIX}${owner}:${mint}`
@@ -112,4 +113,15 @@ export function findCycleByPosition(positionPubkey: string): RunnerCycle | null 
 
 export function busyRunnerStages(cycles: RunnerCycle[]): RunnerCycle[] {
   return cycles.filter(cycle => cycle.stage === 'waiting_pool' || cycle.stage === 'open_first' || cycle.stage === 'reopen_eval' || cycle.stage === 'open_followup')
+}
+
+export function getLastAlertedAt(owner: string, mint: string): number | null {
+  const raw = getSyncValue(`${ALERT_SEEN_PREFIX}${owner}:${mint}`)
+  if (!raw) return null
+  const n = Number(raw)
+  return Number.isFinite(n) ? n : null
+}
+
+export function rememberAlertedAt(owner: string, mint: string, alertedAt: number): void {
+  setSyncValue(`${ALERT_SEEN_PREFIX}${owner}:${mint}`, String(alertedAt))
 }

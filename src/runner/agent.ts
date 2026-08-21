@@ -3,8 +3,8 @@ import { config } from '../config.js'
 import { getWalletOperation } from '../executionLock.js'
 import { loadKnownPositions } from '../meteora/discovery.js'
 import { executeExit } from '../meteora/exit.js'
-import { executeOpenPosition, OpenSubmissionPendingError, pendingOpenExists, prepareOpenPosition } from '../meteora/open.js'
-import { getPool } from '../meteora/positions.js'
+import { executeOpenPosition, getPendingOpen, OpenSubmissionPendingError, pendingOpenExists, prepareOpenPosition } from '../meteora/open.js'
+import { getFreshPool } from '../meteora/positions.js'
 import { sendNotification } from '../telegram.js'
 import type { QuoteCurrency, TriggerType } from '../types.js'
 import {
@@ -14,16 +14,18 @@ import {
   evaluateIngestGate,
   evaluateOpenGate,
   gmgnUnavailableGate,
+  isDuplicateAlert,
   isPriceInRange,
+  isStaleAlert,
   isWinTrigger,
   parseRunnerAlertPayload,
   selectSolOpenPool,
   shouldChaseEntryDrift,
   shouldCloseFollowup,
   sumDlmmTvl,
-  type RunnerAlertPayload,
+  tvlIncompleteGate,
 } from './gates.js'
-import { busyRunnerStages, createRunnerCycle, deleteRunnerCycle, findCycleByPosition, listRunnerCycles, saveRunnerCycle, type RunnerCycle } from './cycle.js'
+import { busyRunnerStages, createRunnerCycle, deleteRunnerCycle, findCycleByPosition, getLastAlertedAt, listRunnerCycles, rememberAlertedAt, saveRunnerCycle, type RunnerCycle } from './cycle.js'
 import { fetchGmgnSnapshot } from './gmgn.js'
 import { discoverMintPools, entryDriftPct, readActiveBin } from './resolvePool.js'
 
@@ -35,6 +37,12 @@ export function ingestRunnerAlert(body: unknown, secretOk: boolean, owner: strin
   if (!config.runnerAgentEnabled) return { status: 503, message: 'runner agent disabled' }
   const parsed = parseRunnerAlertPayload(body)
   if ('error' in parsed) return { status: 400, message: parsed.error }
+  if (isStaleAlert(parsed.alertedAt, Date.now())) {
+    return { status: 202, message: 'stale alert' }
+  }
+  if (isDuplicateAlert(getLastAlertedAt(owner, parsed.mint), parsed.alertedAt)) {
+    return { status: 202, message: 'duplicate alert' }
+  }
   const cycles = listRunnerCycles()
   const busy = busyRunnerStages(cycles)
   const gate = evaluateIngestGate({
@@ -57,6 +65,7 @@ export function ingestRunnerAlert(body: unknown, secretOk: boolean, owner: strin
     return { status: gate.status, message: gate.reason }
   }
   const cycle = createRunnerCycle(owner, parsed.mint, parsed.symbol)
+  rememberAlertedAt(owner, parsed.mint, parsed.alertedAt)
   saveRunnerCycle(cycle)
   sendNotification(
     `🚨 <b>Runner Alert</b>\n\n<b>${parsed.symbol}</b>\nMint: <code>${parsed.mint}</code>\nMcap: <b>$${Math.round(parsed.marketCapUsd).toLocaleString()}</b>\nHolders: <b>${parsed.holders}</b>\nWaiting for DLMM pool.`
@@ -90,6 +99,7 @@ export async function notifyRunnerExit(positionPubkey: string, triggerType: Trig
   if (isWinTrigger(triggerType)) cycle.winCount += 1
   const decision = decideRunnerClose(triggerType, cycle.winCount, config.runnerMaxWins)
   if (decision === 'chase_first') {
+    cycle.firstChaseCount += 1
     cycle.stage = 'open_first'
     cycle.positionPubkey = null
     saveRunnerCycle(cycle)
@@ -112,8 +122,8 @@ async function advanceWaitingPool(connection: Connection, wallet: Keypair, cycle
     finishCycle(cycle, 'pool wait timeout')
     return
   }
-  const pools = await refreshPools(connection, cycle)
-  if (!selectSolOpenPool(pools)) return
+  const discovery = await refreshPools(connection, cycle)
+  if (discovery.incomplete || !selectSolOpenPool(discovery.pools)) return
   await openForCycle(connection, wallet, cycle, 'first')
 }
 
@@ -122,12 +132,21 @@ async function advanceReopen(connection: Connection, wallet: Keypair, cycle: Run
 }
 
 async function monitorFirst(connection: Connection, wallet: Keypair, cycle: RunnerCycle): Promise<void> {
+  const bound = bindCyclePosition(wallet.publicKey.toBase58(), cycle, 'first')
+  if (bound === 'wait') return
+  if (bound === 'missing') {
+    retryOrFinishOpen(cycle)
+    return
+  }
   if (!cycle.positionPubkey) {
     await openForCycle(connection, wallet, cycle, 'first')
     return
   }
   const position = loadKnownPositions().find(row => row.positionPubkey === cycle.positionPubkey)
-  if (!position) return
+  if (!position) {
+    retryOrFinishOpen(cycle)
+    return
+  }
   if (position.status === 'exiting' || position.status === 'opening') return
   if (position.status === 'closed') return
   if (position.status === 'error') {
@@ -161,28 +180,39 @@ async function monitorFollowup(connection: Connection, wallet: Keypair, cycle: R
   if (Date.now() - cycle.lastFollowupAt < config.runnerFollowupPollMs) return
   cycle.lastFollowupAt = Date.now()
   saveRunnerCycle(cycle)
+  const bound = bindCyclePosition(wallet.publicKey.toBase58(), cycle, 'followup')
+  if (bound === 'wait') return
+  if (bound === 'missing') {
+    retryOrFinishOpen(cycle)
+    return
+  }
   if (!cycle.positionPubkey) {
     await openForCycle(connection, wallet, cycle, 'followup')
     return
   }
   const position = loadKnownPositions().find(row => row.positionPubkey === cycle.positionPubkey)
-  if (!position) return
+  if (!position) {
+    retryOrFinishOpen(cycle)
+    return
+  }
   if (position.status === 'exiting' || position.status === 'opening') return
   if (position.status === 'closed') return
   if (position.status === 'error') {
     finishCycle(cycle, 'position error')
     return
   }
-  const pools = await refreshPools(connection, cycle, false)
+  const discovery = await refreshPools(connection, cycle, false)
   const snapshot = await fetchGmgnSnapshot(cycle.mint)
-  cycle.lastTvlUsd = sumDlmmTvl(pools)
-  cycle.lastVol5mUsd = snapshot?.volume5mUsd ?? null
+  const liveVolume = snapshot?.volume5mUsd ?? null
+  cycle.lastVol5mUsd = liveVolume
+  if (!discovery.incomplete) cycle.lastTvlUsd = sumDlmmTvl(discovery.pools)
   saveRunnerCycle(cycle)
   const pnl = position.lastPnlPercent
   if (pnl === null) return
+  const tvlUsd = discovery.incomplete ? 0 : sumDlmmTvl(discovery.pools)
   if (shouldCloseFollowup({
-    totalTvlUsd: cycle.lastTvlUsd,
-    vol5mUsd: cycle.lastVol5mUsd,
+    totalTvlUsd: tvlUsd,
+    vol5mUsd: liveVolume,
     pnlPercent: pnl,
     maxDlmmTvlUsd: config.runnerMaxDlmmTvlUsd,
     exitMinVol5mUsd: config.runnerExitMinVol5mUsd,
@@ -211,12 +241,12 @@ async function chaseFirst(
   position: { positionPubkey: string; poolPubkey: string; tokenXMint: string; tokenYMint: string; quoteCurrency: QuoteCurrency; basisQuote: number; lastPnlPercent: number | null; lastEstimatedExitQuote: number | null },
 ): Promise<void> {
   const live = await liveOpenGate(connection, cycle)
-  if (!live.ok) {
-    if (live.retryable) return
+  if (!live.gate.ok) {
+    if (live.gate.retryable) return
     if (!cycle.chaseCancelNotified) {
       cycle.chaseCancelNotified = true
       saveRunnerCycle(cycle)
-      sendNotification(`⏸ <b>Runner Chase Cancelled</b>\n\n<b>${cycle.symbol}</b>\nReason: <code>${live.reason}</code>\nHolding until price re-enters range.`)
+      sendNotification(`⏸ <b>Runner Chase Cancelled</b>\n\n<b>${cycle.symbol}</b>\nReason: <code>${live.gate.reason}</code>\nHolding until price re-enters range.`)
     }
     return
   }
@@ -237,42 +267,44 @@ async function chaseFirst(
     position.lastEstimatedExitQuote || 0,
     true,
   )
-  if (!result.success) return
-  cycle.firstChaseCount += 1
-  cycle.positionPubkey = null
-  saveRunnerCycle(cycle)
-  sendNotification(`🔁 <b>Runner Entry Drift</b>\n\n<b>${cycle.symbol}</b>\nPrice > ${config.runnerEntryDriftPct * 100}% above upper.\nChase ${cycle.firstChaseCount}/${config.runnerFirstChaseMax}. Close without swap.`)
+  if (result.success) {
+    await notifyRunnerExit(position.positionPubkey, 'RUNNER_ENTRY_DRIFT')
+    return
+  }
+  if (result.pendingRecovery) {
+    sendNotification(`⏳ <b>Runner Chase Close Pending</b>\n\n<b>${cycle.symbol}</b>\nWaiting for finality before reopening.`)
+  }
 }
 
 async function openForCycle(connection: Connection, wallet: Keypair, cycle: RunnerCycle, kind: 'first' | 'followup'): Promise<void> {
   const owner = wallet.publicKey.toBase58()
   if (getWalletOperation(owner) || pendingOpenExists(owner)) return
   const live = await liveOpenGate(connection, cycle)
-  if (!live.ok) {
-    if (live.retryable) {
-      cycle.lastError = live.reason
+  if (!live.gate.ok) {
+    if (live.gate.retryable) {
+      cycle.lastError = live.gate.reason
       saveRunnerCycle(cycle)
       return
     }
-    if (kind === 'followup') finishCycle(cycle, live.reason)
-    else if (cycle.stage === 'waiting_pool' || !cycle.positionPubkey) finishCycle(cycle, live.reason)
-    else sendNotification(`⏸ <b>Runner Open Gate</b>\n\n<b>${cycle.symbol}</b>\nReason: <code>${live.reason}</code>`)
+    if (kind === 'followup') finishCycle(cycle, live.gate.reason)
+    else if (cycle.stage === 'waiting_pool' || !cycle.positionPubkey) finishCycle(cycle, live.gate.reason)
+    else sendNotification(`⏸ <b>Runner Open Gate</b>\n\n<b>${cycle.symbol}</b>\nReason: <code>${live.gate.reason}</code>`)
     return
   }
   if (kind === 'followup') {
     const reopen = canReopenAfterWin({
       winCount: cycle.winCount,
       maxWins: config.runnerMaxWins,
-      vol5mUsd: cycle.lastVol5mUsd,
+      vol5mUsd: live.volume5mUsd,
       minVol5mUsd: config.runnerReopenMinVol5mUsd,
-      openGate: live,
+      openGate: live.gate,
     })
     if (!reopen.ok) {
       finishCycle(cycle, reopen.reason)
       return
     }
   }
-  const pool = selectSolOpenPool(await refreshPools(connection, cycle, false))
+  const pool = selectSolOpenPool(live.pools)
   if (!pool) {
     if (kind === 'first' && cycle.stage === 'waiting_pool') return
     finishCycle(cycle, 'no SOL DLMM pool')
@@ -327,39 +359,94 @@ async function openForCycle(connection: Connection, wallet: Keypair, cycle: Runn
   }
 }
 
-async function liveOpenGate(connection: Connection, cycle: RunnerCycle): Promise<import('./gates.js').OpenGateResult> {
+async function liveOpenGate(connection: Connection, cycle: RunnerCycle): Promise<{
+  gate: import('./gates.js').OpenGateResult
+  pools: import('./gates.js').DiscoveredDlmmPool[]
+  volume5mUsd: number | null
+}> {
   const snapshot = await fetchGmgnSnapshot(cycle.mint)
-  const pools = await refreshPools(connection, cycle, false)
-  cycle.lastTvlUsd = sumDlmmTvl(pools)
-  if (snapshot?.volume5mUsd !== undefined && snapshot.volume5mUsd !== null) {
-    cycle.lastVol5mUsd = snapshot.volume5mUsd
-  }
+  const discovery = await refreshPools(connection, cycle, false)
+  const volume5mUsd = snapshot?.volume5mUsd ?? null
+  cycle.lastVol5mUsd = volume5mUsd
+  if (!discovery.incomplete) cycle.lastTvlUsd = sumDlmmTvl(discovery.pools)
   saveRunnerCycle(cycle)
-  if (!snapshot) return gmgnUnavailableGate()
-  return evaluateOpenGate({
-    marketCapUsd: snapshot.marketCapUsd,
-    athMarketCapUsd: snapshot.athMarketCapUsd,
-    totalTvlUsd: cycle.lastTvlUsd,
-    minMcapUsd: config.runnerMinMcapUsd,
-    maxAthDrop: config.runnerMaxAthDrop,
-    maxDlmmTvlUsd: config.runnerMaxDlmmTvlUsd,
-  })
+  if (!snapshot) return { gate: gmgnUnavailableGate(), pools: discovery.pools, volume5mUsd }
+  if (discovery.incomplete) return { gate: tvlIncompleteGate(), pools: discovery.pools, volume5mUsd }
+  return {
+    gate: evaluateOpenGate({
+      marketCapUsd: snapshot.marketCapUsd,
+      athMarketCapUsd: snapshot.athMarketCapUsd,
+      totalTvlUsd: sumDlmmTvl(discovery.pools),
+      minMcapUsd: config.runnerMinMcapUsd,
+      maxAthDrop: config.runnerMaxAthDrop,
+      maxDlmmTvlUsd: config.runnerMaxDlmmTvlUsd,
+    }),
+    pools: discovery.pools,
+    volume5mUsd,
+  }
 }
 
-async function refreshPools(connection: Connection, cycle: RunnerCycle, force = false): Promise<import('./gates.js').DiscoveredDlmmPool[]> {
+async function refreshPools(connection: Connection, cycle: RunnerCycle, force = false): Promise<import('./gates.js').PoolDiscoveryResult> {
   const now = Date.now()
-  const shouldGpa = force || now - cycle.lastGpaAt >= config.runnerGpaRefreshMs || cycle.knownPoolPubkeys.length === 0
-  const pools = await discoverMintPools(connection, cycle.mint, cycle.knownPoolPubkeys, shouldGpa)
-  cycle.knownPoolPubkeys = [...new Set(pools.map(pool => pool.poolPubkey))]
+  const interval = cycle.knownPoolPubkeys.length === 0 ? config.runnerPoolPollMs : config.runnerGpaRefreshMs
+  const shouldGpa = force || now - cycle.lastGpaAt >= interval
+  const discovery = await discoverMintPools(connection, cycle.mint, cycle.knownPoolPubkeys, shouldGpa)
+  cycle.knownPoolPubkeys = discovery.knownAddresses
   if (shouldGpa) cycle.lastGpaAt = now
-  cycle.lastTvlUsd = sumDlmmTvl(pools)
+  if (!discovery.incomplete) cycle.lastTvlUsd = sumDlmmTvl(discovery.pools)
   saveRunnerCycle(cycle)
-  return pools
+  return discovery
+}
+
+function bindCyclePosition(owner: string, cycle: RunnerCycle, kind: 'first' | 'followup'): 'ready' | 'wait' | 'missing' | 'open' {
+  const pending = getPendingOpen(owner)
+  if (!cycle.positionPubkey) {
+    if (pending) {
+      cycle.positionPubkey = pending.positionPubkey
+      cycle.poolPubkey = pending.poolPubkey
+      cycle.stage = kind === 'followup' ? 'open_followup' : 'open_first'
+      saveRunnerCycle(cycle)
+      return 'wait'
+    }
+    const used = new Set(listRunnerCycles().flatMap(item => item.positionPubkey ? [item.positionPubkey] : []))
+    const recovered = loadKnownPositions().find(position =>
+      (position.tokenXMint === cycle.mint || position.tokenYMint === cycle.mint)
+      && ['opening', 'monitoring', 'exiting'].includes(position.status)
+      && !used.has(position.positionPubkey)
+    )
+    if (recovered) {
+      cycle.positionPubkey = recovered.positionPubkey
+      cycle.poolPubkey = recovered.poolPubkey
+      cycle.stage = kind === 'followup' ? 'open_followup' : 'open_first'
+      saveRunnerCycle(cycle)
+      return recovered.status === 'monitoring' ? 'ready' : 'wait'
+    }
+    return 'open'
+  }
+  if (pending?.positionPubkey === cycle.positionPubkey) return 'wait'
+  const position = loadKnownPositions().find(row => row.positionPubkey === cycle.positionPubkey)
+  if (!position) return 'missing'
+  if (position.status === 'opening' || position.status === 'exiting') return 'wait'
+  if (position.status === 'closed') return 'wait'
+  if (position.status === 'error') return 'missing'
+  return 'ready'
+}
+
+function retryOrFinishOpen(cycle: RunnerCycle): void {
+  const classified = classifyOpenFailure(new Error(cycle.lastError || 'open reconciliation failed'), cycle.firstOpenRetryCount, config.runnerFirstOpenRetryMax)
+  cycle.positionPubkey = null
+  if (classified === 'terminal' || classified === 'give_up') {
+    finishCycle(cycle, cycle.lastError || 'open reconciliation failed')
+    return
+  }
+  cycle.firstOpenRetryCount += 1
+  saveRunnerCycle(cycle)
+  sendNotification(`⚠️ <b>Runner Open Retry ${cycle.firstOpenRetryCount}/${config.runnerFirstOpenRetryMax}</b>\n\n<b>${cycle.symbol}</b>\nReason: <code>open reconciliation failed</code>`)
 }
 
 async function readPositionBins(connection: Connection, poolPubkey: string, positionPubkey: string): Promise<{ lowerBinId: number; upperBinId: number } | null> {
   try {
-    const pool = await getPool(connection, new PublicKey(poolPubkey))
+    const pool = await getFreshPool(connection, new PublicKey(poolPubkey))
     const position = await pool.getPosition(new PublicKey(positionPubkey))
     return {
       lowerBinId: position.positionData.lowerBinId,
