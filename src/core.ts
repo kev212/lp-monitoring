@@ -63,8 +63,9 @@ import {
   formatBotStart,
   formatBotStop,
 } from './telegram.js'
-import { notifyRunnerExit, tickRunnerAgent } from './runner/agent.js'
+ import { notifyRunnerExit, tickRunnerAgent } from './runner/agent.js'
 import { startRunnerAlertServer, stopRunnerAlertServer } from './runner/alertServer.js'
+import { bumpLifecycleGeneration, getLifecycleGeneration, isBotRunning, setBotRunning } from './lifecycle.js'
 import type { PositionRow, BasisConfidence, QuoteCurrency, TriggerType, StrategyType } from './types.js'
 import {
   getWalletOperation,
@@ -77,12 +78,13 @@ import {
 const SOL_MINT = 'So11111111111111111111111111111111111111112'
 const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
 
-let running = false
 let exitCooldowns = new Map<string, number>()
 let lastDiscoveryTime = 0
 let monitorRetries = new Map<string, number>()
 const pendingTriggers = new Map<string, { triggerType: TriggerType; timestamp: number; pnlAtTrigger: number }>()
 let runnerMaintenanceInFlight = false
+let runnerMaintenancePromise: Promise<void> | null = null
+let botStartInProgress = false
 const DISCOVERY_INTERVAL_MS = 1 * 60 * 1000 // 1 menit
 const MAX_MONITOR_RETRIES = 5
 const PRECISION_CURVE_COOLDOWN_MS = 5_000
@@ -135,37 +137,48 @@ function notifyOpenReconcileFailures(summary: { failed: number }): void {
 }
 
 async function runRunnerMaintenance(connection: Connection, wallet: Keypair): Promise<void> {
-  if (runnerMaintenanceInFlight) return
+  if (runnerMaintenanceInFlight) return runnerMaintenancePromise ?? Promise.resolve()
+  const generation = getLifecycleGeneration()
   runnerMaintenanceInFlight = true
-  try {
-    notifyOpenReconcileFailures(await reconcilePendingOpens(connection))
-    await tickRunnerAgent(connection, wallet)
-  } catch (err) {
-    console.log(`[runner] maintenance failed: ${err instanceof Error ? err.message : 'unknown'}`)
-  } finally {
-    runnerMaintenanceInFlight = false
-  }
+  runnerMaintenancePromise = (async () => {
+    try {
+      notifyOpenReconcileFailures(await reconcilePendingOpens(connection))
+      if (generation !== getLifecycleGeneration()) return
+      await tickRunnerAgent(connection, wallet)
+    } catch (err) {
+      console.log(`[runner] maintenance failed: ${err instanceof Error ? err.message : 'unknown'}`)
+    } finally {
+      runnerMaintenanceInFlight = false
+      runnerMaintenancePromise = null
+    }
+  })()
+  return runnerMaintenancePromise
 }
 
 export async function startBot(): Promise<void> {
-  console.log('[app] starting monitoring-lp...')
-  running = true
+  if (isBotRunning() || botStartInProgress) throw new Error('monitoring bot is already running')
+  botStartInProgress = true
+  try {
+    console.log('[app] starting monitoring-lp...')
+    setBotRunning(true)
 
-  loadWallet()
-  const wallet = getWallet()
-  const walletPubkey = wallet.publicKey
-  const ownerStr = walletPubkey.toBase58()
-  startRunnerAlertServer()
+    loadWallet()
+    const wallet = getWallet()
+    const walletPubkey = wallet.publicKey
+    const ownerStr = walletPubkey.toBase58()
+    startRunnerAlertServer()
 
-  reconcileOrphanExitIntent(ownerStr)
-  const reshapeRecovery = await reconcileDurableReshapeOperation(getConnection(), ownerStr)
-  if (reshapeRecovery === 'review') console.log('[reshape] recovered transaction requires manual position review')
-  await reconcilePendingExits(getConnection(), wallet)
-  await recoverLegacyFailedExits(getConnection(), wallet)
-  await flushExitCompletionNotifications()
-  notifyOpenReconcileFailures(await reconcilePendingOpens(getConnection()))
-  await reconcilePendingRebalanceOpens(getConnection(), wallet)
-  await tickRunnerAgent(getConnection(), wallet)
+    reconcileOrphanExitIntent(ownerStr)
+    const reshapeRecovery = await reconcileDurableReshapeOperation(getConnection(), ownerStr)
+    if (reshapeRecovery === 'review') console.log('[reshape] recovered transaction requires manual position review')
+    await reconcilePendingExits(getConnection(), wallet)
+    await recoverLegacyFailedExits(getConnection(), wallet)
+    await flushExitCompletionNotifications()
+    notifyOpenReconcileFailures(await reconcilePendingOpens(getConnection()))
+    await reconcilePendingRebalanceOpens(getConnection(), wallet)
+    // Startup runner work goes through the shared maintenance gate so a stop/start race
+    // can never run two concurrent ticks against the same cycles.
+    await runRunnerMaintenance(getConnection(), wallet)
   const pendingRebalancePositions = new Set(listRebalanceReopenIntents().map(intent => intent.positionPubkey))
   for (const position of loadKnownPositions().filter(p => p.rebalanceBusy && p.status === 'closed' && !pendingRebalancePositions.has(p.positionPubkey))) {
     updateRebalanceBusy(position.positionPubkey, false)
@@ -187,7 +200,7 @@ export async function startBot(): Promise<void> {
   await redetectStrategies(ownerStr)
   lastDiscoveryTime = Date.now() // start timer dari sini
 
-  while (running) {
+  while (isBotRunning()) {
     try {
       const loopNow = Date.now()
       if (loopNow - lastExitRecoveryAt >= config.exitRecoveryPollMs) {
@@ -197,7 +210,6 @@ export async function startBot(): Promise<void> {
         await flushExitCompletionNotifications()
         void runRunnerMaintenance(getConnection(), wallet)
       }
-
       // Periodic discovery — every 5 menit
       const now = Date.now()
       if (now - lastDiscoveryTime >= DISCOVERY_INTERVAL_MS) {
@@ -233,11 +245,22 @@ export async function startBot(): Promise<void> {
       }
     }
   }
+  } finally {
+    botStartInProgress = false
+  }
 }
 
-export function stopBot(): void {
-  running = false
+export async function stopBot(): Promise<void> {
+  setBotRunning(false)
+  bumpLifecycleGeneration()
   stopRunnerAlertServer()
+  // Drain in-flight runner maintenance so no wallet mutation starts after the
+  // operator is told the bot has stopped. Already-submitted durable transactions
+  // keep reconciling on the next start; nothing new is submitted.
+  const maintenance = runnerMaintenancePromise
+  if (maintenance) {
+    try { await maintenance } catch { /* failures already logged inside maintenance */ }
+  }
   sendNotification(formatBotStop())
 }
 
@@ -778,6 +801,7 @@ async function monitorSinglePosition(
         return
       }
       pendingTriggers.delete(pos.positionPubkey)
+      const rearmTrigger = { triggerType, timestamp: Date.now(), pnlAtTrigger: verifiedPnlPct }
 
       // --- Execute exit ---
       const estimatedPnl = exitValuation.pnlQuote
@@ -838,7 +862,13 @@ async function monitorSinglePosition(
             pos.poolPubkey
           )
         )
-        updatePositionConfirmations(pos.positionPubkey, 0)
+        // A wallet-busy rejection means the exit never started; keep the armed trigger so
+        // it retries on the next poll instead of silently dropping the risk exit.
+        if (/wallet is busy/i.test(result.error || '')) {
+          pendingTriggers.set(pos.positionPubkey, rearmTrigger)
+        } else {
+          updatePositionConfirmations(pos.positionPubkey, 0)
+        }
       }
     } else if (decision.triggerType && !decision.shouldTrigger && decision.reason?.includes('awaiting confirmation')) {
       const count = (pos.triggerConfirmations || 0) + 1

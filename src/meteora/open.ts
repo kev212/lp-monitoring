@@ -17,6 +17,7 @@ import { clearPoolCache, getPool, getPoolInfo } from './positions.js'
 import { getRiskSettings } from '../risk/settings.js'
 import { confirmSignature } from '../solana/confirmation.js'
 import { withRpcFallback, withSignatureStatusFallback } from '../solana/connection.js'
+import { sendNotification } from '../telegram.js'
 
 const SOL_MINT = 'So11111111111111111111111111111111111111112'
 const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
@@ -27,6 +28,8 @@ const DLMM_PROGRAM_ID = new PublicKey('LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPw
 const EXPIRED_ABSENCE_CHECKS = 2
 const EXPIRED_ABSENCE_MIN_INTERVAL_MS = 5_000
 const MAX_VERIFICATION_MISSING_CHECKS = 5
+const VERIFICATION_MISS_MIN_INTERVAL_MS = 30_000
+const WALLET_OPEN_DEADLINE_MS = 60_000
 
 export type OpenLiquidityStrategy = 'spot' | 'curve' | 'bidask'
 export type OpenQuoteSide = 'X' | 'Y'
@@ -98,6 +101,8 @@ interface OpenAttemptState {
   runnerCycleId: string | null
   runnerMint: string | null
   runnerExitHandled?: boolean
+  lastVerificationMissAt?: number | null
+  verificationReviewNotified?: boolean
 }
 
 type PendingOpenState = OpenAttemptState & { stage: PendingOpenStage }
@@ -134,6 +139,25 @@ export interface OpenExecutionContext {
 }
 
 class DefinitiveOpenError extends Error {}
+
+/**
+ * Bounds how long an open may hold the process-wide wallet lock. If the deadline fires
+ * before the durable claim, nothing was submitted and the caller retries safely; if it
+ * fires after, the durable pending state plus reconciliation own the outcome and any
+ * later wallet operation is fenced by the transactional createPendingOpen guard.
+ */
+function withOpenDeadline<T>(work: () => Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error('open exceeded the wallet lock deadline; any submitted transaction stays under durable reconciliation')), WALLET_OPEN_DEADLINE_MS)
+  })
+  return Promise.race([
+    work().finally(() => {
+      if (timer) clearTimeout(timer)
+    }),
+    timeout,
+  ])
+}
 
 export interface SingleSideRangeInput {
   activeBinId: number
@@ -543,9 +567,12 @@ function finishOpenAttempt(state: PendingOpenState, stage: TerminalOpenStage, er
   })()
 }
 
-async function verifyFinalizedPosition(connection: Connection, state: PendingOpenState): Promise<boolean> {
+async function verifyFinalizedPosition(connection: Connection, state: PendingOpenState, minContextSlot?: number): Promise<boolean> {
   const positionAddress = new PublicKey(state.positionPubkey)
-  const account = await withRpcFallback(rpc => rpc.getAccountInfo(positionAddress, 'finalized'), connection)
+  const accountConfig = Number.isSafeInteger(minContextSlot)
+    ? { commitment: 'finalized' as const, minContextSlot }
+    : 'finalized' as const
+  const account = await withRpcFallback(rpc => rpc.getAccountInfo(positionAddress, accountConfig), connection)
   if (!account) return false
   if (!account.owner.equals(DLMM_PROGRAM_ID)) throw new Error('finalized position account has an unexpected program owner')
 
@@ -605,7 +632,7 @@ export async function executeOpenPosition(
 
     return submitOpenPosition(connection, wallet, pool, executedPreview, context)
   }
-  return skipLock ? work() : withWalletExecutionLock(work)
+  return skipLock ? work() : withWalletExecutionLock(() => withOpenDeadline(work))
 }
 
 export interface RebalanceOpenParams {
@@ -703,7 +730,7 @@ export async function executeRebalanceOpen(
     const { preview, pool } = await prepareRebalanceOpenWithPool(connection, wallet.publicKey, params)
     return submitOpenPosition(connection, wallet, pool, preview)
   }
-  return skipLock ? work() : withWalletExecutionLock(work)
+  return skipLock ? work() : withWalletExecutionLock(() => withOpenDeadline(work))
 }
 
 async function submitOpenPosition(
@@ -838,6 +865,14 @@ export async function reconcilePendingOpens(connection: Connection): Promise<Ope
         console.log(`[open] reconciled failed position ${pending.positionPubkey.slice(0, 8)}`)
         continue
       }
+      // The signature may have reached finality between the first account read and now;
+      // re-verify anchored at the finalized slot before treating visibility as missing.
+      if (await verifyFinalizedPosition(connection, pending, status.value?.confirmationStatus === 'finalized' ? status.value.slot : undefined)) {
+        finishOpenAttempt(pending, 'finalized', null)
+        summary.finalized++
+        console.log(`[open] reconciled finalized position ${pending.positionPubkey.slice(0, 8)} after signature status`)
+        continue
+      }
 
       if (status.value?.confirmationStatus === 'confirmed' && pending.stage !== 'confirmed') {
         pending = { ...pending, stage: 'confirmed', lastError: null }
@@ -879,20 +914,34 @@ export async function reconcilePendingOpens(connection: Connection): Promise<Ope
         pending = { ...pending, lastError: `non-final transaction error: ${JSON.stringify(status.value.err)}` }
         updatePendingOpen(pending)
       } else if (status.value.confirmationStatus === 'finalized') {
-        const missingVerificationChecks = (pending.missingVerificationChecks || 0) + 1
-        if (missingVerificationChecks >= MAX_VERIFICATION_MISSING_CHECKS) {
-          finishOpenAttempt(pending, 'failed', 'finalized open signature but the position account never became visible; review the wallet before reopening')
-          summary.failed++
-          console.log(`[open] reconciled failed position ${pending.positionPubkey.slice(0, 8)}: finalized signature but account never visible`)
-          continue
+        // A successfully finalized signature is never declared failed just because the
+        // account is not visible yet: the durable pending state and wallet lease stay in
+        // place so no duplicate open can start while verification is unresolved.
+        const now = Date.now()
+        const lastMissAt = pending.lastVerificationMissAt ?? 0
+        const canCountMiss = now - lastMissAt >= VERIFICATION_MISS_MIN_INTERVAL_MS
+        const previousMisses = pending.missingVerificationChecks || 0
+        const missingVerificationChecks = previousMisses + (canCountMiss ? 1 : 0)
+        if (missingVerificationChecks >= MAX_VERIFICATION_MISSING_CHECKS && !pending.verificationReviewNotified) {
+          console.log(`[open] ${pending.positionPubkey.slice(0, 8)} finalized but the account is unseen after ${missingVerificationChecks} checks; holding for manual review`)
+          sendNotification(
+            `⚠️ <b>Open Needs Review</b>\n\n` +
+            `Position: <code>${pending.positionPubkey}</code>\n` +
+            `The open transaction is finalized but the position account is not visible yet.\n` +
+            `No new opens will be submitted until it is verified.`
+          )
         }
-        pending = {
-          ...pending,
-          stage: 'confirmed',
-          missingVerificationChecks,
-          lastError: 'finalized signature found but position verification is unavailable',
+        if (canCountMiss || missingVerificationChecks !== previousMisses) {
+          pending = {
+            ...pending,
+            stage: 'confirmed',
+            missingVerificationChecks,
+            lastVerificationMissAt: canCountMiss ? now : lastMissAt,
+            verificationReviewNotified: pending.verificationReviewNotified || missingVerificationChecks >= MAX_VERIFICATION_MISSING_CHECKS,
+            lastError: 'finalized signature found but position verification is unavailable; review the wallet before reopening',
+          }
+          updatePendingOpen(pending)
         }
-        updatePendingOpen(pending)
       }
       summary.pending++
     } catch (err) {

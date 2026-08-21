@@ -1,6 +1,7 @@
 import { Connection, Keypair, PublicKey } from '@solana/web3.js'
 import { config } from '../config.js'
 import { getWalletOperation } from '../executionLock.js'
+import { isBotRunning } from '../lifecycle.js'
 import { loadKnownPositions } from '../meteora/discovery.js'
 import { executeExit } from '../meteora/exit.js'
 import { executeOpenPosition, getRunnerOpenRecovery, markRunnerOpenExitHandled, OpenSubmissionPendingError, pendingOpenExists, prepareOpenPosition } from '../meteora/open.js'
@@ -84,6 +85,7 @@ export async function tickRunnerAgent(connection: Connection, wallet: Keypair): 
   if (!config.runnerAgentEnabled) return
   const owner = wallet.publicKey.toBase58()
   for (const cycle of listRunnerCycles().filter(item => item.owner === owner)) {
+    if (!isBotRunning()) return
     try {
       if (cycle.stage === 'waiting_pool') await advanceWaitingPool(connection, wallet, cycle)
       else if (cycle.stage === 'reopen_eval') await advanceReopen(connection, wallet, cycle)
@@ -259,6 +261,7 @@ async function monitorFollowup(connection: Connection, wallet: Keypair, cycle: R
     maxDlmmTvlUsd: config.runnerMaxDlmmTvlUsd,
     exitMinVol5mUsd: config.runnerExitMinVol5mUsd,
   })) {
+    if (!isBotRunning()) return
     const result = await executeExit(
       connection,
       wallet,
@@ -295,6 +298,7 @@ async function chaseFirst(
   cycle.chaseCancelNotified = false
   const owner = wallet.publicKey.toBase58()
   if (getWalletOperation(owner) || pendingOpenExists(owner)) return
+  if (!isBotRunning()) return
   const result = await executeExit(
     connection,
     wallet,
@@ -360,6 +364,7 @@ async function openForCycle(connection: Connection, wallet: Keypair, cycle: Runn
     finishCycle(cycle, 'no SOL DLMM pool')
     return
   }
+  if (!isBotRunning()) return
   try {
     const preview = await prepareOpenPosition(
       connection,
