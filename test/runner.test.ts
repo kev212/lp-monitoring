@@ -1,0 +1,167 @@
+import assert from 'node:assert/strict'
+import test from 'node:test'
+import {
+  canReopenAfterWin,
+  classifyOpenFailure,
+  decideRunnerClose,
+  evaluateIngestGate,
+  evaluateOpenGate,
+  isPriceInRange,
+  isTerminalOpenError,
+  isWinTrigger,
+  parseRunnerAlertPayload,
+  priceAboveUpperRatio,
+  selectSolOpenPool,
+  shouldChaseEntryDrift,
+  shouldCloseFollowup,
+  SOL_MINT,
+  sumDlmmTvl,
+} from '../src/runner/gates.js'
+
+const payload = {
+  chainId: 'sol',
+  mint: 'Mint111111111111111111111111111111111111111',
+  symbol: 'RUN',
+  volumeUsd: 200_000,
+  marketCapUsd: 200_000,
+  athMarketCapUsd: 400_000,
+  holders: 2500,
+  top10HolderPct: 28.4,
+  totalFeeSol: 25,
+  liquidityUsd: 80_000,
+  reason: 'volume spike',
+  alertedAt: 1_710_000_000,
+}
+
+test('rejects ingest on mcap, holders, and fee', () => {
+  const base = {
+    enabled: true,
+    secretOk: true,
+    payload,
+    minMcapUsd: 150_000,
+    minHolders: 1_000,
+    minFeeSol: 20,
+    activeRunnerCount: 0,
+    maxActive: 1,
+    sameMintBusy: false,
+  }
+  assert.equal(evaluateIngestGate({ ...base, payload: { ...payload, marketCapUsd: 149_999 } }).ok, false)
+  assert.equal(evaluateIngestGate({ ...base, payload: { ...payload, holders: 999 } }).ok, false)
+  assert.equal(evaluateIngestGate({ ...base, payload: { ...payload, totalFeeSol: 19.99 } }).ok, false)
+  assert.equal(evaluateIngestGate(base).ok, true)
+})
+
+test('skips open when ATH drop exceeds 50% or DLMM TVL is above 100k', () => {
+  const base = { minMcapUsd: 150_000, maxAthDrop: 0.5, maxDlmmTvlUsd: 100_000 }
+  assert.equal(evaluateOpenGate({ ...base, marketCapUsd: 200_001, athMarketCapUsd: 400_000, totalTvlUsd: 10_000 }).ok, true)
+  assert.equal(evaluateOpenGate({ ...base, marketCapUsd: 200_001, athMarketCapUsd: 400_000, totalTvlUsd: 100_001 }).ok, false)
+  assert.equal(evaluateOpenGate({ ...base, marketCapUsd: 200_001, athMarketCapUsd: 400_000, totalTvlUsd: 100_000 }).ok, true)
+  assert.equal(evaluateOpenGate({ ...base, marketCapUsd: 200_000, athMarketCapUsd: 400_000, totalTvlUsd: 0 }).ok, false)
+  const dropped = evaluateOpenGate({ ...base, marketCapUsd: 199_999, athMarketCapUsd: 400_000, totalTvlUsd: 0 })
+  assert.equal(dropped.ok, false)
+  if (!dropped.ok) assert.match(dropped.reason, /ath drop/)
+  const missingAth = evaluateOpenGate({ ...base, marketCapUsd: 200_000, athMarketCapUsd: null, totalTvlUsd: 0 })
+  assert.equal(missingAth.ok, false)
+  const lowMcap = evaluateOpenGate({ ...base, marketCapUsd: 149_999, athMarketCapUsd: 400_000, totalTvlUsd: 0 })
+  assert.equal(lowMcap.ok, false)
+})
+
+test('sums all DLMM TVL including USDC pools and picks the highest SOL pool', () => {
+  const usdc = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
+  const pools = [
+    { poolPubkey: 'sol-low', tokenXMint: 'Mint', tokenYMint: SOL_MINT, tvlUsd: 10_000, blacklisted: false },
+    { poolPubkey: 'sol-high', tokenXMint: 'Mint', tokenYMint: SOL_MINT, tvlUsd: 40_000, blacklisted: false },
+    { poolPubkey: 'usdc', tokenXMint: 'Mint', tokenYMint: usdc, tvlUsd: 30_000, blacklisted: false },
+    { poolPubkey: 'dead', tokenXMint: 'Mint', tokenYMint: SOL_MINT, tvlUsd: 99_000, blacklisted: true },
+  ]
+  assert.equal(sumDlmmTvl(pools), 179_000)
+  assert.equal(selectSolOpenPool(pools)?.poolPubkey, 'sol-high')
+})
+
+test('treats range-cost errors as terminal and pending opens as non-retry submits', () => {
+  assert.equal(isTerminalOpenError('Range requires 2 setup transactions; reduce the percentage range'), true)
+  assert.equal(isTerminalOpenError('Range requires 2 positions; reduce the percentage range'), true)
+  assert.equal(classifyOpenFailure(new Error('Range requires 2 setup transactions; reduce the percentage range'), 0, 3), 'terminal')
+  const pending = new Error('open submission sig requires reconciliation: confirm timeout')
+  pending.name = 'OpenSubmissionPendingError'
+  assert.equal(classifyOpenFailure(pending, 0, 3), 'pending')
+  assert.equal(classifyOpenFailure(new Error('RPC request failed'), 0, 3), 'retry')
+  assert.equal(classifyOpenFailure(new Error('RPC request failed'), 2, 3), 'give_up')
+})
+
+test('chases first-position entry drift up to 3 times and stops after in-range', () => {
+  const base = { cycleStage: 'open_first' as const, firstChaseCount: 0, firstEverInRange: false, maxChase: 3, threshold: 0.04 }
+  assert.ok(Math.abs(priceAboveUpperRatio(1.05, 1) - 0.05) < 1e-12)
+  assert.equal(shouldChaseEntryDrift({ ...base, driftPct: 0.041 }), true)
+  assert.equal(shouldChaseEntryDrift({ ...base, driftPct: 0.04 }), false)
+  assert.equal(shouldChaseEntryDrift({ ...base, firstChaseCount: 3, driftPct: 0.1 }), false)
+  assert.equal(shouldChaseEntryDrift({ ...base, firstEverInRange: true, driftPct: 0.1 }), false)
+  assert.equal(shouldChaseEntryDrift({ ...base, cycleStage: 'open_followup', driftPct: 0.1 }), false)
+  assert.equal(isPriceInRange(10, 1, 10), true)
+  assert.equal(isPriceInRange(11, 1, 10), false)
+})
+
+test('counts only TP and trailing as wins and stops reopen at 3', () => {
+  assert.equal(isWinTrigger('TP'), true)
+  assert.equal(isWinTrigger('TRAILING_STOP'), true)
+  assert.equal(isWinTrigger('SL'), false)
+  assert.equal(isWinTrigger('BIN_RANGE'), false)
+  assert.equal(isWinTrigger('RUNNER_ENTRY_DRIFT'), false)
+  assert.equal(isWinTrigger('RUNNER_CYCLE'), false)
+  assert.equal(decideRunnerClose('TP', 2, 3), 'reopen_eval')
+  assert.equal(decideRunnerClose('TRAILING_STOP', 3, 3), 'cycle_done')
+  assert.equal(decideRunnerClose('RUNNER_ENTRY_DRIFT', 0, 3), 'chase_first')
+  assert.equal(decideRunnerClose('SL', 0, 3), 'cycle_done')
+  assert.equal(decideRunnerClose('MANUAL', 0, 3), 'cycle_done')
+  const gate = evaluateOpenGate({
+    marketCapUsd: 200_001,
+    athMarketCapUsd: 400_000,
+    totalTvlUsd: 10_000,
+    minMcapUsd: 150_000,
+    maxAthDrop: 0.5,
+    maxDlmmTvlUsd: 100_000,
+  })
+  assert.equal(canReopenAfterWin({ winCount: 2, maxWins: 3, vol5mUsd: 151_000, minVol5mUsd: 150_000, openGate: gate }).ok, true)
+  assert.equal(canReopenAfterWin({ winCount: 3, maxWins: 3, vol5mUsd: 151_000, minVol5mUsd: 150_000, openGate: gate }).ok, false)
+  assert.equal(canReopenAfterWin({ winCount: 1, maxWins: 3, vol5mUsd: 150_000, minVol5mUsd: 150_000, openGate: gate }).ok, false)
+})
+
+test('closes follow-up only when TVL or volume trips and PnL is positive', () => {
+  const base = { totalTvlUsd: 100_001, vol5mUsd: 200_000, pnlPercent: 1, maxDlmmTvlUsd: 100_000, exitMinVol5mUsd: 100_000 }
+  assert.equal(shouldCloseFollowup(base), true)
+  assert.equal(shouldCloseFollowup({ ...base, pnlPercent: 0 }), false)
+  assert.equal(shouldCloseFollowup({ ...base, totalTvlUsd: 50_000, vol5mUsd: 99_999 }), true)
+  assert.equal(shouldCloseFollowup({ ...base, totalTvlUsd: 50_000, vol5mUsd: 100_000 }), false)
+  assert.equal(shouldCloseFollowup({ ...base, totalTvlUsd: 50_000, vol5mUsd: null }), false)
+})
+
+test('parses alert payloads and ignores busy mint or disabled agent', () => {
+  const parsed = parseRunnerAlertPayload(payload)
+  assert.equal('error' in parsed, false)
+  const disabled = evaluateIngestGate({
+    enabled: false,
+    secretOk: true,
+    payload,
+    minMcapUsd: 150_000,
+    minHolders: 1_000,
+    minFeeSol: 20,
+    activeRunnerCount: 0,
+    maxActive: 1,
+    sameMintBusy: false,
+  })
+  assert.equal(disabled.ok, false)
+  if (!disabled.ok) assert.equal(disabled.status, 503)
+  const busy = evaluateIngestGate({
+    enabled: true,
+    secretOk: true,
+    payload,
+    minMcapUsd: 150_000,
+    minHolders: 1_000,
+    minFeeSol: 20,
+    activeRunnerCount: 0,
+    maxActive: 1,
+    sameMintBusy: true,
+  })
+  assert.equal(busy.ok, false)
+  if (!busy.ok) assert.equal(busy.status, 202)
+})

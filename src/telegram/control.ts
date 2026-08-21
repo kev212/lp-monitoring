@@ -653,6 +653,8 @@ class TelegramDashboardController {
         return
       }
       if (!result.success) throw new Error(result.error || 'Manual close failed')
+      const { notifyRunnerExit } = await import('../runner/agent.js')
+      await notifyRunnerExit(position.positionPubkey, 'MANUAL')
       const received = position.quoteCurrency === 'USDC' ? result.usdcReceived : result.solReceived
       await this.bot.sendMessage(chatId, `Manual close selesai. Received ${formatQuote(received, position.quoteCurrency)}\nRemove: ${result.removeLiqSig || '-'}\nSwap: ${result.swapSig || 'none'}`)
       if (result.executionId !== null) acknowledgeExitCompletionNotification(result.executionId)

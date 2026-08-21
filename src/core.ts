@@ -63,6 +63,8 @@ import {
   formatBotStart,
   formatBotStop,
 } from './telegram.js'
+import { notifyRunnerExit, tickRunnerAgent } from './runner/agent.js'
+import { startRunnerAlertServer, stopRunnerAlertServer } from './runner/alertServer.js'
 import type { PositionRow, BasisConfidence, QuoteCurrency, TriggerType, StrategyType } from './types.js'
 import {
   getWalletOperation,
@@ -115,7 +117,10 @@ function formatQuoteLog(value: number, quoteCurrency: QuoteCurrency): string {
 async function flushExitCompletionNotifications(): Promise<void> {
   for (const notification of listPendingExitNotifications()) {
     const delivered = await sendNotificationAsync(formatExitReconciled(notification))
-    if (delivered) acknowledgeExitCompletionNotification(notification.executionId)
+    if (delivered) {
+      acknowledgeExitCompletionNotification(notification.executionId)
+      await notifyRunnerExit(notification.positionPubkey, notification.triggerType)
+    }
   }
 }
 
@@ -138,6 +143,7 @@ export async function startBot(): Promise<void> {
   const wallet = getWallet()
   const walletPubkey = wallet.publicKey
   const ownerStr = walletPubkey.toBase58()
+  startRunnerAlertServer()
 
   reconcileOrphanExitIntent(ownerStr)
   const reshapeRecovery = await reconcileDurableReshapeOperation(getConnection(), ownerStr)
@@ -147,6 +153,7 @@ export async function startBot(): Promise<void> {
   await flushExitCompletionNotifications()
   notifyOpenReconcileFailures(await reconcilePendingOpens(getConnection()))
   await reconcilePendingRebalanceOpens(getConnection(), wallet)
+  await tickRunnerAgent(getConnection(), wallet)
   const pendingRebalancePositions = new Set(listRebalanceReopenIntents().map(intent => intent.positionPubkey))
   for (const position of loadKnownPositions().filter(p => p.rebalanceBusy && p.status === 'closed' && !pendingRebalancePositions.has(p.positionPubkey))) {
     updateRebalanceBusy(position.positionPubkey, false)
@@ -175,6 +182,7 @@ export async function startBot(): Promise<void> {
         lastExitRecoveryAt = loopNow
         await reconcilePendingExits(getConnection(), wallet)
         await reconcilePendingRebalanceOpens(getConnection(), wallet)
+        await tickRunnerAgent(getConnection(), wallet)
         await flushExitCompletionNotifications()
       }
 
@@ -218,6 +226,7 @@ export async function startBot(): Promise<void> {
 
 export function stopBot(): void {
   running = false
+  stopRunnerAlertServer()
   sendNotification(formatBotStop())
 }
 
@@ -800,6 +809,7 @@ async function monitorSinglePosition(
         if (delivered && result.executionId !== null) {
           acknowledgeExitCompletionNotification(result.executionId)
         }
+        await notifyRunnerExit(pos.positionPubkey, triggerType)
       } else if (result.pendingRecovery) {
         sendNotification(
           `⏳ <b>Exit Pending Reconciliation</b>\n\n` +

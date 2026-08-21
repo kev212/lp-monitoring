@@ -3,7 +3,8 @@ export type BasisConfidence = 'high' | 'medium' | 'low'
 export type StrategyType = 'single_side_quote' | 'single_side_token' | 'balanced' | 'unknown'
 export type TokenSide = 'X' | 'Y'
 export type EventType = 'POSITION_INIT' | 'ADD_LIQUIDITY' | 'REMOVE_LIQUIDITY' | 'CLAIM_FEE' | 'CLAIM_REWARD' | 'CLOSE_POSITION' | 'UNKNOWN'
-export type TriggerType = 'TP' | 'SL' | 'TRAILING_STOP' | 'BIN_RANGE' | 'MANUAL'
+export type TriggerType = 'TP' | 'SL' | 'TRAILING_STOP' | 'BIN_RANGE' | 'MANUAL' | 'RUNNER_ENTRY_DRIFT' | 'RUNNER_CYCLE'
+export type OpenLiquidityStrategyName = 'spot' | 'curve' | 'bidask'
 export type ExitStatus = 'pending_remove' | 'removed' | 'swap_pending' | 'completed' | 'failed'
 export type QuoteCurrency = 'SOL' | 'USDC'
 
@@ -158,6 +159,30 @@ export interface Config {
   rebalanceOorMinutes: number
   openMaxPriceMoveBins: number
   openSolFeeReserve: number
+  runnerAgentEnabled: boolean
+  runnerAlertSecret: string
+  runnerAlertBind: string
+  runnerAlertPort: number
+  runnerOpenAmountSol: number
+  runnerRangePercent: number
+  runnerStrategy: OpenLiquidityStrategyName
+  runnerMaxActive: number
+  runnerMaxWins: number
+  runnerMinMcapUsd: number
+  runnerMinHolders: number
+  runnerMinFeeSol: number
+  runnerMaxAthDrop: number
+  runnerMaxDlmmTvlUsd: number
+  runnerReopenMinVol5mUsd: number
+  runnerExitMinVol5mUsd: number
+  runnerPoolWaitMs: number
+  runnerPoolPollMs: number
+  runnerFollowupPollMs: number
+  runnerGpaRefreshMs: number
+  runnerFirstOpenRetryMax: number
+  runnerFirstChaseMax: number
+  runnerEntryDriftPct: number
+  gmgnApiKey: string
   dbPath: string
   logLevel: string
 }

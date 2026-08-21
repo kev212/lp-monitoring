@@ -1,5 +1,5 @@
 import dotenv from 'dotenv'
-import type { Config } from './types.js'
+import type { Config, OpenLiquidityStrategyName } from './types.js'
 
 dotenv.config()
 
@@ -24,6 +24,37 @@ const telegramChatId = envStr('TELEGRAM_CHAT_ID')
 const openMaxPriceMoveBins = envNum('OPEN_MAX_PRICE_MOVE_BINS', 3)
 if (!Number.isInteger(openMaxPriceMoveBins) || openMaxPriceMoveBins < 1 || openMaxPriceMoveBins > 25) {
   throw new Error('OPEN_MAX_PRICE_MOVE_BINS must be an integer between 1 and 25')
+}
+
+const runnerStrategyRaw = envStr('RUNNER_STRATEGY', 'spot')
+if (!['spot', 'curve', 'bidask'].includes(runnerStrategyRaw)) {
+  throw new Error('RUNNER_STRATEGY must be spot, curve, or bidask')
+}
+const runnerStrategy = runnerStrategyRaw as OpenLiquidityStrategyName
+const runnerRangePercent = envNum('RUNNER_RANGE_PERCENT', 40)
+if (!Number.isInteger(runnerRangePercent) || runnerRangePercent < 1 || runnerRangePercent > 99) {
+  throw new Error('RUNNER_RANGE_PERCENT must be an integer between 1 and 99')
+}
+const runnerMaxActive = envNum('RUNNER_MAX_ACTIVE', 1)
+if (!Number.isInteger(runnerMaxActive) || runnerMaxActive < 1) {
+  throw new Error('RUNNER_MAX_ACTIVE must be an integer >= 1')
+}
+const runnerMaxWins = envNum('RUNNER_MAX_WINS', 3)
+if (!Number.isInteger(runnerMaxWins) || runnerMaxWins < 1) {
+  throw new Error('RUNNER_MAX_WINS must be an integer >= 1')
+}
+const runnerAlertPort = envNum('RUNNER_ALERT_PORT', 8787)
+if (!Number.isInteger(runnerAlertPort) || runnerAlertPort < 1 || runnerAlertPort > 65535) {
+  throw new Error('RUNNER_ALERT_PORT must be an integer between 1 and 65535')
+}
+const runnerOpenAmountSol = envNum('RUNNER_OPEN_AMOUNT_SOL', 0.5)
+if (!(runnerOpenAmountSol > 0)) {
+  throw new Error('RUNNER_OPEN_AMOUNT_SOL must be greater than 0')
+}
+const runnerAgentEnabled = envBool('RUNNER_AGENT_ENABLED', false)
+const runnerAlertSecret = envStr('RUNNER_ALERT_SECRET')
+if (runnerAgentEnabled && !runnerAlertSecret) {
+  throw new Error('RUNNER_ALERT_SECRET is required when RUNNER_AGENT_ENABLED=true')
 }
 
 export const config: Config = {
@@ -65,6 +96,30 @@ export const config: Config = {
   rebalanceOorMinutes: envNum('REBALANCE_OOR_MINUTES', 5),
   openMaxPriceMoveBins,
   openSolFeeReserve: envNum('OPEN_SOL_FEE_RESERVE', 0.02),
+  runnerAgentEnabled,
+  runnerAlertSecret,
+  runnerAlertBind: envStr('RUNNER_ALERT_BIND', '127.0.0.1'),
+  runnerAlertPort,
+  runnerOpenAmountSol,
+  runnerRangePercent,
+  runnerStrategy,
+  runnerMaxActive,
+  runnerMaxWins,
+  runnerMinMcapUsd: envNum('RUNNER_MIN_MCAP_USD', 150_000),
+  runnerMinHolders: envNum('RUNNER_MIN_HOLDERS', 1_000),
+  runnerMinFeeSol: envNum('RUNNER_MIN_FEE_SOL', 20),
+  runnerMaxAthDrop: envNum('RUNNER_MAX_ATH_DROP', 0.5),
+  runnerMaxDlmmTvlUsd: envNum('RUNNER_MAX_DLMM_TVL_USD', 100_000),
+  runnerReopenMinVol5mUsd: envNum('RUNNER_REOPEN_MIN_VOL_5M_USD', 150_000),
+  runnerExitMinVol5mUsd: envNum('RUNNER_EXIT_MIN_VOL_5M_USD', 100_000),
+  runnerPoolWaitMs: envNum('RUNNER_POOL_WAIT_MS', 900_000),
+  runnerPoolPollMs: envNum('RUNNER_POOL_POLL_MS', 15_000),
+  runnerFollowupPollMs: envNum('RUNNER_FOLLOWUP_POLL_MS', 5_000),
+  runnerGpaRefreshMs: envNum('RUNNER_GPA_REFRESH_MS', 60_000),
+  runnerFirstOpenRetryMax: envNum('RUNNER_FIRST_OPEN_RETRY_MAX', 3),
+  runnerFirstChaseMax: envNum('RUNNER_FIRST_CHASE_MAX', 3),
+  runnerEntryDriftPct: envNum('RUNNER_ENTRY_DRIFT_PCT', 0.04),
+  gmgnApiKey: envStr('GMGN_API_KEY'),
   dbPath: envStr('DB_PATH', './monitoring-lp.sqlite'),
   logLevel: envStr('LOG_LEVEL', 'info'),
 }
