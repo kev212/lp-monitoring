@@ -246,7 +246,7 @@ Setelah finalize:
 - Status `monitoring`.
 - **Jangan** `updateAutoRebalanceEnabled` / Flip / Precision.
 - Tag origin `runner` + `cycleStage: first | followup` di `sync_state`.
-- Global TP/SL/trailing/BIN_RANGE tetap berlaku (BIN_RANGE sudah global, bukan mode baru).
+- Global TP/SL/trailing tetap berlaku. BIN_RANGE **tidak** berlaku untuk posisi yang sedang dikelola active runner cycle (`findCycleByPosition`); BIN_RANGE tetap global untuk posisi lain.
 - Langsung cek **entry drift** (§8.2) sebelum masuk monitor TP/SL.
 
 Open in-flight: satu per wallet, sama seperti hari ini.
@@ -309,7 +309,7 @@ Poll `POLL_INTERVAL_MS` (default 2500). Tidak ada cek TVL/vol 5m di tahap ini. C
 | SL, error, close manual dashboard | `cycle_done`. Tidak reopen. |
 | TP atau trailing | `winCount += 1`. Jika `winCount >= RUNNER_MAX_WINS` (3) → `cycle_done`. Else → `reopen_eval` |
 | `RUNNER_ENTRY_DRIFT` | tetap `open_first` (bukan follow-up) |
-| BIN_RANGE close | `cycle_done`. Reopen follow-up hanya TP + trailing. |
+| BIN_RANGE close | Tidak terjadi pada posisi runner aktif (disuppress di `evaluateTrigger`). Defensive fallback: `cycle_done`. |
 
 ---
 
@@ -554,7 +554,7 @@ Keputusan: trigger baru `RUNNER_CYCLE` untuk close TVL/vol. Manual dashboard clo
 - `getLbPairs` GPA mahal; wajib cache.
 - 40% di bin-step kecil bisa ditolak Meteora.
 - GMGN 5m bisa rate-limit; gagal fetch ≠ close.
-- BIN_RANGE global bisa close posisi pertama tanpa reopen.
+- BIN_RANGE global tidak berlaku untuk posisi yang sedang dikelola runner cycle (lihat baris 249/312).
 - ATH pakai rasio mcap, bukan tick price.
 - Max 3 win: setelah 3 TP/trail, cycle berhenti meski vol/TVL masih bagus.
 - Max active 1: tidak stacking dua runner bersamaan.

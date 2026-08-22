@@ -190,6 +190,51 @@ test('excludes BIN_RANGE close for Auto Rebalance positions', () => {
   assert.equal(rebalance.shouldTrigger, false)
 })
 
+test('suppresses BIN_RANGE for runner-managed positions without touching TP/SL/trailing', () => {
+  const binData = { upperBinId: 100, poolActiveBinId: 95 }
+  const basePosition = {
+    status: 'monitoring',
+    drawdownTpOverrideActive: false,
+    autoRebalanceEnabled: false,
+    trailingActivated: false,
+    peakPnlPercent: 0,
+    triggerConfirmations: 0,
+  } as PositionRow
+  const settings = {
+    slPercent: -20,
+    tpPercent: 20,
+    trailingEnabled: true,
+    trailingActivationPct: 3,
+    trailingStopDropPct: 1,
+    ddLockTpPercent: 3,
+    revision: 1,
+    updatedAt: 1,
+  }
+
+  const suppressed = evaluateTrigger(basePosition, 4.66, binData, settings, false, false)
+  assert.equal(suppressed.shouldTrigger, false)
+
+  const takeProfit = evaluateTrigger(basePosition, 21, binData, settings, false, false)
+  assert.equal(takeProfit.triggerType, 'TP')
+
+  const stopLoss = evaluateTrigger(basePosition, -20, binData, settings, false, false)
+  assert.equal(stopLoss.triggerType, 'SL')
+
+  const trailing = evaluateTrigger(
+    { ...basePosition, trailingActivated: true, peakPnlPercent: 8 },
+    5,
+    binData,
+    settings,
+    false,
+    false,
+  )
+  assert.equal(trailing.triggerType, 'TRAILING_STOP')
+
+  const unmanaged = evaluateTrigger(basePosition, 4.66, binData, settings, false, true)
+  assert.equal(unmanaged.shouldTrigger, true)
+  assert.equal(unmanaged.triggerType, 'BIN_RANGE')
+})
+
 test('trailing remains eligible when bin-range distance is outside its window', () => {
   const position = {
     status: 'monitoring',

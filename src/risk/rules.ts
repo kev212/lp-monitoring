@@ -19,6 +19,7 @@ export function evaluateTrigger(
   binData?: BinData,
   riskSettings?: GlobalRiskSettings,
   applyConfirmation = true,
+  allowBinRange = true,
 ): TriggerDecision {
   if (position.status === 'exiting' || position.status === 'closed') {
     return { shouldTrigger: false, triggerType: null, reason: 'position already exiting/closed' }
@@ -55,8 +56,10 @@ export function evaluateTrigger(
   }
   // Priority 3: BIN_RANGE — auto close when PnL > threshold & close to upper bin.
   // Excluded for Auto Rebalance positions: the mode handles out-of-range movement itself.
+  // Excluded for runner-managed positions: the runner cycle owns exits (TP/SL/trailing only).
   else {
-    if (!position.autoRebalanceEnabled &&
+    if (allowBinRange &&
+        !position.autoRebalanceEnabled &&
         config.binRangeCloseEnabled &&
         binData?.upperBinId !== undefined &&
         binData?.poolActiveBinId !== undefined &&

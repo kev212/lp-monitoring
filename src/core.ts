@@ -64,6 +64,7 @@ import {
   formatBotStop,
 } from './telegram.js'
  import { notifyRunnerExit, tickRunnerAgent } from './runner/agent.js'
+import { findCycleByPosition } from './runner/cycle.js'
 import { startRunnerAlertServer, stopRunnerAlertServer } from './runner/alertServer.js'
 import { bumpLifecycleGeneration, getLifecycleGeneration, isBotRunning, setBotRunning } from './lifecycle.js'
 import type { PositionRow, BasisConfidence, QuoteCurrency, TriggerType, StrategyType } from './types.js'
@@ -660,6 +661,9 @@ async function monitorSinglePosition(
       upperBinId: valuation.upperBinId,
       poolActiveBinId: valuation.poolActiveBinId,
     }
+    // A position bound to an active runner cycle exits only via the runner's own
+    // policy (TP/SL/trailing/drift); global BIN_RANGE must not close it out.
+    const runnerManaged = findCycleByPosition(pos.positionPubkey) !== null
 
     const flipHandled = await maybeRunFlipMode(pos, valuation.lowerBinId, valuation.upperBinId, valuation.poolActiveBinId)
     if (flipHandled) {
@@ -689,7 +693,7 @@ async function monitorSinglePosition(
       return
     }
 
-    const decision = evaluateTrigger(pos, pnlPercent, binData, effectiveRiskSettings(riskSettings, pos))
+    const decision = evaluateTrigger(pos, pnlPercent, binData, effectiveRiskSettings(riskSettings, pos), true, !runnerManaged)
     if (decision.shouldTrigger && decision.triggerType) {
       let triggerType = decision.triggerType
       // LP Agent is diagnostic only; on-chain valuation remains authoritative.
@@ -773,6 +777,7 @@ async function monitorSinglePosition(
           },
           latestRiskSettings,
           false,
+          !runnerManaged,
         )
 
         if (!freshDecision.shouldTrigger || !freshDecision.triggerType) {
