@@ -9,8 +9,10 @@ import {
   remainingPriceMoveBins,
   sdkSlippagePercentForBins,
   strategyType,
+  transactionRequiresInitializeBinArray,
 } from '../src/meteora/open.js'
 import { StrategyType } from '@meteora-ag/dlmm'
+import { PublicKey, SystemProgram } from '@solana/web3.js'
 
 function binResolver(activeBinId: number, activePrice: number, step: number) {
   return (price: number, min: boolean): number => {
@@ -118,4 +120,17 @@ test('distinguishes finalized open transactions from unknown submission state', 
 
   assert.equal(finalized.transactionFinalized, true)
   assert.equal(unknown.transactionFinalized, false)
+})
+
+test('detects only Meteora InitializeBinArray instructions', () => {
+  const meteoraProgram = new PublicKey('LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo')
+  const initializeBinArray = Buffer.from('235613b94ed44bd3', 'hex')
+
+  assert.equal(transactionRequiresInitializeBinArray({ instructions: [
+    { programId: meteoraProgram, data: Buffer.concat([initializeBinArray, Buffer.alloc(8)]) },
+  ] }), true)
+  assert.equal(transactionRequiresInitializeBinArray({ instructions: [
+    { programId: SystemProgram.programId, data: initializeBinArray },
+    { programId: meteoraProgram, data: Buffer.from('235613b94ed44bd4', 'hex') },
+  ] }), false)
 })

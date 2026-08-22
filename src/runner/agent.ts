@@ -4,7 +4,7 @@ import { getWalletOperation } from '../executionLock.js'
 import { isBotRunning } from '../lifecycle.js'
 import { loadKnownPositions } from '../meteora/discovery.js'
 import { executeExit } from '../meteora/exit.js'
-import { executeOpenPosition, getRunnerOpenRecovery, markRunnerOpenExitHandled, OpenSubmissionPendingError, pendingOpenExists, prepareOpenPosition } from '../meteora/open.js'
+import { BinArrayInitializationRequiredError, executeOpenPosition, getRunnerOpenRecovery, markRunnerOpenExitHandled, OpenSubmissionPendingError, pendingOpenExists, prepareOpenPosition, type OpenPositionPreview } from '../meteora/open.js'
 import { getFreshPool } from '../meteora/positions.js'
 import { sendNotification } from '../telegram.js'
 import type { QuoteCurrency, TriggerType } from '../types.js'
@@ -20,7 +20,9 @@ import {
   isStaleAlert,
   isWinTrigger,
   parseRunnerAlertPayload,
+  runnerBinArrayAction,
   selectSolOpenPool,
+  selectSolOpenPools,
   shouldChaseEntryDrift,
   shouldCloseFollowup,
   sumDlmmTvl,
@@ -299,6 +301,23 @@ async function chaseFirst(
   const owner = wallet.publicKey.toBase58()
   if (getWalletOperation(owner) || pendingOpenExists(owner)) return
   if (!isBotRunning()) return
+  try {
+    const prepared = await prepareRunnerOpen(connection, wallet, live.pools, cycle.poolPubkey)
+    if (!prepared) return
+    cycle.lastError = null
+    saveRunnerCycle(cycle)
+  } catch (err) {
+    if (!(err instanceof BinArrayInitializationRequiredError)) throw err
+    if (runnerBinArrayAction('chase') !== 'hold') throw err
+    const reason = 'all eligible SOL DLMM pools require InitializeBinArray'
+    const shouldNotify = cycle.lastError !== reason
+    cycle.lastError = reason
+    saveRunnerCycle(cycle)
+    if (shouldNotify) {
+      sendNotification(`⏳ <b>Runner Waiting - Bin Arrays Missing</b>\n\n<b>${cycle.symbol}</b>\nHolding the existing position; chase count is unchanged.`)
+    }
+    return
+  }
   const result = await executeExit(
     connection,
     wallet,
@@ -358,26 +377,16 @@ async function openForCycle(connection: Connection, wallet: Keypair, cycle: Runn
       return
     }
   }
-  const pool = selectSolOpenPool(live.pools)
-  if (!pool) {
+  if (!selectSolOpenPool(live.pools)) {
     if (kind === 'first' && cycle.stage === 'waiting_pool') return
     finishCycle(cycle, 'no SOL DLMM pool')
     return
   }
   if (!isBotRunning()) return
   try {
-    const preview = await prepareOpenPosition(
-      connection,
-      wallet.publicKey,
-      pool.poolPubkey,
-      formatSolAmount(config.runnerOpenAmountSol),
-      config.runnerRangePercent,
-      config.runnerStrategy,
-    )
-    const result = await executeOpenPosition(connection, wallet, preview, false, {
-      runnerCycleId: cycle.cycleId,
-      runnerMint: cycle.mint,
-    })
+    const opened = await executeRunnerOpen(connection, wallet, live.pools, cycle)
+    if (!opened) return
+    const { pool, result } = opened
     cycle.poolPubkey = pool.poolPubkey
     cycle.positionPubkey = result.positionPubkey
     cycle.stage = kind === 'followup' ? 'open_followup' : 'open_first'
@@ -396,6 +405,23 @@ async function openForCycle(connection: Connection, wallet: Keypair, cycle: Runn
       `Open: <a href="https://solscan.io/tx/${result.signature}">tx</a>`
     )
   } catch (err) {
+    if (err instanceof BinArrayInitializationRequiredError) {
+      const reason = 'all eligible SOL DLMM pools require InitializeBinArray'
+      const shouldNotify = cycle.lastError !== reason
+      cycle.lastError = reason
+      if (runnerBinArrayAction(kind) === 'finish') {
+        if (shouldNotify) sendNotification(`⏳ <b>Runner Waiting - Bin Arrays Missing</b>\n\n<b>${cycle.symbol}</b>\nFollow-up skipped; funds remain in the wallet.`)
+        finishCycle(cycle, reason)
+        return
+      }
+      if (Date.now() - (cycle.waitingSince || cycle.createdAt) >= Math.min(config.runnerPoolWaitMs, 900_000)) {
+        finishCycle(cycle, `${reason}; no-position retry timeout`)
+        return
+      }
+      saveRunnerCycle(cycle)
+      if (shouldNotify) sendNotification(`⏳ <b>Runner Waiting - Bin Arrays Missing</b>\n\n<b>${cycle.symbol}</b>\nChecking alternate pools for up to 15 minutes.`)
+      return
+    }
     if (err instanceof OpenSubmissionPendingError) {
       cycle.positionPubkey = err.positionPubkey
       cycle.stage = kind === 'followup' ? 'open_followup' : 'open_first'
@@ -415,6 +441,84 @@ async function openForCycle(connection: Connection, wallet: Keypair, cycle: Runn
     saveRunnerCycle(cycle)
     sendNotification(`⚠️ <b>Runner Open Retry ${cycle.firstOpenRetryCount}/${config.runnerFirstOpenRetryMax}</b>\n\n<b>${cycle.symbol}</b>\nReason: <code>${message}</code>`)
   }
+}
+
+async function prepareRunnerOpen(
+  connection: Connection,
+  wallet: Keypair,
+  pools: import('./gates.js').DiscoveredDlmmPool[],
+  preferredPoolPubkey: string | null,
+): Promise<{ pool: import('./gates.js').DiscoveredDlmmPool; preview: OpenPositionPreview } | null> {
+  const candidates = runnerOpenCandidates(pools, preferredPoolPubkey)
+  if (candidates.length === 0) return null
+
+  let missingBinArrays = 0
+  for (const pool of candidates) {
+    try {
+      const preview = await prepareOpenPosition(
+        connection,
+        wallet.publicKey,
+        pool.poolPubkey,
+        formatSolAmount(config.runnerOpenAmountSol),
+        config.runnerRangePercent,
+        config.runnerStrategy,
+        { requireExistingBinArrays: true },
+      )
+      return { pool, preview }
+    } catch (err) {
+      if (!(err instanceof BinArrayInitializationRequiredError)) throw err
+      missingBinArrays++
+    }
+  }
+  if (missingBinArrays === candidates.length) throw new BinArrayInitializationRequiredError()
+  return null
+}
+
+async function executeRunnerOpen(
+  connection: Connection,
+  wallet: Keypair,
+  pools: import('./gates.js').DiscoveredDlmmPool[],
+  cycle: RunnerCycle,
+): Promise<{ pool: import('./gates.js').DiscoveredDlmmPool; result: Awaited<ReturnType<typeof executeOpenPosition>> } | null> {
+  const candidates = runnerOpenCandidates(pools, cycle.poolPubkey)
+  if (candidates.length === 0) return null
+
+  let missingBinArrays = 0
+  for (const pool of candidates) {
+    try {
+      const preview = await prepareOpenPosition(
+        connection,
+        wallet.publicKey,
+        pool.poolPubkey,
+        formatSolAmount(config.runnerOpenAmountSol),
+        config.runnerRangePercent,
+        config.runnerStrategy,
+        { requireExistingBinArrays: true },
+      )
+      const result = await executeOpenPosition(connection, wallet, preview, false, {
+        runnerCycleId: cycle.cycleId,
+        runnerMint: cycle.mint,
+        requireExistingBinArrays: true,
+      })
+      return { pool, result }
+    } catch (err) {
+      if (!(err instanceof BinArrayInitializationRequiredError)) throw err
+      missingBinArrays++
+    }
+  }
+  if (missingBinArrays === candidates.length) throw new BinArrayInitializationRequiredError()
+  return null
+}
+
+function runnerOpenCandidates(
+  pools: import('./gates.js').DiscoveredDlmmPool[],
+  preferredPoolPubkey: string | null,
+): import('./gates.js').DiscoveredDlmmPool[] {
+  const candidates = selectSolOpenPools(pools)
+  if (preferredPoolPubkey) {
+    candidates.sort((left, right) => Number(right.poolPubkey === preferredPoolPubkey) - Number(left.poolPubkey === preferredPoolPubkey))
+  }
+  return candidates
 }
 
 async function liveOpenGate(connection: Connection, cycle: RunnerCycle): Promise<{

@@ -18,7 +18,9 @@ import {
   isWinTrigger,
   parseRunnerAlertPayload,
   priceAboveUpperRatio,
+  runnerBinArrayAction,
   selectSolOpenPool,
+  selectSolOpenPools,
   shouldChaseEntryDrift,
   shouldCloseFollowup,
   SOL_MINT,
@@ -88,6 +90,7 @@ test('sums all DLMM TVL including USDC pools and picks the highest SOL pool', ()
   ]
   assert.equal(sumDlmmTvl(pools), 179_000)
   assert.equal(selectSolOpenPool(pools)?.poolPubkey, 'sol-high')
+  assert.deepEqual(selectSolOpenPools(pools).map(pool => pool.poolPubkey), ['sol-high', 'sol-low'])
   assert.equal(Number.isNaN(sumDlmmTvl([{ ...pools[0], tvlUsd: Number.NaN }])), true)
 })
 
@@ -100,6 +103,12 @@ test('treats range-cost errors as terminal and pending opens as non-retry submit
   assert.equal(classifyOpenFailure(pending, 0, 3), 'pending')
   assert.equal(classifyOpenFailure(new Error('RPC request failed'), 0, 3), 'retry')
   assert.equal(classifyOpenFailure(new Error('RPC request failed'), 2, 3), 'give_up')
+})
+
+test('maps missing bin arrays to wait, hold, and finish runner actions', () => {
+  assert.equal(runnerBinArrayAction('first'), 'wait')
+  assert.equal(runnerBinArrayAction('chase'), 'hold')
+  assert.equal(runnerBinArrayAction('followup'), 'finish')
 })
 
 test('chases first-position entry drift up to 3 times and stops after in-range', () => {

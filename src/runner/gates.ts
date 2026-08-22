@@ -168,9 +168,18 @@ export function sumDlmmTvl(pools: DiscoveredDlmmPool[]): number {
 }
 
 export function selectSolOpenPool(pools: DiscoveredDlmmPool[]): DiscoveredDlmmPool | null {
-  const eligible = pools.filter(pool => !pool.blacklisted && Number.isFinite(pool.tvlUsd) && pool.tvlUsd >= 0 && quoteIsSol(pool.tokenXMint, pool.tokenYMint))
-  if (eligible.length === 0) return null
-  return eligible.reduce((best, pool) => pool.tvlUsd > best.tvlUsd ? pool : best)
+  return selectSolOpenPools(pools)[0] || null
+}
+
+export function selectSolOpenPools(pools: DiscoveredDlmmPool[]): DiscoveredDlmmPool[] {
+  return pools
+    .filter(pool => !pool.blacklisted && Number.isFinite(pool.tvlUsd) && pool.tvlUsd >= 0 && quoteIsSol(pool.tokenXMint, pool.tokenYMint))
+    .sort((left, right) => right.tvlUsd - left.tvlUsd)
+}
+
+export function runnerBinArrayAction(kind: 'first' | 'chase' | 'followup'): 'wait' | 'hold' | 'finish' {
+  if (kind === 'chase') return 'hold'
+  return kind === 'followup' ? 'finish' : 'wait'
 }
 
 export function quoteIsSol(tokenXMint: string, tokenYMint: string): boolean {

@@ -264,8 +264,11 @@ Reuse error classes `open.ts`. Jangan spam notif.
 | `DefinitiveOpenError` (TX gagal on-chain) | Posisi `opening` sudah dihapus oleh durable fail. Retry sebagai **first**, lihat baris bawah. |
 | Expired / signature absent / `Pool price moved too far since preview` / RPC transient | Retry sebagai **first**. |
 | Retry gagal open | Max `RUNNER_FIRST_OPEN_RETRY_MAX` (3). Masih gagal → skip, 1 notif, tunggu alert berikutnya. **Tidak** ada posisi yang bisa “nunggu masuk range”. |
+| Semua pool SOL butuh `InitializeBinArray` | Jangan sign atau submit. Coba pool SOL lain berdasarkan TVL; jika semua sama, tunggu/recheck sampai timeout 15 menit. Base `InitializePosition` dan bitmap extension tetap boleh. |
 
 Retry open mengulang gate §7 (mcap, ATH drop, total TVL DLMM) + pool SOL. Kalau gate gagal di tengah retry → skip alert, bukan paksa open.
+
+Policy bin-array hanya berlaku untuk runner. `prepareOpenPosition` memindai transaction unsigned dari SDK dan `executeOpenPosition` memindai ulang transaction aktual tepat sebelum signing. Manual open dan Auto Rebalance tidak memakai policy ini.
 
 ### 8.2 Entry drift chase (posisi sudah finalized, masih `open_first`)
 
@@ -295,6 +298,8 @@ Kasus runner volume besar: TX sukses, harga sudah pump, posisi langsung OOR di a
 - Setelah masuk range: monitor first biasa (TP/SL/trailing). Tidak ada cek TVL/vol 5m di tahap ini.
 
 Kalau gate §7 gagal saat mau chase: **jangan** close. Hold posisi yang ada, nunggu masuk range atau SL/TP. Satu notif “chase dibatalkan”.
+
+Sebelum close chase, preflight open pengganti pada semua candidate pool SOL. Jika semuanya butuh `InitializeBinArray`, jangan close, jangan tambah `firstChaseCount`, dan hold posisi lama. Follow-up yang semuanya butuh init langsung menyelesaikan cycle; dana tetap di wallet.
 
 Cek drift: sekali segera setelah finalize, lalu tiap tick `open_first` selama `firstChaseCount < 3` dan harga belum pernah masuk range. Setelah harga pernah in-range, chase **mati** untuk cycle ini (pump berikutnya = OOR biasa, bukan chase).
 
@@ -408,6 +413,7 @@ Satu pesan per transisi bermakna. Jangan spam tiap tick 5s.
 - Alert diterima + lolos ingest
 - Skip (alasan: mcap / holders / fee / slot / ATH / TVL / no SOL pool)
 - Waiting pool
+- Waiting bin arrays (sekali per transisi; tidak spam tiap tick)
 - Timeout 15 menit
 - Open success (pool, range, size, tx, first vs followup)
 - Open gagal retry / terminal

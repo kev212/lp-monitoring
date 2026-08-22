@@ -30,6 +30,7 @@ const EXPIRED_ABSENCE_MIN_INTERVAL_MS = 5_000
 const MAX_VERIFICATION_MISSING_CHECKS = 5
 const VERIFICATION_MISS_MIN_INTERVAL_MS = 30_000
 const WALLET_OPEN_DEADLINE_MS = 60_000
+const INITIALIZE_BIN_ARRAY_DISCRIMINATOR = Buffer.from('235613b94ed44bd3', 'hex')
 
 export type OpenLiquidityStrategy = 'spot' | 'curve' | 'bidask'
 export type OpenQuoteSide = 'X' | 'Y'
@@ -136,6 +137,34 @@ export interface RunnerOpenRecovery {
 export interface OpenExecutionContext {
   runnerCycleId?: string
   runnerMint?: string
+  requireExistingBinArrays?: boolean
+}
+
+export class BinArrayInitializationRequiredError extends Error {
+  constructor() {
+    super('Runner open requires InitializeBinArray')
+    this.name = 'BinArrayInitializationRequiredError'
+  }
+}
+
+export function transactionRequiresInitializeBinArray(transaction: {
+  instructions: readonly { programId: PublicKey; data: Uint8Array }[]
+}): boolean {
+  return transaction.instructions.some(instruction => {
+    const data = Buffer.from(instruction.data)
+    return instruction.programId.equals(DLMM_PROGRAM_ID)
+      && data.length >= INITIALIZE_BIN_ARRAY_DISCRIMINATOR.length
+      && data.subarray(0, INITIALIZE_BIN_ARRAY_DISCRIMINATOR.length).equals(INITIALIZE_BIN_ARRAY_DISCRIMINATOR)
+  })
+}
+
+function enforceExistingBinArrays(
+  transaction: { instructions: readonly { programId: PublicKey; data: Uint8Array }[] },
+  context?: OpenExecutionContext,
+): void {
+  if (context?.requireExistingBinArrays && transactionRequiresInitializeBinArray(transaction)) {
+    throw new BinArrayInitializationRequiredError()
+  }
 }
 
 class DefinitiveOpenError extends Error {}
@@ -312,6 +341,7 @@ async function prepareOpenPositionWithPool(
   amountInput: string,
   rangePercent: number,
   strategy: OpenLiquidityStrategy,
+  context?: OpenExecutionContext,
 ): Promise<{ preview: OpenPositionPreview; pool: DLMM }> {
   const { pool, poolInfo } = await loadOpenPool(connection, poolPubkey)
   const activeBinId = pool.lbPair.activeId
@@ -343,26 +373,10 @@ async function prepareOpenPositionWithPool(
   }
   const cost = await pool.quoteCreatePosition({ strategy: strategyParams })
   if (cost.positionCount !== 1) throw new Error(`Range requires ${cost.positionCount} positions; reduce the percentage range`)
-  if (cost.transactionCount !== 1) throw new Error(`Range requires ${cost.transactionCount} setup transactions; reduce the percentage range`)
-  const estimatedPositionCostSol = cost.positionCost + cost.positionReallocCost + cost.bitmapExtensionCost + cost.binArrayCost
+  let estimatedPositionCostSol = cost.positionCost + cost.positionReallocCost + cost.bitmapExtensionCost + cost.binArrayCost
   const maxPriceMoveBins = config.openMaxPriceMoveBins
   const addSlippagePercent = sdkSlippagePercentForBins(pool.lbPair.binStep, maxPriceMoveBins)
-  const nativeBalance = await withRpcFallback(rpc => rpc.getBalance(owner), connection)
-  const requiredFeeLamports = BigInt(Math.ceil((estimatedPositionCostSol + config.openSolFeeReserve) * LAMPORTS_PER_SOL))
-
-  if (poolInfo.quoteCurrency === 'SOL') {
-    if (BigInt(nativeBalance) < amountRaw + requiredFeeLamports) {
-      throw new Error(`Insufficient SOL; keep ${config.openSolFeeReserve} SOL plus estimated position rent for fees`)
-    }
-  } else {
-    const quoteBalance = await rawAssociatedTokenBalance(connection, owner, poolInfo.quoteMint)
-    if (quoteBalance < amountRaw) throw new Error('Insufficient USDC balance')
-    if (BigInt(nativeBalance) < requiredFeeLamports) {
-      throw new Error(`Insufficient SOL for rent and fees; keep at least ${config.openSolFeeReserve} SOL reserve`)
-    }
-  }
-
-  return { pool, preview: {
+  const preview: OpenPositionPreview = {
     ...poolInfo,
     amountInput: formatRawAmount(amountRaw, poolInfo.quoteDecimals),
     amountQuote: Number(amountRaw) / 10 ** poolInfo.quoteDecimals,
@@ -379,7 +393,29 @@ async function prepareOpenPositionWithPool(
     maxPriceMoveBins,
     addSlippagePercent,
     observedAt: Date.now(),
-  } }
+  }
+  if (context?.requireExistingBinArrays) {
+    const transaction = await buildOpenTransaction(pool, owner, Keypair.generate().publicKey, preview)
+    enforceExistingBinArrays(transaction, context)
+    estimatedPositionCostSol -= cost.binArrayCost
+    preview.estimatedPositionCostSol = estimatedPositionCostSol
+  }
+  if (cost.transactionCount !== 1) throw new Error(`Range requires ${cost.transactionCount} setup transactions; reduce the percentage range`)
+
+  const nativeBalance = await withRpcFallback(rpc => rpc.getBalance(owner), connection)
+  const requiredFeeLamports = BigInt(Math.ceil((estimatedPositionCostSol + config.openSolFeeReserve) * LAMPORTS_PER_SOL))
+  if (poolInfo.quoteCurrency === 'SOL') {
+    if (BigInt(nativeBalance) < amountRaw + requiredFeeLamports) {
+      throw new Error(`Insufficient SOL; keep ${config.openSolFeeReserve} SOL plus estimated position rent for fees`)
+    }
+  } else {
+    const quoteBalance = await rawAssociatedTokenBalance(connection, owner, poolInfo.quoteMint)
+    if (quoteBalance < amountRaw) throw new Error('Insufficient USDC balance')
+    if (BigInt(nativeBalance) < requiredFeeLamports) {
+      throw new Error(`Insufficient SOL for rent and fees; keep at least ${config.openSolFeeReserve} SOL reserve`)
+    }
+  }
+  return { pool, preview }
 }
 
 export async function prepareOpenPosition(
@@ -389,8 +425,9 @@ export async function prepareOpenPosition(
   amountInput: string,
   rangePercent: number,
   strategy: OpenLiquidityStrategy,
+  context?: OpenExecutionContext,
 ): Promise<OpenPositionPreview> {
-  return (await prepareOpenPositionWithPool(connection, owner, poolPubkey, amountInput, rangePercent, strategy)).preview
+  return (await prepareOpenPositionWithPool(connection, owner, poolPubkey, amountInput, rangePercent, strategy, context)).preview
 }
 
 function persistOpenPosition(position: Keypair, preview: OpenPositionPreview, owner: string): void {
@@ -631,6 +668,7 @@ export async function executeOpenPosition(
       preview.amountInput,
       preview.rangePercent,
       preview.strategy,
+      context,
     )
     const maxPriceMoveBins = Math.min(preview.maxPriceMoveBins, refreshed.maxPriceMoveBins)
     const observedMoveBins = Math.abs(refreshed.activeBinId - preview.activeBinId)
@@ -747,6 +785,28 @@ export async function executeRebalanceOpen(
   return skipLock ? work() : withWalletExecutionLock(() => withOpenDeadline(work))
 }
 
+async function buildOpenTransaction(
+  pool: DLMM,
+  owner: PublicKey,
+  positionPubkey: PublicKey,
+  preview: OpenPositionPreview,
+) {
+  const amountRaw = new BN(preview.amountRaw)
+  return pool.initializePositionAndAddLiquidityByStrategy({
+    positionPubKey: positionPubkey,
+    user: owner,
+    totalXAmount: preview.quoteSide === 'X' ? amountRaw : new BN(0),
+    totalYAmount: preview.quoteSide === 'Y' ? amountRaw : new BN(0),
+    strategy: {
+      minBinId: preview.minBinId,
+      maxBinId: preview.maxBinId,
+      strategyType: strategyType(preview.strategy),
+      singleSidedX: preview.quoteSide === 'X',
+    },
+    slippage: preview.addSlippagePercent,
+  })
+}
+
 async function submitOpenPosition(
   connection: Connection,
   wallet: Keypair,
@@ -756,20 +816,8 @@ async function submitOpenPosition(
 ): Promise<OpenPositionResult> {
   const owner = wallet.publicKey.toBase58()
   const position = Keypair.generate()
-  const amountRaw = new BN(executedPreview.amountRaw)
-  const createTx = await pool.initializePositionAndAddLiquidityByStrategy({
-    positionPubKey: position.publicKey,
-    user: wallet.publicKey,
-    totalXAmount: executedPreview.quoteSide === 'X' ? amountRaw : new BN(0),
-    totalYAmount: executedPreview.quoteSide === 'Y' ? amountRaw : new BN(0),
-    strategy: {
-      minBinId: executedPreview.minBinId,
-      maxBinId: executedPreview.maxBinId,
-      strategyType: strategyType(executedPreview.strategy),
-      singleSidedX: executedPreview.quoteSide === 'X',
-    },
-    slippage: executedPreview.addSlippagePercent,
-  })
+  const createTx = await buildOpenTransaction(pool, wallet.publicKey, position.publicKey, executedPreview)
+  enforceExistingBinArrays(createTx, context)
 
   const latest = await withRpcFallback(rpc => rpc.getLatestBlockhash('confirmed'), connection)
   createTx.feePayer = wallet.publicKey
