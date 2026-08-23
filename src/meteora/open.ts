@@ -31,6 +31,7 @@ const MAX_VERIFICATION_MISSING_CHECKS = 5
 const VERIFICATION_MISS_MIN_INTERVAL_MS = 30_000
 const WALLET_OPEN_DEADLINE_MS = 60_000
 const INITIALIZE_BIN_ARRAY_DISCRIMINATOR = Buffer.from('235613b94ed44bd3', 'hex')
+const MAX_BIN_SLIPPAGE_REBUILDS = 2
 
 export type OpenLiquidityStrategy = 'spot' | 'curve' | 'bidask'
 export type OpenQuoteSide = 'X' | 'Y'
@@ -113,6 +114,12 @@ export interface OpenReconcileSummary {
   finalized: number
   failed: number
   pending: number
+  failures: Array<{
+    positionPubkey: string
+    signature: string
+    message: string
+    runner: boolean
+  }>
 }
 
 export class OpenSubmissionPendingError extends Error {
@@ -134,16 +141,103 @@ export interface RunnerOpenRecovery {
   pending: boolean
 }
 
+export interface RunnerOpenFailure {
+  positionPubkey: string
+  signature: string
+  message: string
+}
+
 export interface OpenExecutionContext {
   runnerCycleId?: string
   runnerMint?: string
   requireExistingBinArrays?: boolean
 }
 
+export interface OpenPositionRequest {
+  poolPubkey: string
+  amountInput: string
+  rangePercent: number
+  strategy: OpenLiquidityStrategy
+  activeBinId?: number
+  maxPriceMoveBins?: number
+}
+
+export interface OpenErrorDetails {
+  code: number | null
+  name: string
+  message: string
+}
+
+const KNOWN_OPEN_ERRORS: Record<number, { name: string; message: string }> = {
+  6004: {
+    name: 'ExceededBinSlippageTolerance',
+    message: 'Exceeded bin slippage tolerance',
+  },
+}
+
 export class BinArrayInitializationRequiredError extends Error {
   constructor() {
     super('Runner open requires InitializeBinArray')
     this.name = 'BinArrayInitializationRequiredError'
+  }
+}
+
+export class OpenSimulationError extends Error {
+  constructor(readonly details: OpenErrorDetails) {
+    super(`open transaction simulation failed: ${formatOpenErrorDetails(details)}`)
+    this.name = 'OpenSimulationError'
+  }
+}
+
+export class OpenTransactionFailedError extends Error {
+  constructor(
+    readonly signature: string,
+    readonly positionPubkey: string,
+    readonly details: OpenErrorDetails,
+  ) {
+    super(`open transaction failed on-chain: ${formatOpenErrorDetails(details)}`)
+    this.name = 'OpenTransactionFailedError'
+  }
+}
+
+export function describeOpenError(error: unknown, logs: readonly string[] = []): OpenErrorDetails {
+  const message = error instanceof Error ? error.message : ''
+  const serialized = safeSerialize(error)
+  const embeddedLogs = error && typeof error === 'object' && 'logs' in error && Array.isArray(error.logs)
+    ? error.logs.filter((item): item is string => typeof item === 'string')
+    : []
+  const text = [message, serialized, ...embeddedLogs, ...logs].filter(Boolean).join('\n')
+  const codeMatch = text.match(/(?:Custom["']?\s*:\s*|custom program error:\s*0x|Error Number:\s*)([0-9a-f]+)/i)
+  const code = codeMatch
+    ? (text.match(/custom program error:\s*0x/i) ? Number.parseInt(codeMatch[1], 16) : Number.parseInt(codeMatch[1], 10))
+    : null
+  const known = code === null ? undefined : KNOWN_OPEN_ERRORS[code]
+  const name = text.match(/Error Code:\s*([A-Za-z0-9_]+)/)?.[1] || known?.name || 'UnknownOpenError'
+  const errorMessage = text.match(/Error Message:\s*(.+?)(?:\r?\n|$)/)?.[1]?.trim()
+    || known?.message
+    || message
+    || 'unknown open transaction error'
+  return { code, name, message: errorMessage }
+}
+
+export function isBinSlippageError(error: unknown): boolean {
+  if (error instanceof OpenSimulationError || error instanceof OpenTransactionFailedError) {
+    return error.details.code === 6004 || error.details.name === 'ExceededBinSlippageTolerance'
+  }
+  const details = describeOpenError(error)
+  return details.code === 6004 || details.name === 'ExceededBinSlippageTolerance'
+}
+
+function formatOpenErrorDetails(details: OpenErrorDetails): string {
+  const code = details.code === null ? '' : ` (${details.code})`
+  return `${details.name}${code}: ${details.message}`
+}
+
+function safeSerialize(value: unknown): string {
+  try {
+    return typeof value === 'string' ? value : JSON.stringify(value) || ''
+  } catch {
+    return ''
   }
 }
 
@@ -166,8 +260,6 @@ function enforceExistingBinArrays(
     throw new BinArrayInitializationRequiredError()
   }
 }
-
-class DefinitiveOpenError extends Error {}
 
 /**
  * Bounds how long an open may hold the process-wide wallet lock. If the deadline fires
@@ -532,6 +624,34 @@ export function getRunnerOpenRecovery(owner: string, cycleId: string, mint: stri
   return null
 }
 
+export function getRunnerOpenFailure(
+  owner: string,
+  cycleId: string,
+  mint: string,
+  positionPubkey: string,
+): RunnerOpenFailure | null {
+  const row = getDb().prepare('SELECT value FROM sync_state WHERE key = ?').get(`${OPEN_ATTEMPT_PREFIX}${positionPubkey}`) as { value: string } | undefined
+  if (!row) return null
+  try {
+    const state = JSON.parse(row.value) as Partial<OpenAttemptState>
+    if (
+      state.stage !== 'failed'
+      || state.owner !== owner
+      || state.runnerCycleId !== cycleId
+      || state.runnerMint !== mint
+      || state.positionPubkey !== positionPubkey
+      || !state.signature
+    ) return null
+    return {
+      positionPubkey,
+      signature: state.signature,
+      message: state.lastError || 'open transaction failed during reconciliation',
+    }
+  } catch {
+    return null
+  }
+}
+
 export function markRunnerOpenExitHandled(positionPubkey: string): void {
   const key = `${OPEN_ATTEMPT_PREFIX}${positionPubkey}`
   const row = getDb().prepare('SELECT value FROM sync_state WHERE key = ?').get(key) as { value: string } | undefined
@@ -647,7 +767,7 @@ function positionIsMonitoring(positionPubkey: string): boolean {
 export async function executeOpenPosition(
   connection: Connection,
   wallet: Keypair,
-  preview: OpenPositionPreview,
+  preview: OpenPositionRequest,
   skipLock = false,
   context?: OpenExecutionContext,
 ): Promise<OpenPositionResult> {
@@ -661,28 +781,39 @@ export async function executeOpenPosition(
       throw new OpenSubmissionPendingError(unresolved.positionPubkey, unresolved.signature, 'wait for final reconciliation before opening again')
     }
 
-    const { preview: refreshed, pool } = await prepareOpenPositionWithPool(
-      connection,
-      wallet.publicKey,
-      preview.poolPubkey,
-      preview.amountInput,
-      preview.rangePercent,
-      preview.strategy,
-      context,
-    )
-    const maxPriceMoveBins = Math.min(preview.maxPriceMoveBins, refreshed.maxPriceMoveBins)
-    const observedMoveBins = Math.abs(refreshed.activeBinId - preview.activeBinId)
-    if (observedMoveBins > maxPriceMoveBins) {
-      throw new Error('Pool price moved too far since preview; review the open position again')
-    }
-    const remainingMoveBins = remainingPriceMoveBins(maxPriceMoveBins, observedMoveBins)
-    const executedPreview: OpenPositionPreview = {
-      ...refreshed,
-      maxPriceMoveBins,
-      addSlippagePercent: sdkSlippagePercentForBins(pool.lbPair.binStep, remainingMoveBins),
-    }
+    let slippageRebuilds = 0
+    for (;;) {
+      const { preview: refreshed, pool } = await prepareOpenPositionWithPool(
+        connection,
+        wallet.publicKey,
+        preview.poolPubkey,
+        preview.amountInput,
+        preview.rangePercent,
+        preview.strategy,
+        context,
+      )
+      const maxPriceMoveBins = Math.min(preview.maxPriceMoveBins ?? refreshed.maxPriceMoveBins, refreshed.maxPriceMoveBins)
+      const observedMoveBins = preview.activeBinId === undefined
+        ? 0
+        : Math.abs(refreshed.activeBinId - preview.activeBinId)
+      if (observedMoveBins > maxPriceMoveBins) {
+        throw new Error('Pool price moved too far since preview; review the open position again')
+      }
+      const remainingMoveBins = remainingPriceMoveBins(maxPriceMoveBins, observedMoveBins)
+      const executedPreview: OpenPositionPreview = {
+        ...refreshed,
+        maxPriceMoveBins,
+        addSlippagePercent: sdkSlippagePercentForBins(pool.lbPair.binStep, remainingMoveBins),
+      }
 
-    return submitOpenPosition(connection, wallet, pool, executedPreview, context)
+      try {
+        return await submitOpenPosition(connection, wallet, pool, executedPreview, context)
+      } catch (err) {
+        if (!(err instanceof OpenSimulationError) || !isBinSlippageError(err) || slippageRebuilds >= MAX_BIN_SLIPPAGE_REBUILDS) throw err
+        slippageRebuilds++
+        console.log(`[open] bin slippage simulation failed; rebuilding with fresh pool bins (${slippageRebuilds}/${MAX_BIN_SLIPPAGE_REBUILDS})`)
+      }
+    }
   }
   return skipLock ? work() : withWalletExecutionLock(() => withOpenDeadline(work))
 }
@@ -817,10 +948,17 @@ async function submitOpenPosition(
   const owner = wallet.publicKey.toBase58()
   const position = Keypair.generate()
   const createTx = await buildOpenTransaction(pool, wallet.publicKey, position.publicKey, executedPreview)
+  createTx.feePayer = wallet.publicKey
   enforceExistingBinArrays(createTx, context)
 
-  const latest = await withRpcFallback(rpc => rpc.getLatestBlockhash('confirmed'), connection)
-  createTx.feePayer = wallet.publicKey
+  const simulation = await withRpcFallback(rpc => rpc.simulateTransaction(createTx), connection)
+  if (simulation.value.err) {
+    throw new OpenSimulationError(describeOpenError(simulation.value.err, simulation.value.logs || []))
+  }
+
+  const latest = createTx.recentBlockhash && Number.isSafeInteger(createTx.lastValidBlockHeight)
+    ? { blockhash: createTx.recentBlockhash, lastValidBlockHeight: createTx.lastValidBlockHeight as number }
+    : await withRpcFallback(rpc => rpc.getLatestBlockhash('confirmed'), connection)
   createTx.recentBlockhash = latest.blockhash
   createTx.sign(wallet, position)
   const expectedSignature = bs58.encode(createTx.signature!)
@@ -855,8 +993,9 @@ async function submitOpenPosition(
   let transactionFinalized = false
   try {
     const signature = await withRpcFallback(rpc => rpc.sendRawTransaction(signedTransaction, {
-      skipPreflight: false,
-      preflightCommitment: 'confirmed',
+      // The explicit simulation above is the preflight gate; avoid a second
+      // race-prone simulation between durable claim and submission.
+      skipPreflight: true,
       maxRetries: 3,
     }), connection)
     if (signature !== expectedSignature) throw new Error('RPC returned a signature that does not match the signed transaction')
@@ -869,9 +1008,10 @@ async function submitOpenPosition(
       30_000,
     )
     if (confirmation.value.err) {
-      const message = `open transaction failed on-chain: ${JSON.stringify(confirmation.value.err)}`
+      const details = describeOpenError(confirmation.value.err)
+      const message = `open transaction failed on-chain: ${formatOpenErrorDetails(details)}`
       finishOpenAttempt(pendingState, 'failed', message)
-      throw new DefinitiveOpenError(message)
+      throw new OpenTransactionFailedError(expectedSignature, pendingState.positionPubkey, details)
     }
     transactionFinalized = true
     if (!await verifyFinalizedPosition(connection, pendingState)) {
@@ -879,7 +1019,7 @@ async function submitOpenPosition(
     }
     finishOpenAttempt(pendingState, 'finalized', null)
   } catch (err) {
-    if (err instanceof DefinitiveOpenError) throw err
+    if (err instanceof OpenTransactionFailedError) throw err
     if (!findPendingOpen(owner) && positionIsMonitoring(pendingState.positionPubkey)) {
       console.log(`[open] position ${pendingState.positionPubkey.slice(0, 8)} was finalized by concurrent reconciliation`)
     } else {
@@ -897,7 +1037,7 @@ async function submitOpenPosition(
 }
 
 export async function reconcilePendingOpens(connection: Connection): Promise<OpenReconcileSummary> {
-  const summary: OpenReconcileSummary = { finalized: 0, failed: 0, pending: 0 }
+  const summary: OpenReconcileSummary = { finalized: 0, failed: 0, pending: 0, failures: [] }
   for (const row of listSyncValues(OPEN_PENDING_PREFIX)) {
     let pending: PendingOpenState | null = null
     try {
@@ -921,9 +1061,16 @@ export async function reconcilePendingOpens(connection: Connection): Promise<Ope
         connection,
       )
       if (status.value?.confirmationStatus === 'finalized' && status.value.err) {
-        const message = `open transaction failed on-chain: ${JSON.stringify(status.value.err)}`
+        const details = describeOpenError(status.value.err)
+        const message = `open transaction failed on-chain: ${formatOpenErrorDetails(details)}`
         finishOpenAttempt(pending, 'failed', message)
         summary.failed++
+        summary.failures.push({
+          positionPubkey: pending.positionPubkey,
+          signature: pending.signature,
+          message,
+          runner: pending.runnerCycleId !== null,
+        })
         console.log(`[open] reconciled failed position ${pending.positionPubkey.slice(0, 8)}`)
         continue
       }
@@ -950,6 +1097,12 @@ export async function reconcilePendingOpens(connection: Connection): Promise<Ope
         if (missingAfterExpiryChecks >= EXPIRED_ABSENCE_CHECKS) {
           finishOpenAttempt(pending, 'expired', 'signature absent after blockhash expiry')
           summary.failed++
+          summary.failures.push({
+            positionPubkey: pending.positionPubkey,
+            signature: pending.signature,
+            message: 'signature absent after blockhash expiry',
+            runner: pending.runnerCycleId !== null,
+          })
           console.log(`[open] reconciled expired position ${pending.positionPubkey.slice(0, 8)}`)
           continue
         }

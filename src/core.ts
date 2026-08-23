@@ -126,14 +126,22 @@ async function flushExitCompletionNotifications(): Promise<void> {
   }
 }
 
-function notifyOpenReconcileFailures(summary: { failed: number }): void {
+function notifyOpenReconcileFailures(summary: {
+  failed: number
+  failures?: Array<{ positionPubkey: string; signature: string; message: string; runner: boolean }>
+}): void {
   if (summary.failed <= 0) return
   console.log(`[open] reconciliation failed ${summary.failed} open attempt(s)`)
+  const details = (summary.failures || []).slice(0, 3).map(failure =>
+    `${failure.runner ? 'Runner' : 'Open'} <code>${failure.positionPubkey.slice(0, 8)}</code>: ` +
+    `<a href="https://solscan.io/tx/${failure.signature}">${failure.signature.slice(0, 6)}..${failure.signature.slice(-4)}</a> ` +
+    `<code>${failure.message}</code>`
+  ).join('\n')
   sendNotification(
     `⚠️ <b>Open Reconciliation Failed</b>\n\n` +
     `${summary.failed} open attempt(s) did not finalize on-chain.\n` +
-    `The opening position was removed from the active list.\n` +
-    `Review the wallet before opening again.`
+    (details ? `${details}\n` : '') +
+    `Runner-associated attempts will continue their configured retry flow; manual opens require review.`
   )
 }
 

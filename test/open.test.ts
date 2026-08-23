@@ -4,6 +4,10 @@ import {
   calculateSingleSideRange,
   binIdFromUiPrice,
   formatRawAmount,
+  describeOpenError,
+  isBinSlippageError,
+  OpenSimulationError,
+  OpenTransactionFailedError,
   OpenSubmissionPendingError,
   parseUiAmountToRaw,
   remainingPriceMoveBins,
@@ -133,4 +137,18 @@ test('detects only Meteora InitializeBinArray instructions', () => {
     { programId: SystemProgram.programId, data: initializeBinArray },
     { programId: meteoraProgram, data: Buffer.from('235613b94ed44bd4', 'hex') },
   ] }), false)
+})
+
+test('decodes Meteora bin slippage errors for simulation and finalized failures', () => {
+  const details = describeOpenError({ InstructionError: [6, { Custom: 6004 }] }, [
+    'Program log: Error Code: ExceededBinSlippageTolerance. Error Number: 6004. Error Message: Exceeded bin slippage tolerance.',
+  ])
+  assert.deepEqual(details, {
+    code: 6004,
+    name: 'ExceededBinSlippageTolerance',
+    message: 'Exceeded bin slippage tolerance.',
+  })
+  assert.equal(isBinSlippageError(new OpenSimulationError(details)), true)
+  assert.equal(isBinSlippageError(new OpenTransactionFailedError('signature', 'position', details)), true)
+  assert.equal(isBinSlippageError(new Error('RPC request failed')), false)
 })

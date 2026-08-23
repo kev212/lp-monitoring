@@ -260,13 +260,16 @@ Reuse error classes `open.ts`. Jangan spam notif.
 | Kasus | Aksi |
 |---|---|
 | `OpenSubmissionPendingError` | Tunggu `reconcilePendingOpens`. Jangan submit open kedua. Sukses reconcile → lanjut §8.2 sebagai first. Gagal reconcile → hitung sebagai gagal open. |
+| Final simulation `ExceededBinSlippageTolerance` (`6004`) | Jangan membuat durable pending atau sign/send. Refresh active bin dan rebuild maksimal 2 kali di dalam attempt yang sama; tidak ada fee transaction yang terpakai. |
 | Deterministik: range >1 tx / >1 position / bins > limit / insufficient SOL / quote mismatch | Terminal. Hapus intent, 1 notif, **tidak retry**, jangan auto-kecilkan range. Tunggu alert berikutnya. |
-| `DefinitiveOpenError` (TX gagal on-chain) | Posisi `opening` sudah dihapus oleh durable fail. Retry sebagai **first**, lihat baris bawah. |
+| `OpenTransactionFailedError` (TX gagal on-chain) | Posisi `opening` sudah dihapus oleh durable fail. Retry sebagai **first**, lihat baris bawah. |
 | Expired / signature absent / `Pool price moved too far since preview` / RPC transient | Retry sebagai **first**. |
 | Retry gagal open | Max `RUNNER_FIRST_OPEN_RETRY_MAX` (3). Masih gagal → skip, 1 notif, tunggu alert berikutnya. **Tidak** ada posisi yang bisa “nunggu masuk range”. |
 | Semua pool SOL butuh `InitializeBinArray` | Jangan sign atau submit. Coba pool SOL lain berdasarkan TVL; jika semua sama, tunggu/recheck sampai timeout 15 menit. Base `InitializePosition` dan bitmap extension tetap boleh. |
 
 Retry open mengulang gate §7 (mcap, ATH drop, total TVL DLMM) + pool SOL. Kalau gate gagal di tengah retry → skip alert, bukan paksa open.
+
+Jika pending open akhirnya finalized dengan error, reconciliation mempertahankan signature dan error code, menghapus posisi `opening`, lalu runner menganggapnya sebagai satu retry yang gagal dan melanjutkan sisa retry. Tidak lagi berhenti sebagai `position disappeared` tanpa konteks.
 
 Policy bin-array hanya berlaku untuk runner. `prepareOpenPosition` memindai transaction unsigned dari SDK dan `executeOpenPosition` memindai ulang transaction aktual tepat sebelum signing. Manual open dan Auto Rebalance tidak memakai policy ini.
 

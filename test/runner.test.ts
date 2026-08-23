@@ -27,7 +27,7 @@ import {
   sumDlmmTvl,
 } from '../src/runner/gates.js'
 import { parseGmgnTokenInfo } from '../src/runner/gmgn.js'
-import { getRunnerOpenRecovery, markRunnerOpenExitHandled } from '../src/meteora/open.js'
+import { getRunnerOpenFailure, getRunnerOpenRecovery, markRunnerOpenExitHandled } from '../src/meteora/open.js'
 
 const payload = {
   chainId: 'sol',
@@ -252,6 +252,39 @@ test('ignores the intentionally closed open when a runner cycle reopens', () => 
   } finally {
     db.prepare('DELETE FROM sync_state WHERE key = ?').run(openKey)
     db.prepare('DELETE FROM positions WHERE position_pubkey = ?').run(positionPubkey)
+  }
+})
+
+test('recovers a reconciled runner open failure with its signature and error', () => {
+  const db = getDb()
+  const owner = `failure-test-${randomUUID()}`
+  const cycleId = randomUUID()
+  const positionPubkey = `position-${randomUUID()}`
+  const openKey = `open_attempt:${positionPubkey}`
+  const signature = `signature-${randomUUID()}`
+  db.prepare('INSERT INTO sync_state (key, value, updated_at) VALUES (?, ?, ?)').run(
+    openKey,
+    JSON.stringify({
+      version: 1,
+      positionPubkey,
+      poolPubkey: 'pool-test',
+      owner,
+      runnerCycleId: cycleId,
+      runnerMint: 'runner-mint',
+      signature,
+      stage: 'failed',
+      lastError: 'open transaction failed on-chain: ExceededBinSlippageTolerance (6004): Exceeded bin slippage tolerance',
+    }),
+    Date.now(),
+  )
+  try {
+    assert.deepEqual(getRunnerOpenFailure(owner, cycleId, 'runner-mint', positionPubkey), {
+      positionPubkey,
+      signature,
+      message: 'open transaction failed on-chain: ExceededBinSlippageTolerance (6004): Exceeded bin slippage tolerance',
+    })
+  } finally {
+    db.prepare('DELETE FROM sync_state WHERE key = ?').run(openKey)
   }
 })
 

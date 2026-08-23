@@ -4,7 +4,7 @@ import { getWalletOperation } from '../executionLock.js'
 import { isBotRunning } from '../lifecycle.js'
 import { loadKnownPositions } from '../meteora/discovery.js'
 import { executeExit } from '../meteora/exit.js'
-import { BinArrayInitializationRequiredError, executeOpenPosition, getRunnerOpenRecovery, markRunnerOpenExitHandled, OpenSubmissionPendingError, pendingOpenExists, prepareOpenPosition, type OpenPositionPreview } from '../meteora/open.js'
+import { BinArrayInitializationRequiredError, executeOpenPosition, getRunnerOpenFailure, getRunnerOpenRecovery, markRunnerOpenExitHandled, OpenSubmissionPendingError, OpenTransactionFailedError, pendingOpenExists, prepareOpenPosition, type OpenPositionPreview } from '../meteora/open.js'
 import { getFreshPool } from '../meteora/positions.js'
 import { sendNotification } from '../telegram.js'
 import type { QuoteCurrency, TriggerType } from '../types.js'
@@ -347,6 +347,10 @@ async function openForCycle(connection: Connection, wallet: Keypair, cycle: Runn
     finishCycle(cycle, 'legacy runner cycle has no durable open identity; review wallet before reopening')
     return
   }
+  if (cycle.firstOpenRetryCount >= config.runnerFirstOpenRetryMax) {
+    finishCycle(cycle, cycle.lastError || 'open retry limit reached')
+    return
+  }
   if (getWalletOperation(owner) || pendingOpenExists(owner)) return
   const live = await liveOpenGate(connection, cycle)
   if (!live.gate.ok) {
@@ -427,7 +431,14 @@ async function openForCycle(connection: Connection, wallet: Keypair, cycle: Runn
       cycle.stage = kind === 'followup' ? 'open_followup' : 'open_first'
       cycle.lastError = err.message
       saveRunnerCycle(cycle)
-      sendNotification(`⏳ <b>Runner Open Pending</b>\n\n<b>${cycle.symbol}</b>\nPosition: <code>${err.positionPubkey}</code>`)
+      sendNotification(
+        `⏳ <b>Runner Open Pending</b>\n\n` +
+        `<b>${cycle.symbol}</b>\n` +
+        `Type: <code>${err.name}</code>\n` +
+        `Position: <code>${err.positionPubkey}</code>\n` +
+        `Open tx: <a href="https://solscan.io/tx/${err.signature}">${err.signature.slice(0, 6)}..${err.signature.slice(-4)}</a>\n` +
+        `Reason: <code>${err.message}</code>`,
+      )
       return
     }
     const classified = classifyOpenFailure(err, cycle.firstOpenRetryCount, config.runnerFirstOpenRetryMax)
@@ -439,7 +450,7 @@ async function openForCycle(connection: Connection, wallet: Keypair, cycle: Runn
     }
     cycle.firstOpenRetryCount += 1
     saveRunnerCycle(cycle)
-    sendNotification(`⚠️ <b>Runner Open Retry ${cycle.firstOpenRetryCount}/${config.runnerFirstOpenRetryMax}</b>\n\n<b>${cycle.symbol}</b>\nReason: <code>${message}</code>`)
+    notifyRunnerOpenRetry(cycle, message, cycle.firstOpenRetryCount, err instanceof OpenTransactionFailedError ? err.signature : null, err instanceof Error ? err.name : 'UnknownError')
   }
 }
 
@@ -486,16 +497,12 @@ async function executeRunnerOpen(
   let missingBinArrays = 0
   for (const pool of candidates) {
     try {
-      const preview = await prepareOpenPosition(
-        connection,
-        wallet.publicKey,
-        pool.poolPubkey,
-        formatSolAmount(config.runnerOpenAmountSol),
-        config.runnerRangePercent,
-        config.runnerStrategy,
-        { requireExistingBinArrays: true },
-      )
-      const result = await executeOpenPosition(connection, wallet, preview, false, {
+      const result = await executeOpenPosition(connection, wallet, {
+        poolPubkey: pool.poolPubkey,
+        amountInput: formatSolAmount(config.runnerOpenAmountSol),
+        rangePercent: config.runnerRangePercent,
+        strategy: config.runnerStrategy,
+      }, false, {
         runnerCycleId: cycle.cycleId,
         runnerMint: cycle.mint,
         requireExistingBinArrays: true,
@@ -519,6 +526,25 @@ function runnerOpenCandidates(
     candidates.sort((left, right) => Number(right.poolPubkey === preferredPoolPubkey) - Number(left.poolPubkey === preferredPoolPubkey))
   }
   return candidates
+}
+
+function notifyRunnerOpenRetry(
+  cycle: RunnerCycle,
+  message: string,
+  retryCount: number,
+  signature: string | null,
+  errorName: string,
+): void {
+  const tx = signature
+    ? `\nOpen tx: <a href="https://solscan.io/tx/${signature}">${signature.slice(0, 6)}..${signature.slice(-4)}</a>`
+    : '\nOpen tx: <code>not submitted (simulation/preflight)</code>'
+  sendNotification(
+    `⚠️ <b>Runner Open Retry ${retryCount}/${config.runnerFirstOpenRetryMax}</b>\n\n` +
+    `<b>${cycle.symbol}</b>\n` +
+    `Type: <code>${errorName}</code>\n` +
+    `Reason: <code>${message}</code>` +
+    tx,
+  )
 }
 
 async function liveOpenGate(connection: Connection, cycle: RunnerCycle): Promise<{
@@ -576,6 +602,15 @@ function bindCyclePosition(owner: string, cycle: RunnerCycle, kind: 'first' | 'f
       if (recovery.status === 'error') return 'error'
       return recovery.status === 'monitoring' ? 'ready' : 'wait'
     }
+    return 'open'
+  }
+  const failedOpen = getRunnerOpenFailure(owner, cycle.cycleId, cycle.mint, cycle.positionPubkey)
+  if (failedOpen) {
+    cycle.positionPubkey = null
+    cycle.firstOpenRetryCount += 1
+    cycle.lastError = failedOpen.message
+    saveRunnerCycle(cycle)
+    notifyRunnerOpenRetry(cycle, failedOpen.message, cycle.firstOpenRetryCount, failedOpen.signature, 'OpenTransactionFailedError')
     return 'open'
   }
   const position = loadKnownPositions().find(row => row.positionPubkey === cycle.positionPubkey)
