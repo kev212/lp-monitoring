@@ -177,6 +177,15 @@ export function selectSolOpenPools(pools: DiscoveredDlmmPool[]): DiscoveredDlmmP
     .sort((left, right) => right.tvlUsd - left.tvlUsd)
 }
 
+export function describeWalletBusyReason(
+  lease: { kind: string; operationId: string } | null,
+  pendingOpen: boolean,
+): string | null {
+  if (lease) return `wallet busy with ${lease.kind} operation ${lease.operationId}`
+  if (pendingOpen) return 'wallet busy with pending open'
+  return null
+}
+
 export function runnerBinArrayAction(kind: 'first' | 'chase' | 'followup'): 'wait' | 'hold' | 'finish' {
   if (kind === 'chase') return 'hold'
   return kind === 'followup' ? 'finish' : 'wait'

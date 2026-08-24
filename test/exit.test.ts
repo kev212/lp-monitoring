@@ -137,17 +137,14 @@ test('uses the highest finalized slot as the settlement floor', async () => {
   assert.equal(await finalizedSettlementSlot(connection, []), 0)
 })
 
-test('rejects settlement gating when an exit transaction failed on-chain', async () => {
+test('withholds settlement when an exit transaction failed on-chain', async () => {
   const connection = {
     getSignatureStatus: async () => ({
       value: { slot: 42, err: { InstructionError: [0, 'Custom'] }, confirmationStatus: 'finalized' },
     }),
   } as unknown as Connection
 
-  await assert.rejects(
-    finalizedSettlementSlot(connection, ['failed']),
-    /failed on-chain/,
-  )
+  assert.equal(await finalizedSettlementSlot(connection, ['failed']), null)
 })
 
 test('stops a manually closed exit only after its finality review timeout', () => {

@@ -569,8 +569,10 @@ async function getSolBalance(
 
 /**
  * Highest finalized slot across the exit's transactions, or null while any of
- * them has not reached finality. Settlement reads must be gated on this slot so
- * a lagging RPC cannot report pre-close balances.
+ * them has not reached successful finality. A finalized on-chain error is treated
+ * as unsettled so the closed-account review path can release the wallet lease.
+ * Settlement reads must be gated on this slot so a lagging RPC cannot report
+ * pre-close balances.
  */
 export async function finalizedSettlementSlot(connection: Connection, signatures: string[]): Promise<number | null> {
   let slot = 0
@@ -582,8 +584,7 @@ export async function finalizedSettlementSlot(connection: Connection, signatures
         ),
       EXIT_RPC_TIMEOUT_MS,
     )
-    if (status.value?.err) throw new Error(`exit transaction ${signature.slice(0, 8)} failed on-chain`)
-    if (status.value?.confirmationStatus !== 'finalized') return null
+    if (status.value?.err || status.value?.confirmationStatus !== 'finalized') return null
     slot = Math.max(slot, status.value.slot)
   }
   return slot

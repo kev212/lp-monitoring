@@ -417,6 +417,7 @@ Satu pesan per transisi bermakna. Jangan spam tiap tick 5s.
 - Skip (alasan: mcap / holders / fee / slot / ATH / TVL / no SOL pool)
 - Waiting pool
 - Waiting bin arrays (sekali per transisi; tidak spam tiap tick)
+- Waiting wallet lease (sekali per transisi; pool sudah ada tetapi open ditahan sampai exit/open lain selesai)
 - Timeout 15 menit
 - Open success (pool, range, size, tx, first vs followup)
 - Open gagal retry / terminal

@@ -6,6 +6,7 @@ import {
   canReopenAfterWin,
   classifyOpenFailure,
   decideRunnerClose,
+  describeWalletBusyReason,
   entryDriftFromPrices,
   combinePoolDiscovery,
   evaluateIngestGate,
@@ -109,6 +110,12 @@ test('maps missing bin arrays to wait, hold, and finish runner actions', () => {
   assert.equal(runnerBinArrayAction('first'), 'wait')
   assert.equal(runnerBinArrayAction('chase'), 'hold')
   assert.equal(runnerBinArrayAction('followup'), 'finish')
+})
+
+test('describes a blocking wallet lease without submitting a runner open', () => {
+  assert.equal(describeWalletBusyReason({ kind: 'exit', operationId: '9GrSy6YW' }, false), 'wallet busy with exit operation 9GrSy6YW')
+  assert.equal(describeWalletBusyReason(null, true), 'wallet busy with pending open')
+  assert.equal(describeWalletBusyReason(null, false), null)
 })
 
 test('chases first-position entry drift up to 3 times and stops after in-range', () => {

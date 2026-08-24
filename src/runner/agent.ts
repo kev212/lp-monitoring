@@ -12,6 +12,7 @@ import {
   canReopenAfterWin,
   classifyOpenFailure,
   decideRunnerClose,
+  describeWalletBusyReason,
   evaluateIngestGate,
   evaluateOpenGate,
   gmgnUnavailableGate,
@@ -299,7 +300,7 @@ async function chaseFirst(
   }
   cycle.chaseCancelNotified = false
   const owner = wallet.publicKey.toBase58()
-  if (getWalletOperation(owner) || pendingOpenExists(owner)) return
+  if (notifyWalletBusy(cycle, owner)) return
   if (!isBotRunning()) return
   try {
     const prepared = await prepareRunnerOpen(connection, wallet, live.pools, cycle.poolPubkey)
@@ -351,7 +352,7 @@ async function openForCycle(connection: Connection, wallet: Keypair, cycle: Runn
     finishCycle(cycle, cycle.lastError || 'open retry limit reached')
     return
   }
-  if (getWalletOperation(owner) || pendingOpenExists(owner)) return
+  if (notifyWalletBusy(cycle, owner)) return
   const live = await liveOpenGate(connection, cycle)
   if (!live.gate.ok) {
     if (live.gate.retryable) {
@@ -515,6 +516,25 @@ async function executeRunnerOpen(
   }
   if (missingBinArrays === candidates.length) throw new BinArrayInitializationRequiredError()
   return null
+}
+
+function notifyWalletBusy(cycle: RunnerCycle, owner: string): boolean {
+  const reason = describeWalletBusyReason(getWalletOperation(owner), pendingOpenExists(owner))
+  if (!reason) return false
+  const shouldNotify = cycle.lastError !== reason
+  cycle.lastError = reason
+  saveRunnerCycle(cycle)
+  if (shouldNotify) {
+    const lease = getWalletOperation(owner)
+    sendNotification(
+      `⏳ <b>Runner Waiting - Wallet Busy</b>\n\n` +
+      `<b>${cycle.symbol}</b>\n` +
+      `Blocked by: <code>${lease?.kind || 'open'}</code>\n` +
+      `Position: <code>${lease?.operationId || 'pending open'}</code>\n` +
+      `Pool is ready; opening resumes after the wallet lease clears.`,
+    )
+  }
+  return true
 }
 
 function runnerOpenCandidates(
