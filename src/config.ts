@@ -1,5 +1,5 @@
 import dotenv from 'dotenv'
-import type { Config, OpenLiquidityStrategyName } from './types.js'
+import type { Config, OpenLiquidityStrategyName, RebalanceMode } from './types.js'
 
 dotenv.config()
 
@@ -55,6 +55,28 @@ const runnerAgentEnabled = envBool('RUNNER_AGENT_ENABLED', false)
 const runnerAlertSecret = envStr('RUNNER_ALERT_SECRET')
 if (runnerAgentEnabled && !runnerAlertSecret) {
   throw new Error('RUNNER_ALERT_SECRET is required when RUNNER_AGENT_ENABLED=true')
+}
+
+const raydiumRebalanceModeRaw = envStr('RAYDIUM_REBALANCE_MODE', 'both')
+if (!['up', 'down', 'both'].includes(raydiumRebalanceModeRaw)) {
+  throw new Error('RAYDIUM_REBALANCE_MODE must be up, down, or both')
+}
+const raydiumRebalanceMode = raydiumRebalanceModeRaw as RebalanceMode
+const raydiumSlippageBps = envNum('RAYDIUM_SLIPPAGE_BPS', 100)
+if (!Number.isInteger(raydiumSlippageBps) || raydiumSlippageBps < 1 || raydiumSlippageBps > 5000) {
+  throw new Error('RAYDIUM_SLIPPAGE_BPS must be an integer between 1 and 5000')
+}
+const raydiumPollMs = envNum('RAYDIUM_POLL_MS', 15_000)
+if (!Number.isInteger(raydiumPollMs) || raydiumPollMs < 5_000) {
+  throw new Error('RAYDIUM_POLL_MS must be an integer >= 5000')
+}
+const raydiumComputeUnitLimit = envNum('RAYDIUM_COMPUTE_UNIT_LIMIT', 600_000)
+if (!Number.isInteger(raydiumComputeUnitLimit) || raydiumComputeUnitLimit < 200_000) {
+  throw new Error('RAYDIUM_COMPUTE_UNIT_LIMIT must be an integer >= 200000')
+}
+const raydiumComputeUnitPrice = envNum('RAYDIUM_COMPUTE_UNIT_PRICE', 100_000)
+if (!Number.isInteger(raydiumComputeUnitPrice) || raydiumComputeUnitPrice < 0) {
+  throw new Error('RAYDIUM_COMPUTE_UNIT_PRICE must be an integer >= 0')
 }
 
 const runnerSafetyValues: Array<[string, number, (value: number) => boolean]> = [
@@ -114,6 +136,12 @@ export const config: Config = {
   flipModeInitialTriggerPct: envNum('FLIP_MODE_INITIAL_TRIGGER_PCT', 40),
   flipModeRepeatStepPct: envNum('FLIP_MODE_REPEAT_STEP_PCT', 10),
   rebalanceOorMinutes: envNum('REBALANCE_OOR_MINUTES', 5),
+  raydiumEnabled: envBool('RAYDIUM_ENABLED', false),
+  raydiumRebalanceMode,
+  raydiumSlippageBps,
+  raydiumPollMs,
+  raydiumComputeUnitLimit,
+  raydiumComputeUnitPrice,
   openMaxPriceMoveBins,
   openSolFeeReserve: envNum('OPEN_SOL_FEE_RESERVE', 0.02),
   runnerAgentEnabled,

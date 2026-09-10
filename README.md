@@ -299,3 +299,35 @@ Perubahan mode tidak dapat dilakukan ketika rebalance sedang berjalan atau posis
 sedang exit. Mode Down saat ini hanya dapat menggunakan posisi dengan quote side
 Y (token side X); posisi dengan quote side X belum mendukung deposit token untuk
 reopen Down.
+
+### Raydium CLMM auto rebalance
+
+Bot juga memonitor posisi **Raydium CLMM** milik wallet yang sama (posisi dibuat
+manual di UI Raydium; bot tidak membuka posisi pertama). Saat posisi keluar dari
+range melewati window OOR global yang sama, bot menutup posisi (100% liquidity,
+klaim fee, burn NFT) lalu membuka posisi pengganti **1 tick wide** dengan celah
+**1 tick** dari harga saat itu:
+
+- **Up**: range tepat 1 tick di bawah current tick, seluruh dana di sisi MintB.
+- **Down**: range tepat 1 tick di atas current tick, seluruh dana di sisi MintA.
+
+Posisi hasil rebalance "diarm" untuk sisi berlawanan, sehingga rebalance
+berikutnya baru terjadi setelah harga benar-benar melewati range baru tersebut —
+mencegah churn tiap window. Arah mengikuti `RAYDIUM_REBALANCE_MODE`
+(`up`, `down`, `both`). Semua transaksi memakai wallet lease yang sama dengan
+operasi Meteora sehingga tidak pernah saling bentrok. Notifikasi Telegram dikirim
+untuk OOR, close, sukses reopen, dan kegagalan. Kill switch: `RAYDIUM_ENABLED`.
+
+Env:
+
+| Env | Default | Fungsi |
+|---|---|---|
+| `RAYDIUM_ENABLED` | `false` | Kill switch monitor + rebalance |
+| `RAYDIUM_REBALANCE_MODE` | `both` | Arah rebalance: `up`, `down`, `both` |
+| `RAYDIUM_SLIPPAGE_BPS` | `100` | Toleransi `amountMin` saat close |
+| `RAYDIUM_POLL_MS` | `15000` | Interval polling posisi/pool |
+| `RAYDIUM_COMPUTE_UNIT_LIMIT` | `600000` | Compute unit per transaksi |
+| `RAYDIUM_COMPUTE_UNIT_PRICE` | `100000` | Priority fee (microLamports/CU) |
+
+Window OOR memakai setting global `Waktu Rebalance` (default
+`REBALANCE_OOR_MINUTES=5`).

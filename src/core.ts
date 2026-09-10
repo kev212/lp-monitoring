@@ -65,6 +65,7 @@ import {
   formatBotStop,
 } from './telegram.js'
  import { notifyRunnerExit, tickRunnerAgent } from './runner/agent.js'
+import { tickRaydiumAgent } from './raydium/agent.js'
 import { findCycleByPosition } from './runner/cycle.js'
 import { startRunnerAlertServer, stopRunnerAlertServer } from './runner/alertServer.js'
 import { bumpLifecycleGeneration, getLifecycleGeneration, isBotRunning, setBotRunning } from './lifecycle.js'
@@ -155,6 +156,8 @@ async function runRunnerMaintenance(connection: Connection, wallet: Keypair): Pr
       notifyOpenReconcileFailures(await reconcilePendingOpens(connection))
       if (generation !== getLifecycleGeneration()) return
       await tickRunnerAgent(connection, wallet)
+      if (generation !== getLifecycleGeneration()) return
+      await tickRaydiumAgent(connection, wallet)
     } catch (err) {
       console.log(`[runner] maintenance failed: ${err instanceof Error ? err.message : 'unknown'}`)
     } finally {

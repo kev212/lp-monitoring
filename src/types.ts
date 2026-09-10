@@ -164,6 +164,12 @@ export interface Config {
   flipModeInitialTriggerPct: number
   flipModeRepeatStepPct: number
   rebalanceOorMinutes: number
+  raydiumEnabled: boolean
+  raydiumRebalanceMode: RebalanceMode
+  raydiumSlippageBps: number
+  raydiumPollMs: number
+  raydiumComputeUnitLimit: number
+  raydiumComputeUnitPrice: number
   openMaxPriceMoveBins: number
   openSolFeeReserve: number
   runnerAgentEnabled: boolean

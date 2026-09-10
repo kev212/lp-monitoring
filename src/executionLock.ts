@@ -7,7 +7,7 @@ import { withRpcFallback, withSignatureStatusFallback } from './solana/connectio
 
 let walletMutationTail: Promise<void> = Promise.resolve()
 
-export type WalletOperationKind = 'open' | 'exit' | 'reshape'
+export type WalletOperationKind = 'open' | 'exit' | 'reshape' | 'raydium'
 
 export function isAmbiguousDurableSendError(error: unknown): boolean {
   if (!(error instanceof SendTransactionError)) return false
@@ -76,7 +76,7 @@ export function getWalletOperation(owner: string): WalletOperationLease | null {
   const row = getDb().prepare('SELECT value FROM sync_state WHERE key = ?').get(walletOperationKey(owner)) as { value: string } | undefined
   if (!row) return null
   const lease = JSON.parse(row.value) as Partial<WalletOperationLease>
-  if (!['open', 'exit', 'reshape'].includes(lease.kind || '') || !lease.operationId) {
+  if (!['open', 'exit', 'reshape', 'raydium'].includes(lease.kind || '') || !lease.operationId) {
     throw new Error('durable wallet operation lease is malformed')
   }
   return lease as WalletOperationLease
