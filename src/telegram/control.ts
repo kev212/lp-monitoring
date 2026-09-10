@@ -18,7 +18,6 @@ import {
   type OpenPositionPreview,
 } from '../meteora/open.js'
 import { getPool } from '../meteora/positions.js'
-import { getRebalanceOorMinutes } from '../meteora/rebalanceSettings.js'
 import { formatRaydiumDashboardLines, refreshRaydiumDashboardSnapshot } from '../raydium/dashboard.js'
 import {
   getRebalanceSettings,
@@ -544,7 +543,7 @@ class TelegramDashboardController {
       return formatRaydiumDashboardLines(snapshot, {
         enabled: config.raydiumEnabled,
         mode: config.raydiumRebalanceMode,
-        windowMinutes: getRebalanceOorMinutes(),
+        windowMinutes: config.raydiumRebalanceWindowMinutes,
         gapPercent: config.raydiumRebalanceGapPct,
       })
     } catch (err) {

@@ -327,10 +327,14 @@ Env:
 | `RAYDIUM_ENABLED` | `false` | Kill switch monitor + rebalance |
 | `RAYDIUM_REBALANCE_MODE` | `both` | Arah rebalance: `up`, `down`, `both` |
 | `RAYDIUM_REBALANCE_GAP_PCT` | `0.5` | Jarak harga dari current price sebelum range baru |
+| `RAYDIUM_REBALANCE_WINDOW_MINUTES` | `5` | Window OOR khusus Raydium (terpisah dari global Telegram) |
 | `RAYDIUM_SLIPPAGE_BPS` | `100` | Toleransi `amountMin` saat close |
 | `RAYDIUM_POLL_MS` | `15000` | Interval polling posisi/pool |
 | `RAYDIUM_COMPUTE_UNIT_LIMIT` | `600000` | Compute unit per transaksi |
 | `RAYDIUM_COMPUTE_UNIT_PRICE` | `100000` | Priority fee (microLamports/CU) |
 
-Window OOR memakai setting global `Waktu Rebalance` (default
-`REBALANCE_OOR_MINUTES=5`).
+Window OOR Raydium memakai `RAYDIUM_REBALANCE_WINDOW_MINUTES` (default **5
+menit**), terpisah dari setting global Telegram yang dipakai Meteora. Jika close
+berhasil tetapi saldo hasil belum terlihat, bot menyimpan baseline saldo sebelum
+close dan mengukur ulang sampai 5 menit sebelum menyerah, sehingga tidak lagi
+membatalkan reopen karena pembacaan saldo yang telat.

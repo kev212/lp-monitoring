@@ -32,7 +32,14 @@ async function database(work: () => Promise<void>): Promise<void> {
 
 function services(overrides: Partial<RaydiumRebalanceServices> = {}): RaydiumRebalanceServices {
   return {
-    closePosition: async () => ({ signature: 'close-sig', baseSide: 'MintA', baseAmountRaw: 123n }),
+    readFundingBaseline: async () => ({
+      baseSide: 'MintA',
+      fundingMint: 'mint-a',
+      fundingMintProgramId: 'token-program',
+      fundingAmountRaw: 0n,
+    }),
+    submitClose: async () => ({ signature: 'close-sig', baseAmountRaw: 555n }),
+    measureFunding: async () => 555n,
     prepareOpen: async () => ({ nftMint: 'new-nft', submit: async () => 'open-sig' }),
     positionExists: async () => true,
     notify: () => undefined,
@@ -54,9 +61,13 @@ function seedIntent(intent: Partial<RaydiumRebalanceIntent> & Pick<RaydiumRebala
     tickLower: 840,
     tickUpper: 900,
     baseSide: 'MintB',
+    preFundingBalanceRaw: null,
+    fundingMint: null,
+    fundingMintProgramId: null,
     baseAmountRaw: null,
     newNftMint: null,
     closeSignature: null,
+    closeSubmittedAt: null,
     openSignature: null,
     attempts: 0,
     nextRetryAt: 0,
@@ -67,8 +78,9 @@ function seedIntent(intent: Partial<RaydiumRebalanceIntent> & Pick<RaydiumRebala
   }))
 }
 
-test('closes, reopens once, and arms the new position for the opposite side', async () => {
+test('records a baseline, closes, reopens once, and arms the new position', async () => {
   await database(async () => {
+    let baselineCalls = 0
     let closeCalls = 0
     let prepareCalls = 0
     let submitCalls = 0
@@ -82,9 +94,14 @@ test('closes, reopens once, and arms the new position for the opposite side', as
       direction: 'down',
       gapPercent: 0.5,
     }, services({
-      closePosition: async () => {
+      readFundingBaseline: async () => {
+        baselineCalls++
+        return { baseSide: 'MintA', fundingMint: 'usdc', fundingMintProgramId: 'token-program', fundingAmountRaw: 1000n }
+      },
+      submitClose: async params => {
         closeCalls++
-        return { signature: 'close-sig', baseSide: 'MintA', baseAmountRaw: 555n }
+        assert.equal(params.preFundingAmountRaw, 1000n)
+        return { signature: 'close-sig', baseAmountRaw: 555n }
       },
       prepareOpen: async params => {
         prepareCalls++
@@ -93,10 +110,10 @@ test('closes, reopens once, and arms the new position for the opposite side', as
         assert.deepEqual({ lower: params.tickLower, upper: params.tickUpper }, { lower: 1020, upper: 1080 })
         return { nftMint: 'new-nft', submit: async () => { submitCalls++; return 'open-sig' } }
       },
-      positionExists: async nftMint => nftMint === 'old-nft',
     }))
 
     assert.equal(started, true)
+    assert.equal(baselineCalls, 1)
     assert.equal(closeCalls, 1)
     assert.equal(prepareCalls, 1)
     assert.equal(submitCalls, 1)
@@ -110,11 +127,92 @@ test('closes, reopens once, and arms the new position for the opposite side', as
   })
 })
 
-test('verifies a submitted reopen by its persisted NFT instead of opening twice', async () => {
+test('keeps measuring when the close proceeds are not visible yet', async () => {
   await database(async () => {
-    seedIntent({ owner: 'owner-2', stage: 'open_submitted', newNftMint: 'persisted-nft', baseAmountRaw: '1000' })
+    let measureCalls = 0
+    const trigger = {
+      owner: 'owner-2',
+      nftMint: 'old-nft',
+      poolId: 'pool-1',
+      pairLabel: 'A/B',
+      currentTick: 1000,
+      tickSpacing: 60,
+      direction: 'up' as const,
+      gapPercent: 0.5,
+    }
+    const firstPass = services({
+      submitClose: async () => ({ signature: 'close-sig', baseAmountRaw: null }),
+    })
+    assert.equal(await startRaydiumRebalance(trigger, firstPass), true)
+    const pending = getRaydiumIntent('owner-2')
+    assert.equal(pending?.stage, 'close_submitted')
+    assert.equal(pending?.closeSignature, 'close-sig')
+    // Make the measurement retry due now instead of waiting the production backoff.
+    seedIntent({ ...(pending as RaydiumRebalanceIntent), owner: 'owner-2', nextRetryAt: 0 })
+
     let prepareCalls = 0
     await reconcilePendingRaydiumRebalances('owner-2', services({
+      measureFunding: async () => {
+        measureCalls++
+        return 777n
+      },
+      prepareOpen: async params => {
+        prepareCalls++
+        assert.equal(params.baseAmountRaw, 777n)
+        return { nftMint: 'new-nft', submit: async () => 'open-sig' }
+      },
+    }))
+    assert.equal(measureCalls, 1)
+    assert.equal(prepareCalls, 1)
+    assert.equal(getRaydiumIntent('owner-2'), null)
+    assert.equal(getRaydiumPositionState('new-nft')?.armedDirection, 'down')
+  })
+})
+
+test('reopens from a durable baseline when the position vanished before submit', async () => {
+  await database(async () => {
+    seedIntent({
+      owner: 'owner-3',
+      stage: 'close_requested',
+      preFundingBalanceRaw: '1000',
+      fundingMint: 'usdc',
+      fundingMintProgramId: 'token-program',
+    })
+    let closeCalls = 0
+    let prepareCalls = 0
+    await reconcilePendingRaydiumRebalances('owner-3', services({
+      positionExists: async () => false,
+      submitClose: async () => {
+        closeCalls++
+        return { signature: 'never', baseAmountRaw: null }
+      },
+      measureFunding: async () => 250n,
+      prepareOpen: async params => {
+        prepareCalls++
+        assert.equal(params.baseAmountRaw, 250n)
+        return { nftMint: 'recovered-nft', submit: async () => 'open-sig' }
+      },
+    }))
+    assert.equal(closeCalls, 0)
+    assert.equal(prepareCalls, 1)
+    assert.equal(getRaydiumIntent('owner-3'), null)
+    assert.equal(getRaydiumPositionState('recovered-nft')?.armedDirection, 'down')
+  })
+})
+
+test('verifies a submitted reopen by its persisted NFT instead of opening twice', async () => {
+  await database(async () => {
+    seedIntent({
+      owner: 'owner-4',
+      stage: 'open_submitted',
+      newNftMint: 'persisted-nft',
+      baseAmountRaw: '1000',
+      preFundingBalanceRaw: '1000',
+      fundingMint: 'usdc',
+      fundingMintProgramId: 'token-program',
+    })
+    let prepareCalls = 0
+    await reconcilePendingRaydiumRebalances('owner-4', services({
       prepareOpen: async () => {
         prepareCalls++
         return { nftMint: 'unused', submit: async () => 'unused' }
@@ -122,21 +220,21 @@ test('verifies a submitted reopen by its persisted NFT instead of opening twice'
       positionExists: async nftMint => nftMint === 'persisted-nft',
     }))
     assert.equal(prepareCalls, 0)
-    assert.equal(getRaydiumIntent('owner-2'), null)
+    assert.equal(getRaydiumIntent('owner-4'), null)
     assert.equal(getRaydiumPositionState('persisted-nft')?.armedDirection, 'down')
   })
 })
 
 test('rebuilds a reopen when the persisted NFT never landed', async () => {
   await database(async () => {
-    seedIntent({ owner: 'owner-3', stage: 'open_submitted', newNftMint: 'ghost-nft', baseAmountRaw: '1000' })
+    seedIntent({ owner: 'owner-5', stage: 'open_submitted', newNftMint: 'ghost-nft', baseAmountRaw: '1000' })
     let submitCalls = 0
-    await reconcilePendingRaydiumRebalances('owner-3', services({
+    await reconcilePendingRaydiumRebalances('owner-5', services({
       prepareOpen: async () => ({ nftMint: 'fresh-nft', submit: async () => { submitCalls++; return 'open-sig' } }),
       positionExists: async nftMint => nftMint === 'fresh-nft',
     }))
     assert.equal(submitCalls, 1)
-    assert.equal(getRaydiumIntent('owner-3'), null)
+    assert.equal(getRaydiumIntent('owner-5'), null)
     assert.equal(getRaydiumPositionState('fresh-nft')?.armedDirection, 'down')
   })
 })
@@ -146,7 +244,7 @@ test('aborts without reopening when the old position vanished before a receipt',
     const notifications: string[] = []
     let prepareCalls = 0
     const started = await startRaydiumRebalance({
-      owner: 'owner-4',
+      owner: 'owner-6',
       nftMint: 'old-nft',
       poolId: 'pool-1',
       pairLabel: 'A/B',
@@ -165,8 +263,8 @@ test('aborts without reopening when the old position vanished before a receipt',
 
     assert.equal(started, true)
     assert.equal(prepareCalls, 0)
-    assert.equal(getRaydiumIntent('owner-4'), null)
-    assert.equal(getWalletOperation('owner-4'), null)
+    assert.equal(getRaydiumIntent('owner-6'), null)
+    assert.equal(getWalletOperation('owner-6'), null)
     assert.ok(notifications.some(message => message.includes('Dibatalkan')))
   })
 })
@@ -175,13 +273,13 @@ test('keeps a durable intent and refuses a second start while retrying', async (
   await database(async () => {
     let closeCalls = 0
     const retrying = services({
-      closePosition: async () => {
+      submitClose: async () => {
         closeCalls++
         throw new Error('RPC timeout')
       },
     })
     const trigger = {
-      owner: 'owner-5',
+      owner: 'owner-7',
       nftMint: 'old-nft',
       poolId: 'pool-1',
       pairLabel: 'A/B',
@@ -191,15 +289,15 @@ test('keeps a durable intent and refuses a second start while retrying', async (
       gapPercent: 0.5,
     }
     assert.equal(await startRaydiumRebalance(trigger, retrying), true)
-    const intent = getRaydiumIntent('owner-5')
+    const intent = getRaydiumIntent('owner-7')
     assert.equal(intent?.stage, 'close_requested')
     assert.equal(intent?.attempts, 1)
     assert.ok((intent?.nextRetryAt ?? 0) > Date.now())
     assert.equal(closeCalls, 1)
 
     assert.equal(await startRaydiumRebalance(trigger, retrying), false)
-    await reconcilePendingRaydiumRebalances('owner-5', retrying)
+    await reconcilePendingRaydiumRebalances('owner-7', retrying)
     assert.equal(closeCalls, 1)
-    assert.equal(getRaydiumIntent('owner-5')?.attempts, 1)
+    assert.equal(getRaydiumIntent('owner-7')?.attempts, 1)
   })
 })

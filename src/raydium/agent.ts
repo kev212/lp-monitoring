@@ -2,7 +2,6 @@ import type { Connection, Keypair } from '@solana/web3.js'
 import { config } from '../config.js'
 import { getWalletOperation } from '../executionLock.js'
 import { isBotRunning } from '../lifecycle.js'
-import { getRebalanceOorMinutes } from '../meteora/rebalanceSettings.js'
 import { sendNotification } from '../telegram.js'
 import { loadRaydiumPool, rayDiumPairLabel } from './pool.js'
 import { listRaydiumWalletPositions } from './positions.js'
@@ -43,7 +42,7 @@ export async function tickRaydiumAgent(connection: Connection, wallet: Keypair):
   }
   if (positions.length === 0) return
 
-  const minutes = getRebalanceOorMinutes()
+  const minutes = config.raydiumRebalanceWindowMinutes
   const pools = new Map<string, Awaited<ReturnType<typeof loadRaydiumPool>>>()
   for (const position of positions) {
     if (getWalletOperation(owner) || getRaydiumIntent(owner)) return
