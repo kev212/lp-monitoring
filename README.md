@@ -303,13 +303,15 @@ reopen Down.
 ### Raydium CLMM auto rebalance
 
 Bot juga memonitor posisi **Raydium CLMM** milik wallet yang sama (posisi dibuat
-manual di UI Raydium; bot tidak membuka posisi pertama). Saat posisi keluar dari
-range melewati window OOR global yang sama, bot menutup posisi (100% liquidity,
-klaim fee, burn NFT) lalu membuka posisi pengganti **1 tick wide** dengan celah
-**1 tick** dari harga saat itu:
+manual di UI Raydium; bot tidak membuka posisi pertama). Semua posisi baru
+otomatis muncul di `/dashboard` (read-only: pair, status in-range/OOR, ticks,
+current tick) walau auto rebalance sedang OFF. Saat posisi keluar dari range
+melewati window OOR global yang sama, bot menutup posisi (100% liquidity, klaim
+fee, burn NFT) lalu membuka posisi pengganti **1 tick wide** dengan **gap ±0.5%
+dari current price** (dibulatkan ke step `tickSpacing` terdekat, minimal 1 step):
 
-- **Up**: range tepat 1 tick di bawah current tick, seluruh dana di sisi MintB.
-- **Down**: range tepat 1 tick di atas current tick, seluruh dana di sisi MintA.
+- **Up**: range tepat di bawah current price sejauh gap, seluruh dana di sisi MintB.
+- **Down**: range tepat di atas current price sejauh gap, seluruh dana di sisi MintA.
 
 Posisi hasil rebalance "diarm" untuk sisi berlawanan, sehingga rebalance
 berikutnya baru terjadi setelah harga benar-benar melewati range baru tersebut —
@@ -324,6 +326,7 @@ Env:
 |---|---|---|
 | `RAYDIUM_ENABLED` | `false` | Kill switch monitor + rebalance |
 | `RAYDIUM_REBALANCE_MODE` | `both` | Arah rebalance: `up`, `down`, `both` |
+| `RAYDIUM_REBALANCE_GAP_PCT` | `0.5` | Jarak harga dari current price sebelum range baru |
 | `RAYDIUM_SLIPPAGE_BPS` | `100` | Toleransi `amountMin` saat close |
 | `RAYDIUM_POLL_MS` | `15000` | Interval polling posisi/pool |
 | `RAYDIUM_COMPUTE_UNIT_LIMIT` | `600000` | Compute unit per transaksi |

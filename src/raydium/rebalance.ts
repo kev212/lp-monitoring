@@ -2,10 +2,18 @@ import { deleteSyncValue, listSyncValues, setSyncValue, getSyncValue } from '../
 import { getWalletOperation, releaseWalletOperation, tryAcquireWalletOperation, withWalletExecutionLock } from '../executionLock.js'
 import { sendNotification } from '../telegram.js'
 import type { RebalanceDirection } from '../types.js'
-import { armedDirectionAfterRebalance, baseSideForDirection, buildOneTickRange, type RaydiumBaseSide } from './policy.js'
+import { armedDirectionAfterRebalance, baseSideForDirection, buildRaydiumRebalanceRange, type RaydiumBaseSide } from './policy.js'
+import {
+  deleteRaydiumPositionState,
+  getRaydiumPositionState,
+  listRaydiumPositionStates,
+  saveRaydiumPositionState,
+  type RaydiumPositionState,
+} from './state.js'
+
+export { deleteRaydiumPositionState, getRaydiumPositionState, listRaydiumPositionStates, saveRaydiumPositionState, type RaydiumPositionState }
 
 const INTENT_PREFIX = 'raydium_rebalance:'
-const STATE_PREFIX = 'raydium_position_state:'
 
 export type RaydiumIntentStage = 'close_requested' | 'open_prepared' | 'open_submitted' | 'done'
 
@@ -29,15 +37,6 @@ export interface RaydiumRebalanceIntent {
   nextRetryAt: number
   lastError: string | null
   createdAt: number
-  updatedAt: number
-}
-
-export interface RaydiumPositionState {
-  nftMint: string
-  since: number | null
-  direction: RebalanceDirection | null
-  armedDirection: RebalanceDirection | null
-  notified: boolean
   updatedAt: number
 }
 
@@ -66,6 +65,7 @@ export interface RaydiumRebalanceTrigger {
   currentTick: number
   tickSpacing: number
   direction: RebalanceDirection
+  gapPercent: number
 }
 
 export function raydiumRetryDelayMs(attempts: number): number {
@@ -74,10 +74,6 @@ export function raydiumRetryDelayMs(attempts: number): number {
 
 function intentKey(owner: string): string {
   return `${INTENT_PREFIX}${owner}`
-}
-
-function stateKey(nftMint: string): string {
-  return `${STATE_PREFIX}${nftMint}`
 }
 
 export function saveRaydiumIntent(intent: RaydiumRebalanceIntent): void {
@@ -141,36 +137,6 @@ export function listRaydiumIntents(): RaydiumRebalanceIntent[] {
   })
 }
 
-export function getRaydiumPositionState(nftMint: string): RaydiumPositionState | null {
-  const raw = getSyncValue(stateKey(nftMint))
-  if (!raw) return null
-  try {
-    const parsed = JSON.parse(raw) as Partial<RaydiumPositionState>
-    return {
-      nftMint,
-      since: Number.isSafeInteger(parsed.since) ? parsed.since as number : null,
-      direction: ['up', 'down'].includes(parsed.direction || '') ? parsed.direction as RebalanceDirection : null,
-      armedDirection: ['up', 'down'].includes(parsed.armedDirection || '') ? parsed.armedDirection as RebalanceDirection : null,
-      notified: parsed.notified === true,
-      updatedAt: Number.isSafeInteger(parsed.updatedAt) ? parsed.updatedAt as number : Date.now(),
-    }
-  } catch {
-    return null
-  }
-}
-
-export function saveRaydiumPositionState(state: Omit<RaydiumPositionState, 'updatedAt'>): void {
-  setSyncValue(stateKey(state.nftMint), JSON.stringify({ ...state, updatedAt: Date.now() }))
-}
-
-export function deleteRaydiumPositionState(nftMint: string): void {
-  deleteSyncValue(stateKey(nftMint))
-}
-
-export function listRaydiumPositionStates(): RaydiumPositionState[] {
-  return listSyncValues(STATE_PREFIX).flatMap(row => getRaydiumPositionState(row.key.slice(STATE_PREFIX.length)) || [])
-}
-
 /**
  * Claims the wallet for one close+reopen cycle: durable lease, durable intent,
  * then reconcile. The freshly reopened position is armed for the opposite side
@@ -182,7 +148,12 @@ export async function startRaydiumRebalance(
 ): Promise<boolean> {
   const owner = trigger.owner
   if (getRaydiumIntent(owner) || getWalletOperation(owner)) return false
-  const range = buildOneTickRange(trigger.currentTick, trigger.tickSpacing, trigger.direction)
+  const range = buildRaydiumRebalanceRange({
+    currentTick: trigger.currentTick,
+    tickSpacing: trigger.tickSpacing,
+    direction: trigger.direction,
+    gapPercent: trigger.gapPercent,
+  })
 
   const started = await withWalletExecutionLock(async () => {
     if (getRaydiumIntent(owner) || getWalletOperation(owner)) return false
@@ -220,7 +191,7 @@ export async function startRaydiumRebalance(
   services.notify(
     `🔄 <b>Raydium Rebalance ${trigger.direction.toUpperCase()}</b>\n\n` +
     `<b>${trigger.pairLabel}</b>\n` +
-    `Close + reopen <b>1 tick wide</b> ${trigger.direction === 'up' ? 'di bawah' : 'di atas'} current tick.\n` +
+    `Close + reopen <b>1 tick wide</b> ${trigger.direction === 'up' ? 'di bawah' : 'di atas'} current price, gap <b>${trigger.gapPercent}%</b>.\n` +
     `Target ticks: <b>${range.tickLower}-${range.tickUpper}</b>`
   )
   await reconcilePendingRaydiumRebalances(owner, services)

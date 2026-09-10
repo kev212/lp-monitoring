@@ -170,6 +170,7 @@ export interface Config {
   raydiumPollMs: number
   raydiumComputeUnitLimit: number
   raydiumComputeUnitPrice: number
+  raydiumRebalanceGapPct: number
   openMaxPriceMoveBins: number
   openSolFeeReserve: number
   runnerAgentEnabled: boolean

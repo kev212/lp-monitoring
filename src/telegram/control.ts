@@ -18,6 +18,8 @@ import {
   type OpenPositionPreview,
 } from '../meteora/open.js'
 import { getPool } from '../meteora/positions.js'
+import { getRebalanceOorMinutes } from '../meteora/rebalanceSettings.js'
+import { formatRaydiumDashboardLines, refreshRaydiumDashboardSnapshot } from '../raydium/dashboard.js'
 import {
   getRebalanceSettings,
   parseRebalanceMinutesInput,
@@ -511,6 +513,9 @@ class TelegramDashboardController {
     }
     if (pageCount > 1) lines.push('', `📄 Page ${page + 1}/${pageCount} · ${positions.length} positions`)
 
+    const raydiumLines = await this.buildRaydiumDashboardSection()
+    if (raydiumLines.length > 0) lines.push('', ...raydiumLines)
+
     const inline_keyboard: TelegramBot.InlineKeyboardButton[][] = [
       [
         { text: '🔄 Refresh', callback_data: `lpd:refresh:${page}` },
@@ -531,6 +536,21 @@ class TelegramDashboardController {
       inline_keyboard.push(nav)
     }
     return { text: lines.join('\n'), keyboard: { inline_keyboard }, positions, page }
+  }
+
+  private async buildRaydiumDashboardSection(): Promise<string[]> {
+    try {
+      const snapshot = await refreshRaydiumDashboardSnapshot(getConnection(), getWallet())
+      return formatRaydiumDashboardLines(snapshot, {
+        enabled: config.raydiumEnabled,
+        mode: config.raydiumRebalanceMode,
+        windowMinutes: getRebalanceOorMinutes(),
+        gapPercent: config.raydiumRebalanceGapPct,
+      })
+    } catch (err) {
+      console.log(`[telegram] raydium dashboard section failed: ${err instanceof Error ? err.message : 'unknown'}`)
+      return []
+    }
   }
 
   private async showDashboard(chatId: string, page: number, messageId?: number, forceNew = false): Promise<void> {

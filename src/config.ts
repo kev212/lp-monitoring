@@ -78,6 +78,10 @@ const raydiumComputeUnitPrice = envNum('RAYDIUM_COMPUTE_UNIT_PRICE', 100_000)
 if (!Number.isInteger(raydiumComputeUnitPrice) || raydiumComputeUnitPrice < 0) {
   throw new Error('RAYDIUM_COMPUTE_UNIT_PRICE must be an integer >= 0')
 }
+const raydiumRebalanceGapPct = envNum('RAYDIUM_REBALANCE_GAP_PCT', 0.5)
+if (!(raydiumRebalanceGapPct > 0) || raydiumRebalanceGapPct > 5) {
+  throw new Error('RAYDIUM_REBALANCE_GAP_PCT must be greater than 0 and at most 5')
+}
 
 const runnerSafetyValues: Array<[string, number, (value: number) => boolean]> = [
   ['RUNNER_MIN_MCAP_USD', envNum('RUNNER_MIN_MCAP_USD', 150_000), value => value > 0],
@@ -142,6 +146,7 @@ export const config: Config = {
   raydiumPollMs,
   raydiumComputeUnitLimit,
   raydiumComputeUnitPrice,
+  raydiumRebalanceGapPct,
   openMaxPriceMoveBins,
   openSolFeeReserve: envNum('OPEN_SOL_FEE_RESERVE', 0.02),
   runnerAgentEnabled,

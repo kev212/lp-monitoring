@@ -80,6 +80,7 @@ test('closes, reopens once, and arms the new position for the opposite side', as
       currentTick: 1000,
       tickSpacing: 60,
       direction: 'down',
+      gapPercent: 0.5,
     }, services({
       closePosition: async () => {
         closeCalls++
@@ -152,6 +153,7 @@ test('aborts without reopening when the old position vanished before a receipt',
       currentTick: 1000,
       tickSpacing: 60,
       direction: 'up',
+      gapPercent: 0.5,
     }, services({
       positionExists: async () => false,
       prepareOpen: async () => {
@@ -186,6 +188,7 @@ test('keeps a durable intent and refuses a second start while retrying', async (
       currentTick: 1000,
       tickSpacing: 60,
       direction: 'up' as const,
+      gapPercent: 0.5,
     }
     assert.equal(await startRaydiumRebalance(trigger, retrying), true)
     const intent = getRaydiumIntent('owner-5')

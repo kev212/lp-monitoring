@@ -3,11 +3,13 @@ import test from 'node:test'
 import {
   armedDirectionAfterRebalance,
   baseSideForDirection,
-  buildOneTickRange,
+  buildRaydiumRebalanceRange,
   nextRaydiumTimer,
+  pricePercentToTicks,
   raydiumDirectionEnabled,
   raydiumOorDirection,
   shouldTriggerRaydium,
+  snapTicksToSpacing,
 } from '../src/raydium/policy.js'
 import { raydiumRetryDelayMs } from '../src/raydium/rebalance.js'
 
@@ -21,13 +23,52 @@ test('treats a Raydium CLMM range as half-open on both edges', () => {
   assert.equal(raydiumOorDirection(105, 106, 105), null)
 })
 
-test('builds a one-tick-wide range one tick away from the current tick', () => {
-  assert.deepEqual(buildOneTickRange(1000, 60, 'up'), { tickLower: 840, tickUpper: 900 })
-  assert.deepEqual(buildOneTickRange(1000, 60, 'down'), { tickLower: 1020, tickUpper: 1080 })
-  assert.deepEqual(buildOneTickRange(1010, 60, 'up'), { tickLower: 840, tickUpper: 900 })
-  assert.deepEqual(buildOneTickRange(-43, 10, 'down'), { tickLower: -40, tickUpper: -30 })
-  assert.throws(() => buildOneTickRange(10, 0, 'up'), /tick spacing/i)
-  assert.throws(() => buildOneTickRange(10.5, 1, 'up'), /current tick/i)
+test('converts a price gap into pool ticks', () => {
+  assert.equal(pricePercentToTicks(0.5), 50)
+  assert.equal(pricePercentToTicks(1), 100)
+  assert.equal(pricePercentToTicks(0.1), 10)
+  assert.throws(() => pricePercentToTicks(0), /gap percent/i)
+  assert.throws(() => pricePercentToTicks(-1), /gap percent/i)
+  assert.throws(() => pricePercentToTicks(Number.NaN), /gap percent/i)
+})
+
+test('snaps the gap to whole tick-spacing steps with a one-step minimum', () => {
+  assert.equal(snapTicksToSpacing(50, 60), 60)
+  assert.equal(snapTicksToSpacing(50, 120), 120)
+  assert.equal(snapTicksToSpacing(50, 10), 50)
+  assert.equal(snapTicksToSpacing(50, 1), 50)
+  assert.equal(snapTicksToSpacing(130, 60), 120)
+  assert.throws(() => snapTicksToSpacing(50, 0), /tick spacing/i)
+})
+
+test('builds a one-tick-wide range a snapped gap away from the current tick', () => {
+  // tickSpacing 60: 0.5% (50 ticks) snaps to one step (60 ticks)
+  assert.deepEqual(
+    buildRaydiumRebalanceRange({ currentTick: 1000, tickSpacing: 60, direction: 'up', gapPercent: 0.5 }),
+    { tickLower: 840, tickUpper: 900 },
+  )
+  assert.deepEqual(
+    buildRaydiumRebalanceRange({ currentTick: 1000, tickSpacing: 60, direction: 'down', gapPercent: 0.5 }),
+    { tickLower: 1020, tickUpper: 1080 },
+  )
+  // tickSpacing 1: 0.5% resolves to exactly 50 ticks
+  assert.deepEqual(
+    buildRaydiumRebalanceRange({ currentTick: 1000, tickSpacing: 1, direction: 'up', gapPercent: 0.5 }),
+    { tickLower: 949, tickUpper: 950 },
+  )
+  assert.deepEqual(
+    buildRaydiumRebalanceRange({ currentTick: 1000, tickSpacing: 1, direction: 'down', gapPercent: 0.5 }),
+    { tickLower: 1050, tickUpper: 1051 },
+  )
+  // an unaligned current tick floors to the pool spacing first
+  assert.deepEqual(
+    buildRaydiumRebalanceRange({ currentTick: 1010, tickSpacing: 60, direction: 'up', gapPercent: 0.5 }),
+    { tickLower: 840, tickUpper: 900 },
+  )
+  assert.throws(
+    () => buildRaydiumRebalanceRange({ currentTick: 10.5, tickSpacing: 1, direction: 'up', gapPercent: 0.5 }),
+    /current tick/i,
+  )
 })
 
 test('maps direction to funding side and opposite armed side', () => {

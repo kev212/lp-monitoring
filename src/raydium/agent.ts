@@ -101,6 +101,7 @@ export async function tickRaydiumAgent(connection: Connection, wallet: Keypair):
       currentTick: loaded.state.currentTick,
       tickSpacing: loaded.state.tickSpacing,
       direction,
+      gapPercent: config.raydiumRebalanceGapPct,
     }, services)
     if (started) return
   }

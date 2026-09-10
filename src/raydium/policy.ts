@@ -30,23 +30,47 @@ export function raydiumDirectionEnabled(mode: RebalanceMode, direction: Rebalanc
 }
 
 /**
- * Builds the one-tick-wide replacement range.
- * Up: the range sits one tick below the current tick and holds 100% MintB.
- * Down: the range sits one tick above the current tick and holds 100% MintA.
+ * Converts a price distance in percent into pool ticks. Raydium CLMM prices
+ * follow price = 1.0001^tick, so the tick delta is independent of token
+ * decimals. 0.5% resolves to about 50 ticks.
  */
-export function buildOneTickRange(
-  currentTick: number,
-  tickSpacing: number,
-  direction: RebalanceDirection,
-): RaydiumTickRange {
-  if (!Number.isInteger(currentTick)) throw new Error('Raydium current tick is invalid')
+export function pricePercentToTicks(percent: number): number {
+  if (!Number.isFinite(percent) || percent <= 0) throw new Error('Raydium gap percent is invalid')
+  return Math.round(Math.log(1 + percent / 100) / Math.log(1.0001))
+}
+
+export function snapTicksToSpacing(ticks: number, tickSpacing: number): number {
   if (!Number.isInteger(tickSpacing) || tickSpacing < 1) throw new Error('Raydium tick spacing is invalid')
-  if (direction !== 'up' && direction !== 'down') throw new Error('Raydium rebalance direction is invalid')
-  const aligned = Math.floor(currentTick / tickSpacing) * tickSpacing
-  if (direction === 'up') {
-    return { tickUpper: aligned - tickSpacing, tickLower: aligned - 2 * tickSpacing }
+  const steps = Math.max(1, Math.round(ticks / tickSpacing))
+  return steps * tickSpacing
+}
+
+export interface RaydiumRangeInput {
+  currentTick: number
+  tickSpacing: number
+  direction: RebalanceDirection
+  gapPercent: number
+}
+
+/**
+ * Builds the one-tick-wide replacement range with a price gap from the current
+ * tick. The gap is snapped to whole tick-spacing steps with a one-step minimum,
+ * so the position always sits strictly outside the current price.
+ * Up: the range sits below the current tick and holds 100% MintB.
+ * Down: the range sits above the current tick and holds 100% MintA.
+ */
+export function buildRaydiumRebalanceRange(input: RaydiumRangeInput): RaydiumTickRange {
+  if (!Number.isInteger(input.currentTick)) throw new Error('Raydium current tick is invalid')
+  if (!Number.isInteger(input.tickSpacing) || input.tickSpacing < 1) throw new Error('Raydium tick spacing is invalid')
+  if (input.direction !== 'up' && input.direction !== 'down') throw new Error('Raydium rebalance direction is invalid')
+  const aligned = Math.floor(input.currentTick / input.tickSpacing) * input.tickSpacing
+  const gap = snapTicksToSpacing(pricePercentToTicks(input.gapPercent), input.tickSpacing)
+  if (input.direction === 'up') {
+    const tickUpper = aligned - gap
+    return { tickUpper, tickLower: tickUpper - input.tickSpacing }
   }
-  return { tickLower: aligned + tickSpacing, tickUpper: aligned + 2 * tickSpacing }
+  const tickLower = aligned + gap
+  return { tickLower, tickUpper: tickLower + input.tickSpacing }
 }
 
 export function baseSideForDirection(direction: RebalanceDirection): RaydiumBaseSide {
