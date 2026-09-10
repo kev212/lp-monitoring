@@ -7,6 +7,8 @@ export type TriggerType = 'TP' | 'SL' | 'TRAILING_STOP' | 'BIN_RANGE' | 'MANUAL'
 export type OpenLiquidityStrategyName = 'spot' | 'curve' | 'bidask'
 export type ExitStatus = 'pending_remove' | 'removed' | 'swap_pending' | 'completed' | 'failed'
 export type QuoteCurrency = 'SOL' | 'USDC'
+export type RebalanceDirection = 'up' | 'down'
+export type RebalanceMode = 'up' | 'down' | 'both'
 
 export type RiskSettingField = 'sl' | 'tp' | 'trail_arm' | 'trail_drop' | 'dd_tp' | 'rebal_tp' | 'rebal_sl'
 
@@ -39,6 +41,9 @@ export interface PositionRow {
   status: PositionStatus
   triggerConfirmations: number
   peakPnlPercent: number
+  trailingDisabled: boolean
+  binRangeDisabled: boolean
+  positionRiskRevision: number
   trailingActivated: boolean
   lastPnlPercent: number | null
   lastEstimatedExitQuote: number | null
@@ -69,7 +74,9 @@ export interface PositionRow {
   flipModePendingLastError: string | null
   drawdownTpOverrideActive: boolean
   autoRebalanceEnabled: boolean
+  rebalanceMode: RebalanceMode
   rebalanceOorSince: number | null
+  rebalanceOorDirection: RebalanceDirection | null
   rebalanceBusy: boolean
   rebalanceLastAt: number | null
   createdAt: number

@@ -1,6 +1,6 @@
 import { Connection, PublicKey } from '@solana/web3.js'
 import { getDb } from '../db/client.js'
-import type { PositionRow, BasisConfidence, QuoteCurrency, StrategyType, TokenSide } from '../types.js'
+import type { PositionRow, BasisConfidence, QuoteCurrency, RebalanceDirection, RebalanceMode, StrategyType, TokenSide } from '../types.js'
 
 const DLMM_PROGRAM_ID = new PublicKey('LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo')
 
@@ -18,6 +18,12 @@ export interface DiscoveredPosition {
 
 function rowToPosition(row: any): PositionRow {
   const quoteCurrency: QuoteCurrency = row.quote_currency === 'USDC' ? 'USDC' : 'SOL'
+  const rebalanceMode: RebalanceMode = row.rebalance_mode === 'down' || row.rebalance_mode === 'both'
+    ? row.rebalance_mode
+    : 'up'
+  const rebalanceOorDirection: RebalanceDirection | null = row.rebalance_oor_direction === 'up' || row.rebalance_oor_direction === 'down'
+    ? row.rebalance_oor_direction
+    : null
   return {
     positionPubkey: row.position_pubkey,
     poolPubkey: row.pool_pubkey,
@@ -34,6 +40,9 @@ function rowToPosition(row: any): PositionRow {
     status: row.status,
     triggerConfirmations: row.trigger_confirmations,
     peakPnlPercent: row.peak_pnl_percent ?? 0,
+    trailingDisabled: row.trailing_disabled === 1,
+    binRangeDisabled: row.bin_range_disabled === 1,
+    positionRiskRevision: row.position_risk_revision ?? 0,
     trailingActivated: row.trailing_activated === 1,
     lastPnlPercent: row.last_pnl_percent,
     lastEstimatedExitQuote: row.last_estimated_exit_quote ?? row.last_estimated_exit_sol,
@@ -66,7 +75,9 @@ function rowToPosition(row: any): PositionRow {
     flipModePendingLastError: row.flip_mode_pending_last_error ?? null,
     drawdownTpOverrideActive: row.drawdown_tp_override_active === 1,
     autoRebalanceEnabled: row.auto_rebalance_enabled === 1,
+    rebalanceMode,
     rebalanceOorSince: row.rebalance_oor_since ?? null,
+    rebalanceOorDirection,
     rebalanceBusy: row.rebalance_busy === 1,
     rebalanceLastAt: row.rebalance_last_at ?? null,
     createdAt: row.created_at,
@@ -108,19 +119,25 @@ export function upsertPosition(row: {
   lastSeenAt: number
   strategy: StrategyType
   flipModeEnabled?: boolean
+  trailingDisabled?: boolean
+  binRangeDisabled?: boolean
+  autoRebalanceEnabled?: boolean
+  rebalanceMode?: RebalanceMode
 }): void {
   const db = getDb()
   const now = Date.now()
   db.prepare(`
     INSERT INTO positions (position_pubkey, pool_pubkey, token_x_mint, token_y_mint, token_x_symbol, token_y_symbol, owner,
       basis_sol, quote_currency, basis_quote, basis_confidence, tp_percent, sl_percent, status, trigger_confirmations,
-      peak_pnl_percent, trailing_activated, strategy,
+      peak_pnl_percent, trailing_activated, trailing_disabled, bin_range_disabled, strategy,
       flip_mode_enabled,
+      auto_rebalance_enabled, rebalance_mode,
       last_pnl_percent, last_estimated_exit_sol, last_estimated_exit_quote, last_seen_at, created_at, updated_at)
     VALUES (@positionPubkey, @poolPubkey, @tokenXMint, @tokenYMint, @tokenXSymbol, @tokenYSymbol, @owner,
       @basisSolLegacy, @quoteCurrency, @basisQuote, @basisConfidence, @tpPercent, @slPercent, @status, @triggerConfirmations,
-      @peakPnlPercent, @trailingActivated, @strategy,
+      @peakPnlPercent, @trailingActivated, COALESCE(@trailingDisabled, 0), COALESCE(@binRangeDisabled, 0), @strategy,
       @flipModeEnabled,
+      COALESCE(@autoRebalanceEnabled, 0), COALESCE(@rebalanceMode, 'up'),
       @lastPnlPercent, @lastEstimatedExitSolLegacy, @lastEstimatedExitQuote, @lastSeenAt, @createdAt, @updatedAt)
     ON CONFLICT(position_pubkey) DO UPDATE SET
       status = @status,
@@ -131,9 +148,25 @@ export function upsertPosition(row: {
       token_x_symbol = @tokenXSymbol,
       token_y_symbol = @tokenYSymbol,
       trigger_confirmations = @triggerConfirmations,
-      peak_pnl_percent = COALESCE(@peakPnlPercent, peak_pnl_percent),
-      trailing_activated = COALESCE(@trailingActivated, trailing_activated),
+      trailing_disabled = COALESCE(@trailingDisabled, trailing_disabled),
+      bin_range_disabled = COALESCE(@binRangeDisabled, bin_range_disabled),
+      peak_pnl_percent = CASE WHEN COALESCE(@trailingDisabled, trailing_disabled) = 1 THEN 0 ELSE COALESCE(@peakPnlPercent, peak_pnl_percent) END,
+      trailing_activated = CASE WHEN COALESCE(@trailingDisabled, trailing_disabled) = 1 THEN 0 ELSE COALESCE(@trailingActivated, trailing_activated) END,
       strategy = @strategy,
+      auto_rebalance_enabled = COALESCE(@autoRebalanceEnabled, auto_rebalance_enabled),
+      rebalance_mode = COALESCE(@rebalanceMode, rebalance_mode),
+      rebalance_oor_since = CASE
+        WHEN COALESCE(@autoRebalanceEnabled, auto_rebalance_enabled) = 0
+          OR (@rebalanceMode IS NOT NULL AND @rebalanceMode != rebalance_mode)
+        THEN NULL
+        ELSE rebalance_oor_since
+      END,
+      rebalance_oor_direction = CASE
+        WHEN COALESCE(@autoRebalanceEnabled, auto_rebalance_enabled) = 0
+          OR (@rebalanceMode IS NOT NULL AND @rebalanceMode != rebalance_mode)
+        THEN NULL
+        ELSE rebalance_oor_direction
+      END,
       last_pnl_percent = @lastPnlPercent,
       last_estimated_exit_sol = @lastEstimatedExitSolLegacy,
       last_estimated_exit_quote = @lastEstimatedExitQuote,
@@ -142,7 +175,11 @@ export function upsertPosition(row: {
   `).run({
     ...row,
     trailingActivated: row.trailingActivated ? 1 : 0,
+    trailingDisabled: row.trailingDisabled === undefined ? null : row.trailingDisabled ? 1 : 0,
+    binRangeDisabled: row.binRangeDisabled === undefined ? null : row.binRangeDisabled ? 1 : 0,
     flipModeEnabled: row.flipModeEnabled ? 1 : 0,
+    autoRebalanceEnabled: row.autoRebalanceEnabled === undefined ? null : row.autoRebalanceEnabled ? 1 : 0,
+    rebalanceMode: row.rebalanceMode ?? null,
     createdAt: now,
     updatedAt: now,
   })
@@ -234,9 +271,11 @@ export function updatePrecisionCurveEnabled(pubkey: string, enabled: boolean, cu
          precision_curve_busy = 0,
          flip_mode_enabled = CASE WHEN ? = 1 THEN 0 ELSE flip_mode_enabled END,
          auto_rebalance_enabled = CASE WHEN ? = 1 THEN 0 ELSE auto_rebalance_enabled END,
+         rebalance_oor_since = CASE WHEN ? = 1 THEN NULL ELSE rebalance_oor_since END,
+         rebalance_oor_direction = CASE WHEN ? = 1 THEN NULL ELSE rebalance_oor_direction END,
          updated_at = ?
      WHERE position_pubkey = ?`
-  ).run(enabled ? 1 : 0, enabled ? 1 : 0, currentActiveBin, enabled ? 1 : 0, enabled ? 1 : 0, now, pubkey)
+  ).run(enabled ? 1 : 0, enabled ? 1 : 0, currentActiveBin, enabled ? 1 : 0, enabled ? 1 : 0, enabled ? 1 : 0, enabled ? 1 : 0, now, pubkey)
 }
 
 export function updatePrecisionCurveBusy(pubkey: string, busy: boolean): void {
@@ -284,16 +323,19 @@ export function updateFlipModeEnabled(pubkey: string, enabled: boolean): void {
          precision_curve_busy = CASE WHEN ? = 1 THEN 0 ELSE precision_curve_busy END,
          auto_rebalance_enabled = CASE WHEN ? = 1 THEN 0 ELSE auto_rebalance_enabled END,
          rebalance_oor_since = CASE WHEN ? = 1 THEN NULL ELSE rebalance_oor_since END,
+         rebalance_oor_direction = CASE WHEN ? = 1 THEN NULL ELSE rebalance_oor_direction END,
          updated_at = ?
      WHERE position_pubkey = ?`
-  ).run(enabled ? 1 : 0, enabled ? 1 : 0, enabled ? 1 : 0, enabled ? 1 : 0, enabled ? 1 : 0, Date.now(), pubkey)
+  ).run(enabled ? 1 : 0, enabled ? 1 : 0, enabled ? 1 : 0, enabled ? 1 : 0, enabled ? 1 : 0, enabled ? 1 : 0, Date.now(), pubkey)
 }
 
-export function updateAutoRebalanceEnabled(pubkey: string, enabled: boolean): void {
+export function updateAutoRebalanceEnabled(pubkey: string, enabled: boolean, mode?: RebalanceMode): void {
   getDb().prepare(
     `UPDATE positions
      SET auto_rebalance_enabled = ?,
-         rebalance_oor_since = CASE WHEN ? = 1 THEN NULL ELSE rebalance_oor_since END,
+         rebalance_mode = COALESCE(?, rebalance_mode),
+         rebalance_oor_since = NULL,
+         rebalance_oor_direction = NULL,
          rebalance_busy = 0,
          flip_mode_enabled = CASE WHEN ? = 1 THEN 0 ELSE flip_mode_enabled END,
          flip_mode_busy = CASE WHEN ? = 1 THEN 0 ELSE flip_mode_busy END,
@@ -301,12 +343,12 @@ export function updateAutoRebalanceEnabled(pubkey: string, enabled: boolean): vo
          precision_curve_busy = CASE WHEN ? = 1 THEN 0 ELSE precision_curve_busy END,
          updated_at = ?
      WHERE position_pubkey = ?`
-  ).run(enabled ? 1 : 0, enabled ? 1 : 0, enabled ? 1 : 0, enabled ? 1 : 0, enabled ? 1 : 0, enabled ? 1 : 0, Date.now(), pubkey)
+  ).run(enabled ? 1 : 0, mode ?? null, enabled ? 1 : 0, enabled ? 1 : 0, enabled ? 1 : 0, enabled ? 1 : 0, Date.now(), pubkey)
 }
 
-export function updateRebalanceOorSince(pubkey: string, since: number | null): void {
-  getDb().prepare('UPDATE positions SET rebalance_oor_since = ?, updated_at = ? WHERE position_pubkey = ?')
-    .run(since, Date.now(), pubkey)
+export function updateRebalanceOorSince(pubkey: string, since: number | null, direction: RebalanceDirection | null = null): void {
+  getDb().prepare('UPDATE positions SET rebalance_oor_since = ?, rebalance_oor_direction = ?, updated_at = ? WHERE position_pubkey = ?')
+    .run(since, since === null ? null : direction, Date.now(), pubkey)
 }
 
 export function updateRebalanceBusy(pubkey: string, busy: boolean): void {
@@ -320,6 +362,7 @@ export function updateRebalanceState(pubkey: string, lastAt: number): void {
      SET rebalance_last_at = ?,
          rebalance_busy = 0,
          rebalance_oor_since = NULL,
+         rebalance_oor_direction = NULL,
          updated_at = ?
      WHERE position_pubkey = ?`
   ).run(lastAt, Date.now(), pubkey)

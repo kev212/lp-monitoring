@@ -1,7 +1,7 @@
 import TelegramBot from 'node-telegram-bot-api'
 import { config } from './config.js'
 import { loadActivePositions, updateAutoRebalanceEnabled, updateFlipModeEnabled, updatePrecisionCurveEnabled, updatePrecisionCurveThreshold } from './meteora/discovery.js'
-import type { ExitCompletionNotification, GlobalRiskSettings, QuoteCurrency } from './types.js'
+import type { ExitCompletionNotification, GlobalRiskSettings, PositionRow, QuoteCurrency, RebalanceMode } from './types.js'
 import { setupTelegramControl } from './telegram/control.js'
 
 let _bot: TelegramBot | null = null
@@ -108,7 +108,11 @@ function setupCommandHandlers(bot: TelegramBot): void {
     const data = query.data || ''
     if (!data.startsWith('pc:') && !data.startsWith('flip:') && !data.startsWith('rebal:')) return
 
-    const [, action, pubkey] = data.split(':')
+    const parts = data.split(':')
+    const namespace = parts[0]
+    const action = parts[1]
+    const selectedMode = namespace === 'rebal' && action === 'mode' ? parts[2] : undefined
+    const pubkey = namespace === 'rebal' && action === 'mode' ? parts[3] : parts[2]
     const positions = loadActivePositions()
     const pos = positions.find(p => p.positionPubkey === pubkey)
     if (!pos) {
@@ -120,6 +124,11 @@ function setupCommandHandlers(bot: TelegramBot): void {
     }
 
     if (data.startsWith('pc:')) {
+      if (action !== 'status' && isModeModificationBlocked(pos)) {
+        await bot.answerCallbackQuery(query.id, { text: 'Position busy or exiting; settings are locked' }).catch(() => undefined)
+        sendPrecisionMenu(bot, chatId)
+        return
+      }
       if (action === 'on') {
         updatePrecisionCurveEnabled(pos.positionPubkey, true, null)
         updatePrecisionCurveThreshold(pos.positionPubkey, 5)
@@ -137,14 +146,36 @@ function setupCommandHandlers(bot: TelegramBot): void {
     }
 
     if (data.startsWith('rebal:')) {
+      if (action === 'mode') {
+        if (!isRebalanceMode(selectedMode)) {
+          await bot.answerCallbackQuery(query.id, { text: 'Invalid rebalance mode' }).catch(() => undefined)
+          sendAutoRebalanceMenu(bot, chatId)
+          return
+        }
+        if (isModeModificationBlocked(pos)) {
+          await bot.answerCallbackQuery(query.id, { text: 'Position busy or exiting; settings are locked' }).catch(() => undefined)
+          sendAutoRebalanceMenu(bot, chatId)
+          return
+        }
+        updateAutoRebalanceEnabled(pos.positionPubkey, pos.autoRebalanceEnabled, selectedMode)
+        await bot.answerCallbackQuery(query.id, { text: `Auto Rebalance mode set to ${rebalanceModeLabel(selectedMode)}` }).catch(() => undefined)
+        sendAutoRebalanceMenu(bot, chatId)
+        return
+      }
+      if (action !== 'status' && isModeModificationBlocked(pos)) {
+        await bot.answerCallbackQuery(query.id, { text: 'Position busy or exiting; settings are locked' }).catch(() => undefined)
+        sendAutoRebalanceMenu(bot, chatId)
+        return
+      }
       if (action === 'on') {
-        updateAutoRebalanceEnabled(pos.positionPubkey, true)
+        updateAutoRebalanceEnabled(pos.positionPubkey, true, pos.rebalanceMode)
         await bot.answerCallbackQuery(query.id, { text: 'Auto Rebalance enabled — Flip/Precision disabled' }).catch(() => undefined)
       } else if (action === 'off') {
-        updateAutoRebalanceEnabled(pos.positionPubkey, false)
+        updateAutoRebalanceEnabled(pos.positionPubkey, false, pos.rebalanceMode)
         await bot.answerCallbackQuery(query.id, { text: 'Auto Rebalance disabled' }).catch(() => undefined)
       } else if (action === 'status') {
-        await bot.answerCallbackQuery(query.id, { text: autoRebalanceStatusText(pos), show_alert: true }).catch(() => undefined)
+        await bot.answerCallbackQuery(query.id).catch(() => undefined)
+        await bot.sendMessage(chatId, autoRebalanceStatusText(pos)).catch(() => undefined)
         return
       }
 
@@ -152,6 +183,11 @@ function setupCommandHandlers(bot: TelegramBot): void {
       return
     }
 
+    if (action !== 'status' && isModeModificationBlocked(pos)) {
+      await bot.answerCallbackQuery(query.id, { text: 'Position busy or exiting; settings are locked' }).catch(() => undefined)
+      sendFlipMenu(bot, chatId)
+      return
+    }
     if (action === 'on') {
       updateFlipModeEnabled(pos.positionPubkey, true)
       await bot.answerCallbackQuery(query.id, { text: 'Flip Mode enabled — Precision/Auto Rebalance disabled' }).catch(() => undefined)
@@ -191,7 +227,7 @@ function sendStatusMenu(bot: TelegramBot, chatId: number | string): void {
       const value = p.lastEstimatedExitQuote ?? 0
       const peak = p.peakPnlPercent ?? 0
       const trail = p.trailingActivated ? ' 🔻' : ''
-      const modes = `${p.precisionCurveEnabled ? ' Precision' : ''}${p.flipModeEnabled ? ' Flip' : ''}${p.flipModePendingAdd ? ' FlipPending' : ''}${p.autoRebalanceEnabled ? ' Rebalance' : ''}`
+      const modes = `${p.precisionCurveEnabled ? ' Precision' : ''}${p.flipModeEnabled ? ' Flip' : ''}${p.flipModePendingAdd ? ' FlipPending' : ''}${p.autoRebalanceEnabled ? ` Rebalance(${rebalanceModeLabel(p.rebalanceMode)})` : ''}`
       return `${idx + 1}. ${emoji} <b>${label}</b> <code>${shortAddr(p.positionPubkey)}</code>\n` +
         `   PnL: <b>${sign}${pnl.toFixed(2)}%</b> | Value: <b>${formatQuoteValue(value, p.quoteCurrency)}</b>\n` +
         `   SL: <b>${p.slPercent}%</b> TP: <b>+${p.tpPercent}%</b> | Peak: <b>${peak.toFixed(2)}%</b>${trail}${modes}`
@@ -257,15 +293,19 @@ function sendAutoRebalanceMenu(bot: TelegramBot, chatId: number | string): void 
   const lines = [
     `<b>Auto Rebalance</b>`,
     sep(),
-    `Default: <b>off</b> | OOR-above window: <b>${config.rebalanceOorMinutes} min</b>`,
-    `Close the position (no swap) after sustained OOR above, then reopen with upper bin == current bin and the same amount.`,
+    `Default: <b>off</b> | OOR window: <b>${config.rebalanceOorMinutes} min</b>`,
+    `Mode controls sustained OOR above, below, or both; the position is reopened without a swap.`,
+    `Down requires quote side Y (token side X); quote side X down is unavailable.`,
     sep(),
     ...positions.map((p, idx) => {
       const label = `${p.tokenXSymbol || p.tokenXMint.slice(0, 4)}/${p.tokenYSymbol || p.tokenYMint.slice(0, 4)}`
       const state = p.autoRebalanceEnabled ? 'ON' : 'OFF'
       const busy = p.rebalanceBusy ? ' busy' : ''
       const last = p.rebalanceLastAt === null ? '-' : new Date(p.rebalanceLastAt).toISOString().slice(0, 19)
-      return `${idx + 1}. <b>${label}</b> <code>${shortAddr(p.positionPubkey)}</code> — <b>${state}</b>${busy}\nLast rebalance: <b>${last}</b>`
+      const timer = p.rebalanceOorSince === null
+        ? '-'
+        : `${p.rebalanceOorDirection ? p.rebalanceOorDirection.toUpperCase() + ' ' : ''}${Math.max(0, Math.round((Date.now() - p.rebalanceOorSince) / 1000))}s ago`
+      return `${idx + 1}. <b>${label}</b> <code>${shortAddr(p.positionPubkey)}</code> — <b>${state}</b>${busy}\nMode: <b>${rebalanceModeLabel(p.rebalanceMode)}</b> | OOR timer: <b>${timer}</b>\nLast rebalance: <b>${last}</b>`
     })
   ]
 
@@ -275,10 +315,17 @@ function sendAutoRebalanceMenu(bot: TelegramBot, chatId: number | string): void 
     reply_markup: {
       inline_keyboard: positions.flatMap(p => {
         const label = `${p.tokenXSymbol || p.tokenXMint.slice(0, 4)}/${p.tokenYSymbol || p.tokenYMint.slice(0, 4)} ${shortAddr(p.positionPubkey)}`
-        return [[
-          { text: p.autoRebalanceEnabled ? `Disable ${label}` : `Enable ${label}`, callback_data: `rebal:${p.autoRebalanceEnabled ? 'off' : 'on'}:${p.positionPubkey}` },
-          { text: 'Status', callback_data: `rebal:status:${p.positionPubkey}` },
-        ]]
+        return [
+          [
+            { text: p.rebalanceMode === 'up' ? '✅ Up' : 'Up', callback_data: `rebal:mode:up:${p.positionPubkey}` },
+            { text: p.rebalanceMode === 'down' ? '✅ Down' : 'Down', callback_data: `rebal:mode:down:${p.positionPubkey}` },
+            { text: p.rebalanceMode === 'both' ? '✅ Both' : 'Both', callback_data: `rebal:mode:both:${p.positionPubkey}` },
+          ],
+          [
+            { text: p.autoRebalanceEnabled ? `Disable ${label}` : `Enable ${label}`, callback_data: `rebal:${p.autoRebalanceEnabled ? 'off' : 'on'}:${p.positionPubkey}` },
+            { text: 'Status', callback_data: `rebal:status:${p.positionPubkey}` },
+          ],
+        ]
       })
     }
   }).catch(err => {
@@ -369,11 +416,27 @@ function autoRebalanceStatusText(pos: ReturnType<typeof loadActivePositions>[num
   return [
     `${label} ${shortAddr(pos.positionPubkey)}`,
     `Auto Rebalance: ${pos.autoRebalanceEnabled ? 'ON' : 'OFF'}`,
-    `OOR-above window: ${config.rebalanceOorMinutes} min`,
-    `OOR-above since: ${oorSince}`,
+    `Mode: ${rebalanceModeLabel(pos.rebalanceMode)}`,
+    `OOR window: ${config.rebalanceOorMinutes} min`,
+    `OOR direction: ${pos.rebalanceOorDirection?.toUpperCase() ?? '-'}`,
+    `Trailing: ${pos.trailingDisabled ? 'OFF' : 'ON'} (position setting)`,
+    `Bin Trigger: ${pos.binRangeDisabled ? 'OFF' : 'ON'} (position setting)`,
+    `OOR since: ${oorSince}`,
     `Busy: ${pos.rebalanceBusy ? 'yes' : 'no'}`,
     `Last rebalance: ${pos.rebalanceLastAt ? new Date(pos.rebalanceLastAt).toISOString() : '-'}`,
   ].join('\n')
+}
+
+function isRebalanceMode(value: string | undefined): value is RebalanceMode {
+  return value === 'up' || value === 'down' || value === 'both'
+}
+
+function rebalanceModeLabel(mode: RebalanceMode): string {
+  return mode === 'both' ? 'Both' : mode === 'down' ? 'Down' : 'Up'
+}
+
+function isModeModificationBlocked(pos: PositionRow): boolean {
+  return pos.status === 'exiting' || pos.rebalanceBusy || pos.flipModeBusy || pos.precisionCurveBusy
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────

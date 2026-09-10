@@ -1,3 +1,4 @@
+import { isPositionRiskSnapshotCurrent } from './risk/positionSettings.js'
 import { Connection, Keypair, PublicKey } from '@solana/web3.js'
 import { config } from './config.js'
 import { getConnection, withValuationFallback } from './solana/connection.js'
@@ -46,8 +47,7 @@ import {
   recoverLegacyFailedExits,
 } from './meteora/exit.js'
 import { reconcilePendingOpens } from './meteora/open.js'
-import { executeRebalanceOpen } from './meteora/open.js'
-import { isOorAbove, listRebalanceReopenIntents, persistRebalanceReopenIntent, rebalanceCloseDisposition, rebalanceTimerStatus, reconcilePendingRebalanceOpens } from './meteora/rebalance.js'
+import { buildRebalanceRange, rebalanceOorDirection, nextRebalanceTimer, listRebalanceReopenIntents, persistRebalanceReopenIntent, reconcilePendingRebalanceOpens } from './meteora/rebalance.js'
 import { executeDirectionalPrecisionCurve, THRESHOLD_RATIO, THRESHOLD_MIN, RECOVERY_MS } from './meteora/precisionCurve.js'
 import { calculateFlipProgressPct, executeFlipMode, retryPendingFlipAdd } from './meteora/flipMode.js'
 import { evaluateTrigger, type BinData } from './risk/rules.js'
@@ -82,7 +82,7 @@ const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
 let exitCooldowns = new Map<string, number>()
 let lastDiscoveryTime = 0
 let monitorRetries = new Map<string, number>()
-const pendingTriggers = new Map<string, { triggerType: TriggerType; timestamp: number; pnlAtTrigger: number }>()
+const pendingTriggers = new Map<string, { triggerType: TriggerType; timestamp: number; pnlAtTrigger: number; positionRiskRevision: number }>()
 let runnerMaintenanceInFlight = false
 let runnerMaintenancePromise: Promise<void> | null = null
 let botStartInProgress = false
@@ -245,7 +245,7 @@ export async function startBot(): Promise<void> {
       await monitorCycle(getConnection(), walletPubkey, ownerStr)
       const riskSettings = getRiskSettings()
       const fastTrailingPosition = riskSettings.trailingEnabled
-        && loadActivePositions().some(pos => pos.trailingActivated || pendingTriggers.has(pos.positionPubkey))
+        && loadActivePositions().some(pos => !pos.trailingDisabled && (pos.trailingActivated || pendingTriggers.has(pos.positionPubkey)))
       await sleep(fastTrailingPosition ? TRAILING_FAST_POLL_MS : config.pollIntervalMs)
     } catch (err) {
       console.log(`[loop] cycle error: ${err instanceof Error ? err.message : 'unknown'}`)
@@ -488,7 +488,8 @@ async function monitorSinglePosition(
   }
 
   try {
-    const riskSettings = getRiskSettings()
+    const globalRiskSettings = getRiskSettings()
+    const riskSettings = { ...globalRiskSettings, trailingEnabled: globalRiskSettings.trailingEnabled && !pos.trailingDisabled }
     const forceFreshValuation = (riskSettings.trailingEnabled && pos.trailingActivated) || pendingTriggers.has(pos.positionPubkey)
     const valuation = await estimateExitValue(pos.poolPubkey, ownerStr, pos.positionPubkey, pos.quoteCurrency, forceFreshValuation)
     if (!valuation) {
@@ -623,6 +624,12 @@ async function monitorSinglePosition(
       }
     }
 
+    // Async valuation may overlap a per-position risk change. Discard this snapshot.
+    const currentRiskPosition = loadKnownPositions().find(row => row.positionPubkey === pos.positionPubkey)
+    if (!isPositionRiskSnapshotCurrent(pos, currentRiskPosition)) {
+      pendingTriggers.delete(pos.positionPubkey)
+      return
+    }
     // --- Trailing stop: track peak PnL ---
     let updatedPeak = pos.peakPnlPercent
     let trailingActive = riskSettings.trailingEnabled && pos.trailingActivated
@@ -701,6 +708,13 @@ async function monitorSinglePosition(
       return
     }
 
+    const riskBeforeDecision = loadKnownPositions().find(row => row.positionPubkey === pos.positionPubkey)
+    if (!isPositionRiskSnapshotCurrent(pos, riskBeforeDecision)) {
+      pendingTriggers.delete(pos.positionPubkey)
+      return
+    }
+    const previousTrigger = pendingTriggers.get(pos.positionPubkey)
+    if (previousTrigger && previousTrigger.positionRiskRevision !== pos.positionRiskRevision) pendingTriggers.delete(pos.positionPubkey)
     const decision = evaluateTrigger(pos, pnlPercent, binData, effectiveRiskSettings(riskSettings, pos), true, !runnerManaged)
     if (decision.shouldTrigger && decision.triggerType) {
       let triggerType = decision.triggerType
@@ -729,11 +743,16 @@ async function monitorSinglePosition(
         : config.recheckDelayMs
       let pending = pendingTriggers.get(pos.positionPubkey)
 
+      if (pending && (pending.positionRiskRevision !== pos.positionRiskRevision || pending.triggerType !== decision.triggerType)) {
+        pendingTriggers.delete(pos.positionPubkey)
+        pending = undefined
+      }
       if (!pending) {
         pending = {
           triggerType: decision.triggerType,
           timestamp: Date.now(),
           pnlAtTrigger: pnlPercent,
+          positionRiskRevision: pos.positionRiskRevision,
         }
         pendingTriggers.set(pos.positionPubkey, pending)
         console.log(`[recheck] ${tokenLabel} | ${decision.triggerType} triggered at ${pnlPercent.toFixed(2)}% — waiting ${recheckDelayMs}ms for confirmation`)
@@ -775,9 +794,14 @@ async function monitorSinglePosition(
           }
         }
 
-        const latestRiskSettings = effectiveRiskSettings(getRiskSettings(), latestPosition)
+        const finalPosition = loadKnownPositions().find(row => row.positionPubkey === pos.positionPubkey)
+        if (!finalPosition || !isPositionRiskSnapshotCurrent(pos, finalPosition)) {
+          pendingTriggers.delete(pos.positionPubkey)
+          return
+        }
+        const latestRiskSettings = effectiveRiskSettings(getRiskSettings(), finalPosition)
         const freshDecision = evaluateTrigger(
-          latestPosition,
+          finalPosition,
           freshPnlPct,
           {
             upperBinId: freshValuation.upperBinId,
@@ -814,7 +838,7 @@ async function monitorSinglePosition(
         return
       }
       pendingTriggers.delete(pos.positionPubkey)
-      const rearmTrigger = { triggerType, timestamp: Date.now(), pnlAtTrigger: verifiedPnlPct }
+      const rearmTrigger = { triggerType, timestamp: Date.now(), pnlAtTrigger: verifiedPnlPct, positionRiskRevision: pos.positionRiskRevision }
 
       // --- Execute exit ---
       const estimatedPnl = exitValuation.pnlQuote
@@ -1197,141 +1221,63 @@ async function maybeRunAutoRebalance(
   valuation: ValuationResult,
 ): Promise<boolean> {
   const tokenLabel = `${pos.tokenXSymbol || pos.tokenXMint.slice(0, 4)}/${pos.tokenYSymbol || pos.tokenYMint.slice(0, 4)}`
-
+  // A durable intent owns this position even if an earlier cycle stopped before close.
+  if (listRebalanceReopenIntents().some(intent => intent.positionPubkey === pos.positionPubkey)) return true
   if (!pos.autoRebalanceEnabled) {
-    if (pos.rebalanceOorSince !== null) updateRebalanceOorSince(pos.positionPubkey, null)
+    if (pos.rebalanceOorSince !== null || pos.rebalanceOorDirection !== null) updateRebalanceOorSince(pos.positionPubkey, null)
     return false
   }
+  const direction = rebalanceOorDirection(valuation.poolActiveBinId, valuation.lowerBinId, valuation.upperBinId)
+  const timer = nextRebalanceTimer({ direction, mode: pos.rebalanceMode,
+    since: pos.rebalanceOorSince, previousDirection: pos.rebalanceOorDirection,
+    now: Date.now(), minutes: config.rebalanceOorMinutes })
+  if (timer.since !== pos.rebalanceOorSince || timer.direction !== pos.rebalanceOorDirection) {
+    updateRebalanceOorSince(pos.positionPubkey, timer.since, timer.direction)
+    if (timer.direction) console.log(`[rebalance] ${tokenLabel} | OOR ${timer.direction === 'up' ? 'above' : 'below'} — waiting ${config.rebalanceOorMinutes} min`)
+  }
+  if (getWalletOperation(pos.owner) || pos.rebalanceBusy) return true
+  if (!timer.ready || !direction) return false
 
-  if (getWalletOperation(pos.owner)) {
-    console.log(`[rebalance] ${tokenLabel} | durable wallet operation pending — paused`)
+  const quoteMint = pos.quoteCurrency === 'SOL' ? SOL_MINT : USDC_MINT
+  if (direction === 'down' && pos.tokenYMint !== quoteMint) {
+    console.log(`[rebalance] ${tokenLabel} | Down unavailable: token side must be X (quote side Y); position remains open`)
+    sendNotification(`⚠️ <b>Auto Rebalance Down unavailable</b>\n\n<b>${tokenLabel}</b>\nToken side must be X to reopen with lower bin = current bin. Position remains open.`)
+    updateRebalanceOorSince(pos.positionPubkey, Date.now(), direction)
+    return false
+  }
+  const rangeWidth = valuation.upperBinId! - valuation.lowerBinId! + 1
+  buildRebalanceRange(valuation.poolActiveBinId!, rangeWidth, direction)
+
+  const accepted = await withWalletExecutionLock(async () => {
+    if (getWalletOperation(pos.owner) || listRebalanceReopenIntents().some(intent => intent.owner === pos.owner)) return false
+    const latest = loadKnownPositions().find(row => row.positionPubkey === pos.positionPubkey)
+    if (!latest || latest.status !== 'monitoring' || !latest.autoRebalanceEnabled || latest.rebalanceBusy
+      || latest.rebalanceMode !== pos.rebalanceMode || latest.rebalanceOorSince !== pos.rebalanceOorSince
+      || latest.rebalanceOorDirection !== direction) return false
+    // No awaits between this fresh settings snapshot and the durable claim.
+    getDb().transaction(() => {
+      persistRebalanceReopenIntent(pos.owner, {
+        positionPubkey: pos.positionPubkey, poolPubkey: pos.poolPubkey,
+        quoteCurrency: pos.quoteCurrency, amountQuote: pos.basisQuote, rangeWidth,
+        inheritMode: true, direction, rebalanceMode: latest.rebalanceMode,
+        trailingDisabled: latest.trailingDisabled, binRangeDisabled: latest.binRangeDisabled,
+        tokenMint: direction === 'down' ? pos.tokenXMint : null, tokenAmountRaw: null,
+        closeRequested: true, closePnlPercent: pnlFromValuation(valuation, latest).pnlPercent,
+        closeEstimatedQuote: valuation.estimatedExitQuote,
+      })
+      updateRebalanceBusy(pos.positionPubkey, true)
+    })()
     return true
-  }
-
-  if (pos.rebalanceBusy) {
-    console.log(`[rebalance] ${tokenLabel} | busy — skip this cycle`)
-    return true
-  }
-
-  if (valuation.lowerBinId === undefined || valuation.upperBinId === undefined || valuation.poolActiveBinId === undefined) {
-    return false
-  }
-
-  if (!isOorAbove(valuation.poolActiveBinId, valuation.upperBinId)) {
-    if (pos.rebalanceOorSince !== null) updateRebalanceOorSince(pos.positionPubkey, null)
-    return false
-  }
-
-  const now = Date.now()
-  if (pos.rebalanceOorSince === null) {
-    updateRebalanceOorSince(pos.positionPubkey, now)
-    console.log(`[rebalance] ${tokenLabel} | OOR above detected (active=${valuation.poolActiveBinId} > upper=${valuation.upperBinId}) — waiting ${config.rebalanceOorMinutes} min`)
-    return false
-  }
-
-  const timer = rebalanceTimerStatus(pos.rebalanceOorSince, now, config.rebalanceOorMinutes)
-  if (timer === 'waiting') return false
-  if (timer === 'none') {
-    updateRebalanceOorSince(pos.positionPubkey, null)
-    return false
-  }
-
-  const rangeWidth = valuation.upperBinId - valuation.lowerBinId + 1
-  const pnlPercent = pnlFromValuation(valuation, pos).pnlPercent
-  updateRebalanceBusy(pos.positionPubkey, true)
-  console.log(`[rebalance] ${tokenLabel} | executing: close without swap then reopen with upper bin == active bin ${valuation.poolActiveBinId}`)
+  })
+  if (!accepted) return false
   sendNotification(
-    `🔄 <b>Auto Rebalance — Starting</b>\n\n` +
-    `<b>${tokenLabel}</b>\n` +
-    `OOR above for <b>${config.rebalanceOorMinutes} min</b>\n` +
-    `Active bin: <b>${valuation.poolActiveBinId}</b> (range ${valuation.lowerBinId}-${valuation.upperBinId})\n` +
-    `Action: close position (no swap), reopen ${rangeWidth} bins with upper bin == current bin, deposit <b>${pos.basisQuote.toFixed(4)} ${pos.quoteCurrency}</b>.`
+    `🔄 <b>Auto Rebalance ${direction.toUpperCase()} — Starting</b>\n\n` +
+    `<b>${tokenLabel}</b>\nOOR ${direction === 'up' ? 'above' : 'below'} for <b>${config.rebalanceOorMinutes} min</b>\n` +
+    `Close without swap; reopen <b>${rangeWidth} bins</b> with ${direction === 'up' ? 'upper' : 'lower'} bin = current bin.\n` +
+    `Trailing and bin-trigger settings will be inherited.`
   )
-
-  try {
-    const outcome = await withWalletExecutionLock(async () => {
-      const closeResult = await executeExit(
-        getConnection(),
-        getWallet(),
-        pos.positionPubkey,
-        pos.poolPubkey,
-        pos.tokenXMint,
-        pos.tokenYMint,
-        'MANUAL',
-        pnlPercent,
-        pos.quoteCurrency,
-        pos.basisQuote,
-        valuation.estimatedExitQuote,
-        true,
-        true,
-      )
-      const disposition = rebalanceCloseDisposition(closeResult)
-      if (disposition === 'deferred') {
-        persistRebalanceReopenIntent(pos.owner, {
-          positionPubkey: pos.positionPubkey,
-          poolPubkey: pos.poolPubkey,
-          quoteCurrency: pos.quoteCurrency,
-          amountQuote: pos.basisQuote,
-          rangeWidth,
-          inheritMode: pos.autoRebalanceEnabled,
-        })
-        console.log(`[rebalance] ${tokenLabel} | close confirmed — reopen will run once finality reconciliation completes`)
-        sendNotification(
-          `⏳ <b>Auto Rebalance — Close In Progress</b>\n\n` +
-          `<b>${tokenLabel}</b>\n` +
-          `Remove liquidity confirmed; waiting for finality.\n` +
-          `Reopen otomatis setelah posisi final ditutup.`
-        )
-        return { deferred: true as const }
-      }
-      if (disposition === 'failed') {
-        throw new Error(closeResult.error || 'rebalance close failed')
-      }
-      return {
-        deferred: false as const,
-        exitResult: closeResult,
-        openResult: await executeRebalanceOpen(
-          getConnection(),
-          getWallet(),
-          {
-            poolPubkey: pos.poolPubkey,
-            quoteCurrency: pos.quoteCurrency,
-            amountQuote: pos.basisQuote,
-            rangeWidth,
-          },
-          true,
-        ),
-      }
-    })
-    if (outcome.deferred) return true
-
-    const { exitResult, openResult } = outcome
-    console.log(`[rebalance] ${tokenLabel} | closed ${pos.positionPubkey.slice(0, 8)} (${exitResult.removeLiqSig?.slice(0, 8) || 'n/a'}) and reopened as ${openResult.positionPubkey.slice(0, 8)}`)
-    sendNotification(
-      `✅ <b>Auto Rebalance Complete</b>\n\n` +
-      `<b>${tokenLabel}</b>\n` +
-      `Old position closed (no swap): <code>${pos.positionPubkey.slice(0, 8)}..</code>\n` +
-      `New position: <code>${openResult.positionPubkey}</code>\n` +
-      `Range: <b>${openResult.preview.minBinId}-${openResult.preview.maxBinId}</b>\n` +
-      `Deposit: <b>${openResult.preview.amountQuote.toFixed(4)} ${pos.quoteCurrency}</b>\n` +
-      `Close: ${exitResult.removeLiqSig ? `<a href="https://solscan.io/tx/${exitResult.removeLiqSig}">${exitResult.removeLiqSig.slice(0, 6)}..${exitResult.removeLiqSig.slice(-4)}</a>` : '-'}\n` +
-      `Open: <a href="https://solscan.io/tx/${openResult.signature}">${openResult.signature.slice(0, 6)}..${openResult.signature.slice(-4)}</a>`
-    )
-    updateRebalanceState(pos.positionPubkey, Date.now())
-    updateAutoRebalanceEnabled(openResult.positionPubkey, true)
-    return true
-  } catch (err) {
-    updateRebalanceBusy(pos.positionPubkey, false)
-    const message = err instanceof Error ? err.message : 'unknown error'
-    console.log(`[rebalance] ${tokenLabel} | failed: ${message}`)
-    sendNotification(
-      `⚠️ <b>Auto Rebalance Failed</b>\n\n` +
-      `<b>${tokenLabel}</b>\n` +
-      `Reason: <code>${message}</code>\n\n` +
-      `If the position was already closed, its funds are safe in the wallet. Bot will retry on the next valid cycle.`
-    )
-    return true
-  }
+  await reconcilePendingRebalanceOpens(getConnection(), getWallet())
+  return true
 }
 
 async function maybeRunPrecisionCurve(

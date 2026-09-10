@@ -58,7 +58,7 @@ export function evaluateTrigger(
   // Excluded for Auto Rebalance positions: the mode handles out-of-range movement itself.
   // Excluded for runner-managed positions: the runner cycle owns exits (TP/SL/trailing only).
   else {
-    if (allowBinRange &&
+    if (allowBinRange && !position.binRangeDisabled &&
         !position.autoRebalanceEnabled &&
         config.binRangeCloseEnabled &&
         binData?.upperBinId !== undefined &&
@@ -72,7 +72,7 @@ export function evaluateTrigger(
     }
     }
     // Priority 4: trailing remains eligible when BIN_RANGE distance is outside its window.
-    if (!triggered && policy.trailingEnabled && position.trailingActivated && currentPnlPercent > 0) {
+    if (!triggered && !position.trailingDisabled && policy.trailingEnabled && position.trailingActivated && currentPnlPercent > 0) {
       const peak = position.peakPnlPercent
       const dropFromPeak = peak - currentPnlPercent
       if (dropFromPeak >= trailDrop) {

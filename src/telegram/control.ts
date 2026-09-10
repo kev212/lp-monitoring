@@ -1,3 +1,5 @@
+import { isPositionRiskEditable, setPositionRiskDisabled, type PositionRiskField } from '../risk/positionSettings.js'
+import { findCycleByPosition } from '../runner/cycle.js'
 import { randomBytes } from 'node:crypto'
 import TelegramBot from 'node-telegram-bot-api'
 import { PublicKey } from '@solana/web3.js'
@@ -29,6 +31,9 @@ const SOL_MINT = 'So11111111111111111111111111111111111111112'
 const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
 
 export type DashboardAction =
+  | { type: 'position_risk'; page: number }
+  | { type: 'position_risk_select'; positionPubkey: string }
+  | { type: 'position_risk_set'; positionPubkey: string; field: PositionRiskField; disabled: boolean }
   | { type: 'show'; page: number }
   | { type: 'refresh'; page: number }
   | { type: 'close'; page: number }
@@ -141,6 +146,16 @@ function riskFieldLabel(field: RiskSettingField | 'trailing_toggle'): string {
 export function parseDashboardAction(data: string | undefined): DashboardAction | null {
   if (!data?.startsWith('lpd:')) return null
   const parts = data.split(':')
+  if (parts.length === 3 && parts[1] === 'pr') {
+    const page = parsePage(parts[2])
+    return page === null ? null : { type: 'position_risk', page }
+  }
+  if (parts.length === 3 && parts[1] === 'ps' && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(parts[2])) {
+    return { type: 'position_risk_select', positionPubkey: parts[2] }
+  }
+  if (parts.length === 5 && parts[1] === 'pt' && ['trail', 'bin'].includes(parts[2]) && ['0', '1'].includes(parts[3]) && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(parts[4])) {
+    return { type: 'position_risk_set', field: parts[2] as PositionRiskField, disabled: parts[3] === '1', positionPubkey: parts[4] }
+  }
   if (parts.length === 3 && (parts[1] === 'show' || parts[1] === 'refresh' || parts[1] === 'close')) {
     const page = parsePage(parts[2])
     return page === null ? null : { type: parts[1], page }
@@ -332,6 +347,15 @@ class TelegramDashboardController {
       await this.showDashboard(chatId, action.page, message.message_id)
       return
     }
+    if (action.type === 'position_risk') {
+      await this.showPositionRiskMenu(chatId, action.page, message.message_id)
+      return
+    }
+    if (action.type === 'position_risk_select' || action.type === 'position_risk_set') {
+      if (action.type === 'position_risk_set') setPositionRiskDisabled(action.positionPubkey, action.field, action.disabled)
+      await this.showPositionRisk(chatId, message.message_id, action.positionPubkey)
+      return
+    }
     if (action.type === 'close') {
       await this.showCloseMenu(chatId, action.page, message.message_id)
       return
@@ -460,6 +484,7 @@ class TelegramDashboardController {
         const modes = [position.precisionCurveEnabled ? 'Precision' : '', position.flipModeEnabled ? 'Flip' : '', position.flipModePendingAdd ? 'FlipPending' : '', position.autoRebalanceEnabled ? 'Rebalance' : ''].filter(Boolean).join(', ') || 'off'
         const exceptionalStatus = ['opening', 'exiting', 'error'].includes(position.status) ? ` · ${position.status.toUpperCase()}` : ''
         lines.push(`${first + index + 1}. ${indicator} ${label}${exceptionalStatus}`)
+        lines.push(`   Trail ${position.trailingDisabled ? 'OFF (posisi)' : riskSettings.trailingEnabled ? 'ON' : 'OFF (global)'} · Bin Trigger ${position.binRangeDisabled ? 'OFF (posisi)' : !config.binRangeCloseEnabled ? 'OFF (global)' : position.autoRebalanceEnabled ? 'OFF (Rebalance)' : findCycleByPosition(position.positionPubkey) ? 'OFF (Runner)' : 'ON'}`)
         lines.push(...formatDashboardPositionLines(
           position,
           pnl,
@@ -478,7 +503,7 @@ class TelegramDashboardController {
         { text: '🔻 Close Position', callback_data: `lpd:close:${page}` },
       ],
       [{ text: '➕ Open Position', callback_data: 'lpd:open' }],
-      [{ text: '🛡️ Risk Settings', callback_data: 'lpd:risk' }],
+      [{ text: '🛡️ Risk Settings', callback_data: 'lpd:risk' }, { text: '🎚️ Position Risk', callback_data: `lpd:pr:${page}` }],
       [
         { text: '🎛️ Precision Curve', callback_data: 'lpd:precision' },
         { text: '🔁 Flip Mode', callback_data: 'lpd:flip' },
@@ -516,6 +541,46 @@ class TelegramDashboardController {
     }
     const sent = await this.bot.sendMessage(chatId, dashboard.text, { reply_markup: dashboard.keyboard })
     setSyncValue(`${DASHBOARD_KEY_PREFIX}${chatId}`, String(sent.message_id))
+  }
+
+  private async showPositionRiskMenu(chatId: string, requestedPage: number, messageId: number): Promise<void> {
+    const positions = loadKnownPositions().filter(p => isPositionRiskEditable(p.status))
+    const pages = Math.max(1, Math.ceil(positions.length / DASHBOARD_PAGE_SIZE))
+    const page = Math.min(Math.max(0, requestedPage), pages - 1)
+    const keyboard: TelegramBot.InlineKeyboardButton[][] = positions.slice(page * DASHBOARD_PAGE_SIZE, (page + 1) * DASHBOARD_PAGE_SIZE).map(p => [
+      { text: `${p.tokenXSymbol}/${p.tokenYSymbol} ${shortAddress(p.positionPubkey)}`, callback_data: `lpd:ps:${p.positionPubkey}` },
+    ])
+    if (page > 0) keyboard.push([{ text: 'Prev', callback_data: `lpd:pr:${page - 1}` }])
+    if (page + 1 < pages) keyboard.push([{ text: 'Next', callback_data: `lpd:pr:${page + 1}` }])
+    keyboard.push([{ text: 'Back', callback_data: `lpd:show:${page}` }])
+    await this.editPositionRiskMessage(chatId, messageId, positions.length ? 'POSITION RISK — pilih posisi' : 'Tidak ada posisi yang dapat diatur.', keyboard)
+  }
+
+  private async editPositionRiskMessage(chatId: string, messageId: number, text: string, keyboard: TelegramBot.InlineKeyboardButton[][]): Promise<void> {
+    try {
+      await this.bot.editMessageText(text, { chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: keyboard } })
+    } catch (err) {
+      if (!String(err).includes('message is not modified')) throw err
+    }
+  }
+
+  private async showPositionRisk(chatId: string, messageId: number, pubkey: string): Promise<void> {
+    const p = loadKnownPositions().find(row => row.positionPubkey === pubkey)
+    if (!p || !isPositionRiskEditable(p.status)) {
+      await this.showPositionRiskMenu(chatId, 0, messageId)
+      return
+    }
+    const trail = p.trailingDisabled ? 'OFF (posisi)' : getRiskSettings().trailingEnabled ? 'ON' : 'OFF (global)'
+    const bin = p.binRangeDisabled ? 'OFF (posisi)' : !config.binRangeCloseEnabled ? 'OFF (global)' : p.autoRebalanceEnabled ? 'OFF (Auto Rebalance)' : findCycleByPosition(pubkey) ? 'OFF (Runner)' : 'ON'
+    await this.editPositionRiskMessage(chatId, messageId, [
+      'POSITION RISK', `${p.tokenXSymbol}/${p.tokenYSymbol} ${shortAddress(pubkey)}`, pubkey,
+      `Trailing: ${trail}`, `Bin Trigger: ${bin}`,
+      '', 'ON mengikuti global dan aturan mode posisi. OFF hanya berlaku untuk posisi ini.',
+    ].join('\n'), [
+      [{ text: `Trailing → ${p.trailingDisabled ? 'ON' : 'OFF'}`, callback_data: `lpd:pt:trail:${p.trailingDisabled ? 0 : 1}:${pubkey}` }],
+      [{ text: `Bin Trigger → ${p.binRangeDisabled ? 'ON' : 'OFF'}`, callback_data: `lpd:pt:bin:${p.binRangeDisabled ? 0 : 1}:${pubkey}` }],
+      [{ text: 'Back', callback_data: 'lpd:pr:0' }],
+    ])
   }
 
   private async showCloseMenu(chatId: string, requestedPage: number, messageId: number): Promise<void> {

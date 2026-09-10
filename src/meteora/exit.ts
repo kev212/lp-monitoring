@@ -26,6 +26,8 @@ const SOL_MINTS = new Set([
 const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
 const EXIT_PENDING_PREFIX = 'exit_pending:'
 const EXIT_NOTIFICATION_PREFIX = 'exit_notification:'
+const EXIT_CLOSE_TOKEN_RECEIPT_PREFIX = 'exit_close_token_receipt:'
+const REBALANCE_REOPEN_PREFIX = 'rebalance_reopen:'
 const EXPIRED_ABSENCE_CHECKS = 2
 const EXPIRED_ABSENCE_MIN_INTERVAL_MS = 5_000
 const RECONCILIATION_PROBE_TIMEOUT_MS = 2_000
@@ -167,6 +169,144 @@ function exitPendingKey(positionPubkey: string): string {
 
 function exitNotificationKey(executionId: number): string {
   return `${EXIT_NOTIFICATION_PREFIX}${executionId}`
+}
+
+function closeTokenReceiptKey(positionPubkey: string, mint: string): string {
+  return `${EXIT_CLOSE_TOKEN_RECEIPT_PREFIX}${positionPubkey}:${mint}`
+}
+
+/**
+ * Read the raw token amount returned by a durable close-only exit. The receipt
+ * is keyed by both position and mint so a wallet-wide balance cannot be
+ * mistaken for proceeds from a particular close.
+ */
+export function readCloseTokenReceipt(positionPubkey: string, mint: string): string | null {
+  if (!positionPubkey || !mint) return null
+  const row = getDb().prepare('SELECT value FROM sync_state WHERE key = ?').get(closeTokenReceiptKey(positionPubkey, mint)) as { value?: string } | undefined
+  if (!row?.value || !/^\d+$/.test(row.value)) return null
+  return row.value
+}
+
+interface CloseTokenBalance {
+  accountIndex: number
+  mint: string
+  owner?: string
+  uiTokenAmount?: { amount?: string }
+}
+
+interface CloseTokenTransaction {
+  meta?: {
+    err?: unknown
+    preTokenBalances?: CloseTokenBalance[] | null
+    postTokenBalances?: CloseTokenBalance[] | null
+  } | null
+}
+
+function sumOwnerTokenBalances(
+  balances: CloseTokenBalance[],
+  owner: string,
+  mint: string,
+): bigint {
+  let total = 0n
+  for (const balance of balances) {
+    if (balance.mint !== mint) continue
+    if (balance.owner === undefined) {
+      throw new Error(`close token receipt metadata has no owner for ${mint.slice(0, 8)}`)
+    }
+    if (balance.owner !== owner) continue
+    const amount = balance.uiTokenAmount?.amount
+    if (typeof amount !== 'string' || !/^\d+$/.test(amount)) {
+      throw new Error(`close token receipt metadata has no raw amount for ${mint.slice(0, 8)}`)
+    }
+    total += BigInt(amount)
+  }
+  return total
+}
+
+/**
+ * Attribute token proceeds to a close from finalized transaction metadata.
+ * Token account balances are summed per owner and mint in every remove
+ * transaction, which excludes pre-existing wallet balances and unrelated
+ * wallet activity outside those transactions.
+ */
+export function attributedTokenReceipt(
+  transactions: readonly CloseTokenTransaction[],
+  owner: string,
+  mint: string,
+): string {
+  if (!owner || !mint) throw new Error('close token receipt owner and mint are required')
+  if (transactions.length === 0) throw new Error('close token receipt has no remove transactions')
+
+  let total = 0n
+  for (const transaction of transactions) {
+    const meta = transaction?.meta
+    if (!meta || meta.err) throw new Error('close token receipt transaction metadata unavailable')
+    if (!Array.isArray(meta.preTokenBalances) || !Array.isArray(meta.postTokenBalances)) {
+      throw new Error('close token receipt token balance metadata unavailable')
+    }
+    const before = sumOwnerTokenBalances(meta.preTokenBalances, owner, mint)
+    const after = sumOwnerTokenBalances(meta.postTokenBalances, owner, mint)
+    const delta = after - before
+    if (delta < 0n) throw new Error(`close token receipt decreased for ${mint.slice(0, 8)}`)
+    total += delta
+  }
+  return total.toString()
+}
+
+function requiredCloseTokenReceiptMints(state: ExitPendingState): string[] {
+  // Rebalance-down is the close-only flow that needs a token amount for its
+  // next open. Other skip-swap exits retain their existing completion path and
+  // should not be held up by an optional transaction-metadata probe.
+  if (state.triggerType !== 'MANUAL') return []
+  const row = getDb().prepare('SELECT value FROM sync_state WHERE key = ?').get(`${REBALANCE_REOPEN_PREFIX}${state.owner}`) as { value?: string } | undefined
+  if (!row?.value) return []
+  try {
+    const intent = JSON.parse(row.value) as {
+      positionPubkey?: string
+      direction?: string
+      closeRequested?: boolean
+      tokenMint?: string | null
+    }
+    if (
+      intent.positionPubkey !== state.positionPubkey
+      || intent.direction !== 'down'
+      || intent.closeRequested !== true
+      || intent.tokenMint !== state.tokenXMint
+      || !intent.tokenMint
+      || SOL_MINTS.has(intent.tokenMint)
+    ) return []
+    return [intent.tokenMint]
+  } catch {
+    return []
+  }
+}
+
+async function collectCloseTokenReceipts(
+  connection: Connection,
+  state: ExitPendingState,
+  mints: string[],
+): Promise<Record<string, string>> {
+  if (mints.length === 0) return {}
+  const signatures = [...new Set(state.removeSignatures)]
+  if (signatures.length === 0) throw new Error('close token receipt has no finalized remove signature')
+
+  const transactions: CloseTokenTransaction[] = []
+  for (const signature of signatures) {
+    const transaction = await withRpcTimeout(
+      withRpcFallback(
+        rpc => rpc.getTransaction(signature, {
+          commitment: 'finalized',
+          maxSupportedTransactionVersion: 0,
+        }),
+        connection,
+      ),
+      EXIT_RPC_TIMEOUT_MS,
+    )
+    if (!transaction) throw new Error(`close token receipt transaction ${signature} is unavailable`)
+    transactions.push(transaction as unknown as CloseTokenTransaction)
+  }
+
+  return Object.fromEntries(mints.map(mint => [mint, attributedTokenReceipt(transactions, state.owner, mint)]))
 }
 
 export function listPendingExitNotifications(): ExitCompletionNotification[] {
@@ -435,9 +575,15 @@ function finishExit(
   positionStatus: 'monitoring' | 'closed' | 'error',
   fields: Partial<ExecutionRow>,
   queueCompletionNotification = false,
+  closeTokenReceipts: Record<string, string> = {},
 ): void {
   const db = getDb()
   db.transaction(() => {
+    for (const [mint, rawAmount] of Object.entries(closeTokenReceipts)) {
+      if (!/^\d+$/.test(rawAmount)) throw new Error(`invalid close token receipt for ${mint.slice(0, 8)}`)
+      db.prepare('INSERT OR IGNORE INTO sync_state (key, value, updated_at) VALUES (?, ?, ?)')
+        .run(closeTokenReceiptKey(state.positionPubkey, mint), rawAmount, Date.now())
+    }
     const deleted = db.prepare(`
       DELETE FROM sync_state
       WHERE key = ?
@@ -1024,6 +1170,11 @@ async function completeExitWithoutSwap(
   try {
     const settlementSlot = await finalizedSettlementSlot(connection, state.removeSignatures)
     if (settlementSlot === null) throw new Error('remove transactions are not finalized yet')
+    const closeTokenReceipts = await collectCloseTokenReceipts(
+      connection,
+      state,
+      requiredCloseTokenReceiptMints(state),
+    )
     const postSolBalance = await getSolBalance(connection, wallet.publicKey, settlementSlot)
     result.solReceived = (postSolBalance - state.preSolBalance) / 1_000_000_000
     if (quoteIsUsdc) {
@@ -1039,7 +1190,7 @@ async function completeExitWithoutSwap(
       finalSolReceived: result.solReceived,
       finalQuoteReceived: quoteReceived,
       errorMessage: null,
-    }, true)
+    }, true, closeTokenReceipts)
     result.success = true
     result.pendingRecovery = false
     console.log(`[exit] close-only completed without swap: ${quoteIsUsdc ? `${result.usdcReceived.toFixed(2)} USDC` : `${result.solReceived.toFixed(6)} SOL`} returned to wallet`)

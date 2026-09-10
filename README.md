@@ -256,3 +256,39 @@ Contoh log saat runtime:
 ## Disclaimer
 
 Bot ini mengeksekusi transaksi on-chain secara otomatis. Gunakan dengan risiko sendiri. Uji dengan jumlah kecil terlebih dahulu sebelum digunakan pada dana utama.
+
+### Risk per posisi
+
+Di Telegram, buka `/dashboard` → **Position Risk**, pilih pasangan/alamat posisi,
+lalu gunakan tombol **Trailing → OFF/ON** dan **Bin Trigger → OFF/ON**.
+OFF hanya berlaku pada posisi terpilih dan tersimpan setelah restart. ON mengikuti
+pengaturan global serta aturan mode; BIN_RANGE tetap tidak berlaku untuk Auto
+Rebalance dan posisi runner. TP/SL dan drawdown lock tetap aktif sesuai kebijakan.
+Trailing yang dinyalakan kembali mulai dari valuasi valid berikutnya, tanpa peak
+lama. Posisi baru mengikuti global, termasuk posisi pengganti hasil reopen.
+
+### Auto Rebalance arah
+
+Menu Telegram **Auto Rebalance** menyediakan mode **Up**, **Down**, dan **Both**.
+Mode Up menunggu posisi keluar dari batas atas, sedangkan Down menunggu posisi
+keluar dari batas bawah; Both mengaktifkan keduanya. Pilihan mode dan timer OOR
+tersimpan per posisi. Mengubah mode menghapus timer lama agar pengukuran dimulai
+kembali dari arah yang dipilih.
+
+Kedua arah memakai `REBALANCE_OOR_MINUTES` (default 5 menit). Timer diulang
+ketika posisi kembali in-range atau berpindah sisi OOR. Posisi lama tetap Up.
+Down menutup tanpa swap, lalu mendepositkan token hasil close terkonfirmasi
+(termasuk fee dalam token tersebut) dengan lebar bin yang sama dan lower bin
+sama dengan current bin terbaru. Contoh: 3 bin dan current bin 90 menghasilkan
+range 90–92. Saldo token lain di wallet tidak ikut didepositkan; hasil quote
+tetap di wallet. Basis posisi baru memakai nilai token dalam quote saat reopen.
+
+Saat Auto Rebalance membuka kembali posisi pengganti, flag risk per posisi
+(**Trailing ON/OFF** dan **Bin Trigger ON/OFF**) diwariskan bersama mode rebalance
+sejak posisi baru dicatat, termasuk saat recovery setelah restart. Peak PnL dan
+aktivasi trailing dimulai ulang. Setting ON tetap mengikuti konfigurasi global;
+Bin Trigger tetap tersimpan ON walaupun eksekusinya ditekan oleh Auto Rebalance.
+Perubahan mode tidak dapat dilakukan ketika rebalance sedang berjalan atau posisi
+sedang exit. Mode Down saat ini hanya dapat menggunakan posisi dengan quote side
+Y (token side X); posisi dengan quote side X belum mendukung deposit token untuk
+reopen Down.

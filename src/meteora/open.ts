@@ -10,10 +10,11 @@ import {
 import { config } from '../config.js'
 import { getDb, listSyncValues, setSyncValue } from '../db/client.js'
 import { getWalletOperation, walletOperationKey, withWalletExecutionLock } from '../executionLock.js'
-import type { QuoteCurrency } from '../types.js'
+import type { QuoteCurrency, RebalanceDirection, RebalanceMode } from '../types.js'
 import { deleteOpeningPosition, updatePositionStatus, upsertPosition } from './discovery.js'
 import { clearPnlCache, getQuoteCurrency } from './valuation.js'
 import { clearPoolCache, getPool, getPoolInfo } from './positions.js'
+import { buildRebalanceRange } from './rebalance.js'
 import { getRiskSettings } from '../risk/settings.js'
 import { confirmSignature } from '../solana/confirmation.js'
 import { withRpcFallback, withSignatureStatusFallback } from '../solana/connection.js'
@@ -68,6 +69,9 @@ export interface OpenPositionPreview extends OpenPoolInfo {
   maxPriceMoveBins: number
   addSlippagePercent: number
   observedAt: number
+  /** Side and mint that will actually fund the position. Defaults to quoteSide. */
+  fundingSide?: OpenQuoteSide
+  fundingMint?: string
 }
 
 export interface OpenPositionResult {
@@ -151,6 +155,12 @@ export interface OpenExecutionContext {
   runnerCycleId?: string
   runnerMint?: string
   requireExistingBinArrays?: boolean
+  trailingDisabled?: boolean
+  binRangeDisabled?: boolean
+  rebalanceMode?: RebalanceMode
+  inheritMode?: boolean
+  /** Called while the durable pending-open transaction is still open, before broadcast. */
+  onPrepared?: (positionPubkey: string, signature: string) => void
 }
 
 export interface OpenPositionRequest {
@@ -345,6 +355,82 @@ export function parseUiAmountToRaw(input: string, decimals: number): bigint {
   return raw
 }
 
+/** Parse an integer amount already expressed in the token's smallest units. */
+export function parseRawAmount(input: string): bigint {
+  const normalized = input.trim()
+  if (!/^[1-9]\d*$/.test(normalized)) throw new Error('Raw amount must be a positive integer')
+  return BigInt(normalized)
+}
+
+export interface RebalanceFundingPlan {
+  amountRaw: bigint
+  amountInput: string
+  amountQuote: number
+  fundingSide: OpenQuoteSide
+  fundingMint: string
+  currentPriceQuote: number
+  targetPriceQuote: number
+}
+
+/** Resolve the side, raw amount, and quote basis for a rebalance open. */
+export function resolveRebalanceFunding(input: {
+  quoteSide: OpenQuoteSide
+  quoteMint: string
+  tokenXMint: string
+  quoteDecimals: number
+  tokenXDecimals: number
+  amountQuote: number
+  direction?: RebalanceDirection
+  tokenAmountRaw?: string
+  tokenMint?: string
+  activeQuotePrice?: number
+}): RebalanceFundingPlan {
+  const direction = input.direction ?? 'up'
+  if (direction === 'down') {
+    if (input.quoteSide !== 'Y') {
+      throw new Error('Down rebalance is unsupported when the quote token is X')
+    }
+    if (input.tokenMint !== undefined && input.tokenMint !== input.tokenXMint) {
+      throw new Error('Down rebalance token mint must match pool token X')
+    }
+    if (input.tokenAmountRaw === undefined) {
+      throw new Error('Down rebalance requires tokenAmountRaw')
+    }
+    const amountRaw = parseRawAmount(input.tokenAmountRaw)
+    const activeQuotePrice = input.activeQuotePrice
+    if (!Number.isFinite(activeQuotePrice) || activeQuotePrice! <= 0) throw new Error('Pool active price is invalid')
+    const amountInput = formatRawAmount(amountRaw, input.tokenXDecimals)
+    const amountQuote = (Number(amountRaw) / 10 ** input.tokenXDecimals) * activeQuotePrice!
+    if (!Number.isFinite(amountQuote) || amountQuote <= 0) throw new Error('Down rebalance token amount is too large')
+    return {
+      amountRaw,
+      amountInput,
+      amountQuote,
+      fundingSide: 'X',
+      fundingMint: input.tokenXMint,
+      currentPriceQuote: activeQuotePrice!,
+      targetPriceQuote: activeQuotePrice!,
+    }
+  }
+
+  const amountRaw = parseUiAmountToRaw(
+    formatRawAmount(BigInt(Math.round(input.amountQuote * 10 ** input.quoteDecimals)), input.quoteDecimals),
+    input.quoteDecimals,
+  )
+  const amountInput = formatRawAmount(amountRaw, input.quoteDecimals)
+  const amountQuote = Number(amountRaw) / 10 ** input.quoteDecimals
+  if (!Number.isFinite(amountQuote) || amountQuote <= 0) throw new Error('Rebalance amount must be greater than zero')
+  return {
+    amountRaw,
+    amountInput,
+    amountQuote,
+    fundingSide: input.quoteSide,
+    fundingMint: input.quoteMint,
+    currentPriceQuote: 0,
+    targetPriceQuote: 0,
+  }
+}
+
 export function formatRawAmount(raw: bigint, decimals: number): string {
   const padded = raw.toString().padStart(decimals + 1, '0')
   const whole = decimals === 0 ? padded : padded.slice(0, -decimals)
@@ -522,9 +608,14 @@ export async function prepareOpenPosition(
   return (await prepareOpenPositionWithPool(connection, owner, poolPubkey, amountInput, rangePercent, strategy, context)).preview
 }
 
-function persistOpenPosition(position: Keypair, preview: OpenPositionPreview, owner: string): void {
+function persistOpenPosition(
+  position: Keypair,
+  preview: OpenPositionPreview,
+  owner: string,
+  context?: OpenExecutionContext,
+): void {
   const riskSettings = getRiskSettings()
-  upsertPosition({
+  const positionRow: Parameters<typeof upsertPosition>[0] = {
     positionPubkey: position.publicKey.toBase58(),
     poolPubkey: preview.poolPubkey,
     tokenXMint: preview.tokenXMint,
@@ -546,9 +637,16 @@ function persistOpenPosition(position: Keypair, preview: OpenPositionPreview, ow
     lastEstimatedExitQuote: null,
     lastEstimatedExitSolLegacy: null,
     lastSeenAt: Date.now(),
-    strategy: 'single_side_quote',
+    strategy: preview.fundingSide && preview.fundingSide !== preview.quoteSide
+      ? 'single_side_token'
+      : 'single_side_quote',
     flipModeEnabled: false,
-  })
+    trailingDisabled: context?.trailingDisabled ?? false,
+    binRangeDisabled: context?.binRangeDisabled ?? false,
+    autoRebalanceEnabled: context?.inheritMode ?? false,
+    rebalanceMode: context?.rebalanceMode ?? 'up',
+  }
+  upsertPosition(positionRow)
 }
 
 function pendingOpenKey(owner: string): string {
@@ -682,7 +780,12 @@ function ensureOpenWalletLease(state: PendingOpenState): void {
   })()
 }
 
-function createPendingOpen(position: Keypair, preview: OpenPositionPreview, state: PendingOpenState): void {
+export function createPendingOpen(
+  position: Keypair,
+  preview: OpenPositionPreview,
+  state: PendingOpenState,
+  context?: OpenExecutionContext,
+): void {
   const db = getDb()
   db.transaction(() => {
     const existing = db.prepare('SELECT value FROM sync_state WHERE key = ?').get(pendingOpenKey(state.owner)) as { value: string } | undefined
@@ -692,11 +795,12 @@ function createPendingOpen(position: Keypair, preview: OpenPositionPreview, stat
     }
     const lease = db.prepare('SELECT 1 FROM sync_state WHERE key = ?').get(walletOperationKey(state.owner))
     if (lease) throw new Error('wallet is busy with another durable operation')
-    persistOpenPosition(position, preview, state.owner)
+    persistOpenPosition(position, preview, state.owner, context)
     db.prepare('INSERT INTO sync_state (key, value, updated_at) VALUES (?, ?, ?)')
       .run(walletOperationKey(state.owner), JSON.stringify({ kind: 'open', operationId: state.positionPubkey }), state.updatedAt)
     db.prepare('INSERT INTO sync_state (key, value, updated_at) VALUES (?, ?, ?)')
       .run(pendingOpenKey(state.owner), JSON.stringify(state), state.updatedAt)
+    context?.onPrepared?.(state.positionPubkey, state.signature)
   })()
 }
 
@@ -823,6 +927,14 @@ export interface RebalanceOpenParams {
   quoteCurrency: QuoteCurrency
   amountQuote: number
   rangeWidth: number
+  direction?: RebalanceDirection
+  tokenAmountRaw?: string
+  tokenMint?: string
+  trailingDisabled?: boolean
+  binRangeDisabled?: boolean
+  rebalanceMode?: RebalanceMode
+  inheritMode?: boolean
+  onPrepared?: (positionPubkey: string, signature: string) => void
 }
 
 async function prepareRebalanceOpenWithPool(
@@ -832,27 +944,35 @@ async function prepareRebalanceOpenWithPool(
 ): Promise<{ preview: OpenPositionPreview; pool: DLMM }> {
   const { pool, poolInfo } = await loadOpenPool(connection, params.poolPubkey)
   const activeBinId = pool.lbPair.activeId
-  const width = Math.round(params.rangeWidth)
+  const width = params.rangeWidth
   if (!Number.isInteger(width) || width < 1) throw new Error('Rebalance range width is invalid')
-  const maxBins = Number(MAX_BINS_PER_POSITION.toString())
-  if (width > maxBins) throw new Error(`Rebalance range ${width} bins exceeds the ${maxBins}-bin position limit`)
-  const minBinId = activeBinId - width + 1
-  const maxBinId = activeBinId
+  const direction = params.direction ?? 'up'
+  const range = buildRebalanceRange(activeBinId, width, direction)
 
   if (poolInfo.quoteCurrency !== params.quoteCurrency) {
     throw new Error('Rebalance quote currency does not match the pool')
   }
-  const amountRaw = parseUiAmountToRaw(
-    formatRawAmount(BigInt(Math.round(params.amountQuote * 10 ** poolInfo.quoteDecimals)), poolInfo.quoteDecimals),
-    poolInfo.quoteDecimals,
-  )
-  if (amountRaw <= 0n) throw new Error('Rebalance amount must be greater than zero')
+  const activeQuotePrice = direction === 'down'
+    ? Number(pool.fromPricePerLamport(Number(getPriceOfBinByBinId(activeBinId, pool.lbPair.binStep))))
+    : undefined
+  const funding = resolveRebalanceFunding({
+    quoteSide: poolInfo.quoteSide,
+    quoteMint: poolInfo.quoteMint,
+    tokenXMint: poolInfo.tokenXMint,
+    quoteDecimals: poolInfo.quoteDecimals,
+    tokenXDecimals: poolInfo.tokenXDecimals,
+    amountQuote: params.amountQuote,
+    direction,
+    tokenAmountRaw: params.tokenAmountRaw,
+    tokenMint: params.tokenMint,
+    activeQuotePrice,
+  })
 
   const strategyParams = {
-    minBinId,
-    maxBinId,
+    minBinId: range.minBinId,
+    maxBinId: range.maxBinId,
     strategyType: strategyType('spot'),
-    singleSidedX: poolInfo.quoteSide === 'X',
+    singleSidedX: funding.fundingSide === 'X',
   }
   const cost = await pool.quoteCreatePosition({ strategy: strategyParams })
   if (cost.positionCount !== 1) throw new Error(`Range requires ${cost.positionCount} positions; reduce the percentage range`)
@@ -862,13 +982,19 @@ async function prepareRebalanceOpenWithPool(
   const nativeBalance = await withRpcFallback(rpc => rpc.getBalance(owner), connection)
   const requiredFeeLamports = BigInt(Math.ceil((estimatedPositionCostSol + config.openSolFeeReserve) * LAMPORTS_PER_SOL))
 
-  if (poolInfo.quoteCurrency === 'SOL') {
-    if (BigInt(nativeBalance) < amountRaw + requiredFeeLamports) {
+  if (direction === 'down') {
+    const tokenBalance = await rawAssociatedTokenBalance(connection, owner, funding.fundingMint)
+    if (tokenBalance < funding.amountRaw) throw new Error(`Insufficient ${poolInfo.baseSymbol} balance`)
+    if (BigInt(nativeBalance) < requiredFeeLamports) {
+      throw new Error(`Insufficient SOL for rent and fees; keep at least ${config.openSolFeeReserve} SOL reserve`)
+    }
+  } else if (poolInfo.quoteCurrency === 'SOL') {
+    if (BigInt(nativeBalance) < funding.amountRaw + requiredFeeLamports) {
       throw new Error(`Insufficient SOL; keep ${config.openSolFeeReserve} SOL plus estimated position rent for fees`)
     }
   } else {
     const quoteBalance = await rawAssociatedTokenBalance(connection, owner, poolInfo.quoteMint)
-    if (quoteBalance < amountRaw) throw new Error('Insufficient USDC balance')
+    if (quoteBalance < funding.amountRaw) throw new Error('Insufficient USDC balance')
     if (BigInt(nativeBalance) < requiredFeeLamports) {
       throw new Error(`Insufficient SOL for rent and fees; keep at least ${config.openSolFeeReserve} SOL reserve`)
     }
@@ -876,21 +1002,23 @@ async function prepareRebalanceOpenWithPool(
 
   return { pool, preview: {
     ...poolInfo,
-    amountInput: formatRawAmount(amountRaw, poolInfo.quoteDecimals),
-    amountQuote: Number(amountRaw) / 10 ** poolInfo.quoteDecimals,
-    amountRaw: amountRaw.toString(),
+    amountInput: funding.amountInput,
+    amountQuote: funding.amountQuote,
+    amountRaw: funding.amountRaw.toString(),
     rangePercent: 0,
     strategy: 'spot',
     activeBinId,
-    minBinId,
-    maxBinId,
+    minBinId: range.minBinId,
+    maxBinId: range.maxBinId,
     binCount: width,
-    currentPriceQuote: 0,
-    targetPriceQuote: 0,
+    currentPriceQuote: funding.currentPriceQuote,
+    targetPriceQuote: funding.targetPriceQuote,
     estimatedPositionCostSol,
     maxPriceMoveBins: config.openMaxPriceMoveBins,
     addSlippagePercent,
     observedAt: Date.now(),
+    fundingSide: funding.fundingSide,
+    fundingMint: funding.fundingMint,
   } }
 }
 
@@ -911,28 +1039,35 @@ export async function executeRebalanceOpen(
     }
 
     const { preview, pool } = await prepareRebalanceOpenWithPool(connection, wallet.publicKey, params)
-    return submitOpenPosition(connection, wallet, pool, preview)
+    return submitOpenPosition(connection, wallet, pool, preview, {
+      trailingDisabled: params.trailingDisabled,
+      binRangeDisabled: params.binRangeDisabled,
+      rebalanceMode: params.rebalanceMode,
+      inheritMode: params.inheritMode,
+      onPrepared: params.onPrepared,
+    })
   }
   return skipLock ? work() : withWalletExecutionLock(() => withOpenDeadline(work))
 }
 
-async function buildOpenTransaction(
+export async function buildOpenTransaction(
   pool: DLMM,
   owner: PublicKey,
   positionPubkey: PublicKey,
   preview: OpenPositionPreview,
 ) {
   const amountRaw = new BN(preview.amountRaw)
+  const fundingSide = preview.fundingSide ?? preview.quoteSide
   return pool.initializePositionAndAddLiquidityByStrategy({
     positionPubKey: positionPubkey,
     user: owner,
-    totalXAmount: preview.quoteSide === 'X' ? amountRaw : new BN(0),
-    totalYAmount: preview.quoteSide === 'Y' ? amountRaw : new BN(0),
+    totalXAmount: fundingSide === 'X' ? amountRaw : new BN(0),
+    totalYAmount: fundingSide === 'Y' ? amountRaw : new BN(0),
     strategy: {
       minBinId: preview.minBinId,
       maxBinId: preview.maxBinId,
       strategyType: strategyType(preview.strategy),
-      singleSidedX: preview.quoteSide === 'X',
+      singleSidedX: fundingSide === 'X',
     },
     slippage: preview.addSlippagePercent,
   })
@@ -988,7 +1123,7 @@ async function submitOpenPosition(
     runnerCycleId: context?.runnerCycleId || null,
     runnerMint: context?.runnerMint || null,
   }
-  createPendingOpen(position, executedPreview, pendingState)
+  createPendingOpen(position, executedPreview, pendingState, context)
 
   let transactionFinalized = false
   try {

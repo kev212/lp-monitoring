@@ -2,9 +2,84 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { Connection, Keypair, SendTransactionError, Transaction, TransactionInstruction } from '@solana/web3.js'
 import bs58 from 'bs58'
+import { closeDb, getDb } from '../src/db/client.js'
+import { config } from '../src/config.js'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { isAmbiguousDurableSendError } from '../src/executionLock.js'
-import { collectExitBaselines, exitRetryDelayMs, finalizedSettlementSlot, getTokenBalance, positiveBalanceDelta, sendTrackedTransaction, shouldResolveClosedExitWithoutFinalSignature, swapObligation } from '../src/meteora/exit.js'
+import { attributedTokenReceipt, collectExitBaselines, exitRetryDelayMs, finalizedSettlementSlot, getTokenBalance, positiveBalanceDelta, readCloseTokenReceipt, sendTrackedTransaction, shouldResolveClosedExitWithoutFinalSignature, swapObligation } from '../src/meteora/exit.js'
 import { formatExitReconciled } from '../src/telegram.js'
+
+const CLOSE_RECEIPT_PREFIX = 'exit_close_token_receipt:'
+
+function tokenBalance(accountIndex: number, mint: string, owner: string, amount: string) {
+  return { accountIndex, mint, owner, uiTokenAmount: { amount, decimals: 6, uiAmount: Number(amount) / 1e6, uiAmountString: amount } }
+}
+
+function tokenTransaction(preTokenBalances: any[], postTokenBalances: any[]) {
+  return { meta: { err: null, preTokenBalances, postTokenBalances } }
+}
+
+test('attributes close token proceeds from raw owner and mint deltas across remove transactions', () => {
+  const owner = 'WalletOwner'
+  const mint = 'TokenMint'
+  const otherMint = 'UnrelatedMint'
+  const transactions = [
+    tokenTransaction(
+      [
+        tokenBalance(0, mint, owner, '1000'),
+        tokenBalance(1, mint, owner, '250'),
+        tokenBalance(2, otherMint, owner, '900'),
+        tokenBalance(3, mint, 'OtherOwner', '5000'),
+      ],
+      [
+        tokenBalance(0, mint, owner, '1300'),
+        tokenBalance(1, mint, owner, '300'),
+        tokenBalance(2, otherMint, owner, '901'),
+        tokenBalance(3, mint, 'OtherOwner', '5000'),
+      ],
+    ),
+    tokenTransaction(
+      [tokenBalance(4, mint, owner, '10')],
+      [tokenBalance(4, mint, owner, '135')],
+    ),
+  ]
+
+  assert.equal(attributedTokenReceipt(transactions, owner, mint), '475')
+})
+
+test('defers token attribution when finalized transaction metadata is missing', () => {
+  assert.throws(
+    () => attributedTokenReceipt([{ meta: null }], 'WalletOwner', 'TokenMint'),
+    /metadata unavailable/,
+  )
+})
+
+test('accepts an empty but present token balance set as a secured zero receipt', () => {
+  assert.equal(attributedTokenReceipt([tokenTransaction([], [])], 'WalletOwner', 'TokenMint'), '0')
+})
+
+test('reads a durable close token receipt by position and mint', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'exit-receipt-'))
+  const originalPath = config.dbPath
+  closeDb()
+  config.dbPath = join(directory, 'test.sqlite')
+  const positionPubkey = `receipt-test-position-${Date.now()}`
+  const mint = 'receipt-test-mint'
+  const key = `${CLOSE_RECEIPT_PREFIX}${positionPubkey}:${mint}`
+  try {
+    const db = getDb()
+    assert.equal(readCloseTokenReceipt(positionPubkey, mint), null)
+    db.prepare('INSERT INTO sync_state (key, value, updated_at) VALUES (?, ?, ?)').run(key, '123456', Date.now())
+    assert.equal(readCloseTokenReceipt(positionPubkey, mint), '123456')
+    assert.equal(readCloseTokenReceipt(positionPubkey, 'other-mint'), null)
+  } finally {
+    closeDb()
+    config.dbPath = originalPath
+    rmSync(directory, { recursive: true, force: true })
+  }
+})
 
 test('isolates only newly received close proceeds from an existing wallet balance', () => {
   assert.equal(positiveBalanceDelta(1_000n, 1_450n), 450n)

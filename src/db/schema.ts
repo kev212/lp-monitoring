@@ -23,6 +23,9 @@ export function initSchema(db: Database.Database): void {
       last_estimated_exit_quote REAL,
       last_seen_at INTEGER NOT NULL,
       peak_pnl_percent REAL NOT NULL DEFAULT 0,
+      trailing_disabled INTEGER NOT NULL DEFAULT 0,
+      bin_range_disabled INTEGER NOT NULL DEFAULT 0,
+      position_risk_revision INTEGER NOT NULL DEFAULT 0,
       trailing_activated INTEGER NOT NULL DEFAULT 0,
       strategy TEXT NOT NULL DEFAULT 'unknown',
       precision_curve_enabled INTEGER NOT NULL DEFAULT 0,
@@ -50,7 +53,9 @@ export function initSchema(db: Database.Database): void {
       flip_mode_pending_last_error TEXT,
       drawdown_tp_override_active INTEGER NOT NULL DEFAULT 0,
       auto_rebalance_enabled INTEGER NOT NULL DEFAULT 0,
+      rebalance_mode TEXT NOT NULL DEFAULT 'up',
       rebalance_oor_since INTEGER,
+      rebalance_oor_direction TEXT,
       rebalance_busy INTEGER NOT NULL DEFAULT 0,
       rebalance_last_at INTEGER,
       created_at INTEGER NOT NULL,
@@ -129,6 +134,9 @@ export function initSchema(db: Database.Database): void {
 
   // Add columns for existing DBs that were created before schema update
   const cols = db.prepare("PRAGMA table_info('positions')").all() as any[]
+  for (const column of ['trailing_disabled', 'bin_range_disabled', 'position_risk_revision']) {
+    if (!cols.some(c => c.name === column)) db.exec(`ALTER TABLE positions ADD COLUMN ${column} INTEGER NOT NULL DEFAULT 0`)
+  }
   const hasTokenXSymbol = cols.some((c: any) => c.name === 'token_x_symbol')
   if (!hasTokenXSymbol) {
     db.exec("ALTER TABLE positions ADD COLUMN token_x_symbol TEXT NOT NULL DEFAULT ''")
@@ -295,10 +303,20 @@ export function initSchema(db: Database.Database): void {
   if (!hasAutoRebalanceEnabled) {
     db.exec("ALTER TABLE positions ADD COLUMN auto_rebalance_enabled INTEGER NOT NULL DEFAULT 0")
   }
+  const hasRebalanceMode = cols.some((c: any) => c.name === 'rebalance_mode')
+  if (!hasRebalanceMode) {
+    db.exec("ALTER TABLE positions ADD COLUMN rebalance_mode TEXT NOT NULL DEFAULT 'up'")
+  }
   const hasRebalanceOorSince = cols.some((c: any) => c.name === 'rebalance_oor_since')
   if (!hasRebalanceOorSince) {
     db.exec("ALTER TABLE positions ADD COLUMN rebalance_oor_since INTEGER")
   }
+  const hasRebalanceOorDirection = cols.some((c: any) => c.name === 'rebalance_oor_direction')
+  if (!hasRebalanceOorDirection) {
+    db.exec("ALTER TABLE positions ADD COLUMN rebalance_oor_direction TEXT")
+  }
+  db.exec("UPDATE positions SET rebalance_mode = 'up' WHERE rebalance_mode IS NULL OR rebalance_mode NOT IN ('up', 'down', 'both')")
+  db.exec("UPDATE positions SET rebalance_oor_direction = NULL WHERE rebalance_oor_direction IS NOT NULL AND rebalance_oor_direction NOT IN ('up', 'down')")
   const hasRebalanceBusy = cols.some((c: any) => c.name === 'rebalance_busy')
   if (!hasRebalanceBusy) {
     db.exec("ALTER TABLE positions ADD COLUMN rebalance_busy INTEGER NOT NULL DEFAULT 0")
