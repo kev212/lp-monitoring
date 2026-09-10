@@ -277,6 +277,13 @@ kembali dari arah yang dipilih.
 
 Kedua arah memakai `REBALANCE_OOR_MINUTES` (default 5 menit). Timer diulang
 ketika posisi kembali in-range atau berpindah sisi OOR. Posisi lama tetap Up.
+Durasi OOR dapat diubah dari menu Telegram **Auto Rebalance** melalui tombol
+**Waktu Rebalance** dengan angka bulat 1–1440 menit. Nilai ini berlaku untuk
+semua posisi dan semua arah (Up/Down/Both), tersimpan setelah restart, dan
+menggantikan nilai awal `REBALANCE_OOR_MINUTES`. Mengubah durasi mereset timer
+OOR yang masih menunggu; proses close/reopen yang sudah berjalan tetap
+dilanjutkan dengan durasi terbaru untuk siklus berikutnya.
+
 Down menutup tanpa swap, lalu mendepositkan token hasil close terkonfirmasi
 (termasuk fee dalam token tersebut) dengan lebar bin yang sama dan lower bin
 sama dengan current bin terbaru. Contoh: 3 bin dan current bin 90 menghasilkan

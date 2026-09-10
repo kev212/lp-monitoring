@@ -48,6 +48,7 @@ import {
 } from './meteora/exit.js'
 import { reconcilePendingOpens } from './meteora/open.js'
 import { buildRebalanceRange, rebalanceOorDirection, nextRebalanceTimer, listRebalanceReopenIntents, persistRebalanceReopenIntent, reconcilePendingRebalanceOpens } from './meteora/rebalance.js'
+import { getRebalanceSettings } from './meteora/rebalanceSettings.js'
 import { executeDirectionalPrecisionCurve, THRESHOLD_RATIO, THRESHOLD_MIN, RECOVERY_MS } from './meteora/precisionCurve.js'
 import { calculateFlipProgressPct, executeFlipMode, retryPendingFlipAdd } from './meteora/flipMode.js'
 import { evaluateTrigger, type BinData } from './risk/rules.js'
@@ -1228,12 +1229,13 @@ async function maybeRunAutoRebalance(
     return false
   }
   const direction = rebalanceOorDirection(valuation.poolActiveBinId, valuation.lowerBinId, valuation.upperBinId)
+  const rebalanceSettings = getRebalanceSettings()
   const timer = nextRebalanceTimer({ direction, mode: pos.rebalanceMode,
     since: pos.rebalanceOorSince, previousDirection: pos.rebalanceOorDirection,
-    now: Date.now(), minutes: config.rebalanceOorMinutes })
+    now: Date.now(), minutes: rebalanceSettings.minutes })
   if (timer.since !== pos.rebalanceOorSince || timer.direction !== pos.rebalanceOorDirection) {
     updateRebalanceOorSince(pos.positionPubkey, timer.since, timer.direction)
-    if (timer.direction) console.log(`[rebalance] ${tokenLabel} | OOR ${timer.direction === 'up' ? 'above' : 'below'} — waiting ${config.rebalanceOorMinutes} min`)
+    if (timer.direction) console.log(`[rebalance] ${tokenLabel} | OOR ${timer.direction === 'up' ? 'above' : 'below'} — waiting ${rebalanceSettings.minutes} min`)
   }
   if (getWalletOperation(pos.owner) || pos.rebalanceBusy) return true
   if (!timer.ready || !direction) return false
@@ -1254,6 +1256,8 @@ async function maybeRunAutoRebalance(
     if (!latest || latest.status !== 'monitoring' || !latest.autoRebalanceEnabled || latest.rebalanceBusy
       || latest.rebalanceMode !== pos.rebalanceMode || latest.rebalanceOorSince !== pos.rebalanceOorSince
       || latest.rebalanceOorDirection !== direction) return false
+    // A window change after the timer fired must be re-evaluated, not executed with the stale duration.
+    if (getRebalanceSettings().revision !== rebalanceSettings.revision) return false
     // No awaits between this fresh settings snapshot and the durable claim.
     getDb().transaction(() => {
       persistRebalanceReopenIntent(pos.owner, {
@@ -1272,7 +1276,7 @@ async function maybeRunAutoRebalance(
   if (!accepted) return false
   sendNotification(
     `🔄 <b>Auto Rebalance ${direction.toUpperCase()} — Starting</b>\n\n` +
-    `<b>${tokenLabel}</b>\nOOR ${direction === 'up' ? 'above' : 'below'} for <b>${config.rebalanceOorMinutes} min</b>\n` +
+    `<b>${tokenLabel}</b>\nOOR ${direction === 'up' ? 'above' : 'below'} for <b>${rebalanceSettings.minutes} min</b>\n` +
     `Close without swap; reopen <b>${rangeWidth} bins</b> with ${direction === 'up' ? 'upper' : 'lower'} bin = current bin.\n` +
     `Trailing and bin-trigger settings will be inherited.`
   )

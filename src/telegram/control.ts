@@ -18,6 +18,13 @@ import {
   type OpenPositionPreview,
 } from '../meteora/open.js'
 import { getPool } from '../meteora/positions.js'
+import {
+  getRebalanceSettings,
+  parseRebalanceMinutesInput,
+  setRebalanceOorMinutes,
+  MAX_REBALANCE_MINUTES,
+  MIN_REBALANCE_MINUTES,
+} from '../meteora/rebalanceSettings.js'
 import { calculatePnlPercent, estimateExitValue, type ValuationResult } from '../meteora/valuation.js'
 import { getRiskSettings, updateGlobalRiskSettings, validateRiskSettings, type RiskSettingsPatch } from '../risk/settings.js'
 import { getConnection } from '../solana/connection.js'
@@ -51,12 +58,14 @@ export type DashboardAction =
   | { type: 'precision' }
   | { type: 'flip' }
   | { type: 'rebalance' }
+  | { type: 'rebalance_time' }
 
 type PendingOpenInput =
   | PendingBase & { kind: 'pool'; strategy: OpenLiquidityStrategy }
   | PendingBase & { kind: 'range'; strategy: OpenLiquidityStrategy; poolPubkey: string; quoteSymbol: string }
   | PendingBase & { kind: 'amount'; strategy: OpenLiquidityStrategy; poolPubkey: string; rangePercent: number; quoteSymbol: string }
   | PendingBase & { kind: 'risk'; field: RiskSettingField }
+  | PendingBase & { kind: 'rebalance_time' }
 
 interface PendingBase {
   chatId: string
@@ -181,6 +190,7 @@ export function parseDashboardAction(data: string | undefined): DashboardAction 
   if (parts.length === 2 && parts[1] === 'precision') return { type: 'precision' }
   if (parts.length === 2 && parts[1] === 'flip') return { type: 'flip' }
   if (parts.length === 2 && parts[1] === 'rebal') return { type: 'rebalance' }
+  if (parts.length === 2 && parts[1] === 'rebal_time') return { type: 'rebalance_time' }
   return null
 }
 
@@ -429,6 +439,10 @@ class TelegramDashboardController {
     }
     if (action.type === 'flip') {
       this.menus.showFlip(message.chat.id)
+      return
+    }
+    if (action.type === 'rebalance_time') {
+      await this.startRebalanceTimeInput(chatId, query.from.id.toString(), message.message_id)
       return
     }
     this.menus.showAutoRebalance(message.chat.id)
@@ -808,6 +822,25 @@ class TelegramDashboardController {
     await this.armRiskConfirmation(chatId, userId, messageId, 'trailing_toggle', !settings.trailingEnabled)
   }
 
+  private async startRebalanceTimeInput(chatId: string, userId: string, messageId: number): Promise<void> {
+    const settings = getRebalanceSettings()
+    const prompt = await this.bot.sendMessage(
+      chatId,
+      `Auto Rebalance — Waktu OOR\n` +
+        `Current: ${settings.minutes} menit\n` +
+        `Kirim angka bulat ${MIN_REBALANCE_MINUTES}-${MAX_REBALANCE_MINUTES} menit (contoh: 15).`,
+      { reply_markup: { force_reply: true, input_field_placeholder: '15' } },
+    )
+    this.pendingInput.set(chatId, {
+      kind: 'rebalance_time',
+      chatId,
+      userId,
+      dashboardMessageId: messageId,
+      promptMessageId: prompt.message_id,
+      expiresAt: Date.now() + config.telegramConfirmTtlMs,
+    })
+  }
+
   private async armRiskConfirmation(
     chatId: string,
     userId: string,
@@ -982,6 +1015,22 @@ class TelegramDashboardController {
       }
       this.pendingInput.delete(chatId)
       await this.armRiskConfirmation(chatId, pending.userId, pending.dashboardMessageId, pending.field, value)
+      return
+    }
+
+    if (pending.kind === 'rebalance_time') {
+      const minutes = parseRebalanceMinutesInput(text)
+      if (minutes === null) {
+        await this.bot.sendMessage(chatId, `Input tidak valid. Kirim angka bulat ${MIN_REBALANCE_MINUTES}-${MAX_REBALANCE_MINUTES} menit.`)
+        return
+      }
+      this.pendingInput.delete(chatId)
+      const result = setRebalanceOorMinutes(minutes)
+      await this.bot.sendMessage(
+        chatId,
+        `Waktu rebalance disimpan: ${result.minutes} menit.${result.resetTimers ? ' Timer OOR yang menunggu sudah direset.' : ''}`,
+      )
+      this.menus.showAutoRebalance(chatId)
       return
     }
 

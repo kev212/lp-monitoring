@@ -1,6 +1,7 @@
 import TelegramBot from 'node-telegram-bot-api'
 import { config } from './config.js'
 import { loadActivePositions, updateAutoRebalanceEnabled, updateFlipModeEnabled, updatePrecisionCurveEnabled, updatePrecisionCurveThreshold } from './meteora/discovery.js'
+import { getRebalanceOorMinutes } from './meteora/rebalanceSettings.js'
 import type { ExitCompletionNotification, GlobalRiskSettings, PositionRow, QuoteCurrency, RebalanceMode } from './types.js'
 import { setupTelegramControl } from './telegram/control.js'
 
@@ -285,19 +286,19 @@ function sendFlipMenu(bot: TelegramBot, chatId: number | string): void {
 
 function sendAutoRebalanceMenu(bot: TelegramBot, chatId: number | string): void {
   const positions = loadActivePositions()
-  if (positions.length === 0) {
-    bot.sendMessage(chatId, 'No active positions.', { parse_mode: 'HTML' }).catch(() => undefined)
-    return
-  }
+  const minutes = getRebalanceOorMinutes()
 
   const lines = [
     `<b>Auto Rebalance</b>`,
     sep(),
-    `Default: <b>off</b> | OOR window: <b>${config.rebalanceOorMinutes} min</b>`,
+    `Default: <b>off</b> | OOR window: <b>${minutes} min</b>`,
     `Mode controls sustained OOR above, below, or both; the position is reopened without a swap.`,
     `Down requires quote side Y (token side X); quote side X down is unavailable.`,
-    sep(),
-    ...positions.map((p, idx) => {
+  ]
+  if (positions.length === 0) {
+    lines.push(sep(), 'No active positions.')
+  } else {
+    lines.push(sep(), ...positions.map((p, idx) => {
       const label = `${p.tokenXSymbol || p.tokenXMint.slice(0, 4)}/${p.tokenYSymbol || p.tokenYMint.slice(0, 4)}`
       const state = p.autoRebalanceEnabled ? 'ON' : 'OFF'
       const busy = p.rebalanceBusy ? ' busy' : ''
@@ -306,27 +307,30 @@ function sendAutoRebalanceMenu(bot: TelegramBot, chatId: number | string): void 
         ? '-'
         : `${p.rebalanceOorDirection ? p.rebalanceOorDirection.toUpperCase() + ' ' : ''}${Math.max(0, Math.round((Date.now() - p.rebalanceOorSince) / 1000))}s ago`
       return `${idx + 1}. <b>${label}</b> <code>${shortAddr(p.positionPubkey)}</code> — <b>${state}</b>${busy}\nMode: <b>${rebalanceModeLabel(p.rebalanceMode)}</b> | OOR timer: <b>${timer}</b>\nLast rebalance: <b>${last}</b>`
-    })
-  ]
+    }))
+  }
 
   bot.sendMessage(chatId, lines.join('\n'), {
     parse_mode: 'HTML',
     disable_web_page_preview: true,
     reply_markup: {
-      inline_keyboard: positions.flatMap(p => {
-        const label = `${p.tokenXSymbol || p.tokenXMint.slice(0, 4)}/${p.tokenYSymbol || p.tokenYMint.slice(0, 4)} ${shortAddr(p.positionPubkey)}`
-        return [
-          [
-            { text: p.rebalanceMode === 'up' ? '✅ Up' : 'Up', callback_data: `rebal:mode:up:${p.positionPubkey}` },
-            { text: p.rebalanceMode === 'down' ? '✅ Down' : 'Down', callback_data: `rebal:mode:down:${p.positionPubkey}` },
-            { text: p.rebalanceMode === 'both' ? '✅ Both' : 'Both', callback_data: `rebal:mode:both:${p.positionPubkey}` },
-          ],
-          [
-            { text: p.autoRebalanceEnabled ? `Disable ${label}` : `Enable ${label}`, callback_data: `rebal:${p.autoRebalanceEnabled ? 'off' : 'on'}:${p.positionPubkey}` },
-            { text: 'Status', callback_data: `rebal:status:${p.positionPubkey}` },
-          ],
-        ]
-      })
+      inline_keyboard: [
+        ...positions.flatMap(p => {
+          const label = `${p.tokenXSymbol || p.tokenXMint.slice(0, 4)}/${p.tokenYSymbol || p.tokenYMint.slice(0, 4)} ${shortAddr(p.positionPubkey)}`
+          return [
+            [
+              { text: p.rebalanceMode === 'up' ? '✅ Up' : 'Up', callback_data: `rebal:mode:up:${p.positionPubkey}` },
+              { text: p.rebalanceMode === 'down' ? '✅ Down' : 'Down', callback_data: `rebal:mode:down:${p.positionPubkey}` },
+              { text: p.rebalanceMode === 'both' ? '✅ Both' : 'Both', callback_data: `rebal:mode:both:${p.positionPubkey}` },
+            ],
+            [
+              { text: p.autoRebalanceEnabled ? `Disable ${label}` : `Enable ${label}`, callback_data: `rebal:${p.autoRebalanceEnabled ? 'off' : 'on'}:${p.positionPubkey}` },
+              { text: 'Status', callback_data: `rebal:status:${p.positionPubkey}` },
+            ],
+          ]
+        }),
+        [{ text: `⏱ Waktu Rebalance: ${minutes} menit`, callback_data: 'lpd:rebal_time' }],
+      ]
     }
   }).catch(err => {
     console.log(`[telegram] auto rebalance menu failed: ${err.message}`)
@@ -417,7 +421,7 @@ function autoRebalanceStatusText(pos: ReturnType<typeof loadActivePositions>[num
     `${label} ${shortAddr(pos.positionPubkey)}`,
     `Auto Rebalance: ${pos.autoRebalanceEnabled ? 'ON' : 'OFF'}`,
     `Mode: ${rebalanceModeLabel(pos.rebalanceMode)}`,
-    `OOR window: ${config.rebalanceOorMinutes} min`,
+    `OOR window: ${getRebalanceOorMinutes()} min`,
     `OOR direction: ${pos.rebalanceOorDirection?.toUpperCase() ?? '-'}`,
     `Trailing: ${pos.trailingDisabled ? 'OFF' : 'ON'} (position setting)`,
     `Bin Trigger: ${pos.binRangeDisabled ? 'OFF' : 'ON'} (position setting)`,

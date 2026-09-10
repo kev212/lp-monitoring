@@ -19,6 +19,7 @@ test('parses compact dashboard actions and rejects malformed callbacks', () => {
   assert.deepEqual(parseDashboardAction('lpd:strategy:curve'), { type: 'open_strategy', strategy: 'curve' })
   assert.deepEqual(parseDashboardAction('lpd:oc:abc123'), { type: 'open_confirm', token: 'abc123' })
   assert.deepEqual(parseDashboardAction('lpd:rebal'), { type: 'rebalance' })
+  assert.deepEqual(parseDashboardAction('lpd:rebal_time'), { type: 'rebalance_time' })
   assert.equal(parseDashboardAction('lpd:strategy:invalid'), null)
   assert.equal(parseDashboardAction('lpd:refresh:-1'), null)
   assert.equal(parseDashboardAction('other:refresh:0'), null)
