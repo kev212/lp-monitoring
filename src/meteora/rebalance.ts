@@ -87,11 +87,15 @@ export interface RebalanceReopenIntent {
   closeRequested: boolean
   closePnlPercent: number
   closeEstimatedQuote: number
+  lastNotifyKey: string | null
+  lastNotifyAt: number | null
 }
+
+const REBALANCE_NOTIFY_COOLDOWN_MS = 15 * 60_000
 
 export function persistRebalanceReopenIntent(
   owner: string,
-  intent: Omit<RebalanceReopenIntent, 'version' | 'owner' | 'openPositionPubkey' | 'openSignature' | 'createdAt'>,
+  intent: Omit<RebalanceReopenIntent, 'version' | 'owner' | 'openPositionPubkey' | 'openSignature' | 'createdAt' | 'lastNotifyKey' | 'lastNotifyAt'>,
 ): void {
   const value: RebalanceReopenIntent = {
     version: 2,
@@ -100,6 +104,8 @@ export function persistRebalanceReopenIntent(
     openPositionPubkey: null,
     openSignature: null,
     createdAt: Date.now(),
+    lastNotifyKey: null,
+    lastNotifyAt: null,
   }
   getDb().prepare('INSERT INTO sync_state (key, value, updated_at) VALUES (?, ?, ?)')
     .run(`${REBALANCE_REOPEN_PREFIX}${owner}`, JSON.stringify(value), value.createdAt)
@@ -160,6 +166,8 @@ export function listRebalanceReopenIntents(): RebalanceReopenIntent[] {
         closeRequested: parsed.closeRequested ?? false,
         closePnlPercent: parsed.closePnlPercent ?? 0,
         closeEstimatedQuote: parsed.closeEstimatedQuote ?? 0,
+        lastNotifyKey: typeof parsed.lastNotifyKey === 'string' ? parsed.lastNotifyKey : null,
+        lastNotifyAt: Number.isSafeInteger(parsed.lastNotifyAt) ? parsed.lastNotifyAt as number : null,
       }
       return [intent]
     } catch {
@@ -194,6 +202,33 @@ export function isTerminalRebalanceOpenError(error: unknown): boolean {
     || message === 'Rebalance close returned no deposit token'
     || message === 'Down rebalance is unsupported when the quote token is X'
     || message === 'Down rebalance token mint must match pool token X'
+    || /Insufficient .+ balance/.test(message)
+}
+
+/**
+ * Sends at most one notification per cooldown for the same category (key),
+ * persisting the marker in the durable intent so restarts cannot un-throttle it.
+ */
+function notifyRebalanceIntent(
+  intent: RebalanceReopenIntent,
+  key: string,
+  message: string,
+  notify: typeof sendNotification,
+): boolean {
+  const now = Date.now()
+  if (
+    intent.lastNotifyKey === key
+    && intent.lastNotifyAt !== null
+    && now - intent.lastNotifyAt < REBALANCE_NOTIFY_COOLDOWN_MS
+  ) {
+    return false
+  }
+  intent.lastNotifyKey = key
+  intent.lastNotifyAt = now
+  getDb().prepare('UPDATE sync_state SET value = ?, updated_at = ? WHERE key = ?')
+    .run(JSON.stringify(intent), now, `${REBALANCE_REOPEN_PREFIX}${intent.owner}`)
+  notify(message)
+  return true
 }
 
 export type RebalanceCloseDisposition = 'deferred' | 'failed' | 'ok'
@@ -348,11 +383,15 @@ export async function reconcilePendingRebalanceOpens(
         if (err instanceof OpenSubmissionPendingError) {
           updateRebalanceReopenAttempt(owner, err.positionPubkey, err.signature)
           console.log(`[rebalance] reopen ${pair} attempt submitted ${err.positionPubkey.slice(0, 8)} — waiting for finality reconciliation`)
-          services.notify(
+          const latest = listRebalanceReopenIntents().find(item => item.owner === owner) ?? intent
+          notifyRebalanceIntent(
+            latest,
+            `pending:${err.signature}`,
             `⏳ <b>Auto Rebalance — Reopen In Progress</b>\n\n` +
             `Position: <code>${intent.positionPubkey}</code>\n` +
             `Open tx: <a href="https://solscan.io/tx/${err.signature}">${err.signature.slice(0, 6)}..${err.signature.slice(-4)}</a>\n` +
-            `Menunggu finalisasi open; notifikasi sukses menyusul.`
+            `Menunggu finalisasi open; notifikasi sukses menyusul.`,
+            services.notify,
           )
           continue
         }
@@ -369,13 +408,16 @@ export async function reconcilePendingRebalanceOpens(
           )
           continue
         }
-        console.log(`[rebalance] reopen ${pair} attempt failed: ${message}`)
-        services.notify(
+        const notified = notifyRebalanceIntent(
+          intent,
+          `retry:${message}`,
           `⚠️ <b>Auto Rebalance Reopen Retrying</b>\n\n` +
           `Position: <code>${intent.positionPubkey}</code>\n` +
           `Reason: <code>${message}</code>\n\n` +
-          `Bot will retry the reopen automatically.`
+          `Bot will retry the reopen automatically.`,
+          services.notify,
         )
+        if (notified) console.log(`[rebalance] reopen ${pair} attempt failed: ${message}`)
       }
     }
   })

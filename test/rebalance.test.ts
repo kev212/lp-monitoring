@@ -118,5 +118,7 @@ test('stops retrying deterministic range-cost failures but retries transient err
   assert.equal(isTerminalRebalanceOpenError(new Error('Range requires 2 setup transactions; reduce the percentage range')), true)
   assert.equal(isTerminalRebalanceOpenError(new Error('Range requires 2 positions; reduce the percentage range')), true)
   assert.equal(isTerminalRebalanceOpenError(new Error('Insufficient SOL; keep 0.02 SOL plus estimated position rent for fees')), false)
+  assert.equal(isTerminalRebalanceOpenError(new Error('Insufficient USDC balance')), true)
+  assert.equal(isTerminalRebalanceOpenError(new Error('Insufficient TOKEN balance')), true)
   assert.equal(isTerminalRebalanceOpenError(new Error('RPC request failed')), false)
 })

@@ -135,8 +135,7 @@ test('a failed linked open is not resubmitted, and in-progress risk settings are
   assert.equal(listRebalanceReopenIntents().length, 0)
 }))
 
-test('Down waits for a position-specific receipt and persists its exact raw amount before reopening', async () => database(async () => {
-  upsertPosition({ ...row, status: 'closed' })
+test('Down waits for a position-specific receipt and persists its exact raw amount before reopening', async () => database(async () => {  upsertPosition({ ...row, status: 'closed' })
   persistRebalanceReopenIntent(owner, { ...intent, tokenAmountRaw: null })
   let calls = 0
   const services: RebalanceReconcileServices = {
@@ -159,4 +158,35 @@ test('Down waits for a position-specific receipt and persists its exact raw amou
   await reconcilePendingRebalanceOpens(connection, wallet, services)
   assert.equal(calls, 1)
   assert.equal(listRebalanceReopenIntents().length, 0)
+}))
+
+test('throttles repeated reopen retry notifications for the same failure', async () => database(async () => {
+  upsertPosition({ ...row, status: 'closed' })
+  persistRebalanceReopenIntent(owner, intent)
+  let notifications = 0
+  const services: RebalanceReconcileServices = {
+    notify: () => { notifications++ },
+    close: async () => { assert.fail('closed position must not be closed again') },
+    open: async () => { throw new Error('RPC request failed') },
+  }
+  await reconcilePendingRebalanceOpens(connection, wallet, services)
+  await reconcilePendingRebalanceOpens(connection, wallet, services)
+  await reconcilePendingRebalanceOpens(connection, wallet, services)
+  assert.equal(notifications, 1)
+  assert.equal(listRebalanceReopenIntents().length, 1)
+}))
+
+test('stops reopening when the funding balance is insufficient', async () => database(async () => {
+  upsertPosition({ ...row, status: 'closed' })
+  persistRebalanceReopenIntent(owner, intent)
+  const notifications: string[] = []
+  const services: RebalanceReconcileServices = {
+    notify: message => { notifications.push(message) },
+    close: async () => { assert.fail('closed position must not be closed again') },
+    open: async () => { throw new Error('Insufficient USDC balance') },
+  }
+  await reconcilePendingRebalanceOpens(connection, wallet, services)
+  assert.equal(listRebalanceReopenIntents().length, 0)
+  assert.equal(notifications.length, 1)
+  assert.match(notifications[0], /Reopen Stopped/)
 }))
