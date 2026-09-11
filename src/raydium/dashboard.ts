@@ -2,6 +2,7 @@ import type { Connection, Keypair } from '@solana/web3.js'
 import { getSyncValue, setSyncValue } from '../db/client.js'
 import { formatCompactPrice } from '../telegram/binDisplay.js'
 import type { RebalanceDirection, RebalanceMode } from '../types.js'
+import { computeRaydiumPositionFees, type RaydiumPositionFees } from './fees.js'
 import { loadRaydiumPool, rayDiumPairLabel } from './pool.js'
 import { raydiumOorDirection } from './policy.js'
 import { listRaydiumWalletPositions } from './positions.js'
@@ -129,6 +130,7 @@ export async function refreshRaydiumDashboardSnapshot(
   try {
     const positions = await listRaydiumWalletPositions(connection, wallet)
     const pools = new Map<string, Awaited<ReturnType<typeof loadRaydiumPool>>>()
+    const feeCache = new Map<string, Map<string, RaydiumPositionFees>>()
     const usdRates = new Map<string, number | null>()
     const entries: RaydiumDashboardPosition[] = []
     for (const position of positions) {
@@ -137,6 +139,18 @@ export async function refreshRaydiumDashboardSnapshot(
         loaded = await loadRaydiumPool(connection, wallet, position.poolId)
         pools.set(position.poolId, loaded)
       }
+      if (!feeCache.has(position.poolId)) {
+        feeCache.set(
+          position.poolId,
+          await computeRaydiumPositionFees(
+            connection,
+            loaded.bundle,
+            positions.filter(candidate => candidate.poolId === position.poolId),
+          ),
+        )
+      }
+      const positionFees = feeCache.get(position.poolId)?.get(position.nftMint)
+        ?? { feeA: position.feeOwedA, feeB: position.feeOwedB }
       const { bundle, state: pool } = loaded
       const amounts = raydiumPositionAmounts({
         bundle,
@@ -150,8 +164,8 @@ export async function refreshRaydiumDashboardSnapshot(
       const priceCurrent = pool.currentPrice > 0 ? pool.currentPrice : null
       const value = raydiumPositionValue({
         amounts,
-        feeOwedA: position.feeOwedA,
-        feeOwedB: position.feeOwedB,
+        feeOwedA: positionFees.feeA,
+        feeOwedB: positionFees.feeB,
         mintADecimals: pool.mintADecimals,
         mintBDecimals: pool.mintBDecimals,
         priceAInB: priceCurrent ?? 0,
