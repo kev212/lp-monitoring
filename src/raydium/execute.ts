@@ -20,6 +20,7 @@ import {
 } from '@solana/web3.js'
 import type { Signer } from '@solana/web3.js'
 import { config } from '../config.js'
+import { getTokenPricesInUsd } from '../pricing.js'
 import { withRpcFallback } from '../solana/connection.js'
 import { getJupiterSwapQuote } from '../swap.js'
 import { buildRaydiumInRangeRange, pricePercentToTicks, type RaydiumTickRange } from './policy.js'
@@ -28,6 +29,7 @@ import { getRaydium } from './sdk.js'
 import { raydiumUsdPerQuote } from './valuation.js'
 
 const WSOL_MINT = 'So11111111111111111111111111111111111111112'
+const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
 const MAX_TX_BYTES = 1232
 const CLOSE_MEASURE_TIMEOUT_MS = 45_000
 const CLOSE_MEASURE_POLL_MS = 1_000
@@ -406,10 +408,19 @@ export async function prepareRaydiumRebalance(
   )
   if (liquidity.lten(0)) throw new Error('Raydium plan produced zero liquidity')
 
-  const depositValueQuote =
-    toNumber(usableB) / 10 ** state.mintBDecimals + (toNumber(usableA) / 10 ** state.mintADecimals) * state.currentPrice
-  const usdPerQuote = await raydiumUsdPerQuote(state.mintB)
-  const depositValueUsd = usdPerQuote === null ? null : depositValueQuote * usdPerQuote
+  const depositAmountA = toNumber(usableA) / 10 ** state.mintADecimals
+  const depositAmountB = toNumber(usableB) / 10 ** state.mintBDecimals
+  const usdPrices = await getTokenPricesInUsd([state.mintA, state.mintB])
+  const usdPerA = state.mintA === USDC_MINT ? 1 : usdPrices.get(state.mintA)
+  const usdPerB = state.mintB === USDC_MINT ? 1 : usdPrices.get(state.mintB)
+  let depositValueUsd: number | null
+  if (usdPerA !== undefined && usdPerA > 0 && usdPerB !== undefined && usdPerB > 0) {
+    depositValueUsd = depositAmountA * usdPerA + depositAmountB * usdPerB
+  } else {
+    const depositValueQuote = depositAmountA * state.currentPrice + depositAmountB
+    const usdPerQuote = await raydiumUsdPerQuote(state.mintB)
+    depositValueUsd = usdPerQuote === null ? null : depositValueQuote * usdPerQuote
+  }
 
   const maxA = new BN(postA.toString())
   const maxB = new BN(postB.toString())

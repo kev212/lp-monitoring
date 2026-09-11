@@ -1,5 +1,6 @@
 import type { Connection, Keypair } from '@solana/web3.js'
 import { getSyncValue, setSyncValue } from '../db/client.js'
+import { getTokenPricesInUsd } from '../pricing.js'
 import { formatCompactPrice } from '../telegram/binDisplay.js'
 import type { RebalanceDirection, RebalanceMode } from '../types.js'
 import { computeRaydiumPositionFees, type RaydiumPositionFees } from './fees.js'
@@ -18,12 +19,14 @@ import {
   raydiumPositionValue,
   raydiumPriceAtTick,
   raydiumUsdPerQuote,
+  raydiumUsdValue,
 } from './valuation.js'
 
 const SNAPSHOT_KEY = 'raydium_dashboard'
 const SNAPSHOT_VERSION = 2
 const REFRESH_INTERVAL_MS = 30_000
 const RANGE_BAR_WIDTH = 10
+const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
 
 export interface RaydiumDashboardPosition {
   nftMint: string
@@ -130,15 +133,23 @@ export async function refreshRaydiumDashboardSnapshot(
   try {
     const positions = await listRaydiumWalletPositions(connection, wallet)
     const pools = new Map<string, Awaited<ReturnType<typeof loadRaydiumPool>>>()
+    for (const position of positions) {
+      if (!pools.has(position.poolId)) {
+        pools.set(position.poolId, await loadRaydiumPool(connection, wallet, position.poolId))
+      }
+    }
+    const mints = new Set<string>()
+    for (const loaded of pools.values()) {
+      mints.add(loaded.state.mintA)
+      mints.add(loaded.state.mintB)
+    }
+    const usdPrices = await getTokenPricesInUsd([...mints])
+
     const feeCache = new Map<string, Map<string, RaydiumPositionFees>>()
     const usdRates = new Map<string, number | null>()
     const entries: RaydiumDashboardPosition[] = []
     for (const position of positions) {
-      let loaded = pools.get(position.poolId)
-      if (!loaded) {
-        loaded = await loadRaydiumPool(connection, wallet, position.poolId)
-        pools.set(position.poolId, loaded)
-      }
+      const loaded = pools.get(position.poolId)!
       if (!feeCache.has(position.poolId)) {
         feeCache.set(
           position.poolId,
@@ -158,19 +169,33 @@ export async function refreshRaydiumDashboardSnapshot(
         tickLower: position.tickLower,
         tickUpper: position.tickUpper,
       })
-      if (!usdRates.has(pool.mintB)) {
-        usdRates.set(pool.mintB, await raydiumUsdPerQuote(pool.mintB))
-      }
+      const usdPerA = pool.mintA === USDC_MINT ? 1 : usdPrices.get(pool.mintA)
+      const usdPerB = pool.mintB === USDC_MINT ? 1 : usdPrices.get(pool.mintB)
       const priceCurrent = pool.currentPrice > 0 ? pool.currentPrice : null
-      const value = raydiumPositionValue({
-        amounts,
-        feeOwedA: positionFees.feeA,
-        feeOwedB: positionFees.feeB,
-        mintADecimals: pool.mintADecimals,
-        mintBDecimals: pool.mintBDecimals,
-        priceAInB: priceCurrent ?? 0,
-        usdPerQuote: usdRates.get(pool.mintB) ?? null,
-      })
+      const useJupiter = usdPerA !== undefined && usdPerA > 0 && usdPerB !== undefined && usdPerB > 0
+      let value: { valueUsd: number | null; feeValueUsd: number | null }
+      if (useJupiter) {
+        value = raydiumUsdValue({
+          amounts,
+          feeOwedA: positionFees.feeA,
+          feeOwedB: positionFees.feeB,
+          mintADecimals: pool.mintADecimals,
+          mintBDecimals: pool.mintBDecimals,
+          usdPerA,
+          usdPerB,
+        })
+      } else {
+        if (!usdRates.has(pool.mintB)) usdRates.set(pool.mintB, await raydiumUsdPerQuote(pool.mintB))
+        value = raydiumPositionValue({
+          amounts,
+          feeOwedA: positionFees.feeA,
+          feeOwedB: positionFees.feeB,
+          mintADecimals: pool.mintADecimals,
+          mintBDecimals: pool.mintBDecimals,
+          priceAInB: priceCurrent ?? 0,
+          usdPerQuote: usdRates.get(pool.mintB) ?? null,
+        })
+      }
 
       let positionState = getRaydiumPositionState(position.nftMint)
       if (positionState?.basisUsd == null && value.valueUsd !== null) {

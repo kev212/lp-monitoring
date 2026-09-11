@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { raydiumPnl, raydiumPositionValue, raydiumPriceAtSqrtX64, raydiumUsdPerQuote } from '../src/raydium/valuation.js'
+import { raydiumPnl, raydiumPositionValue, raydiumPriceAtSqrtX64, raydiumUsdPerQuote, raydiumUsdValue } from '../src/raydium/valuation.js'
 
 const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
 
@@ -46,6 +46,21 @@ test('computes PnL in USD and percent from a basis', () => {
   assert.equal(raydiumPnl(null, 913.4), null)
   assert.equal(raydiumPnl(934.5, null), null)
   assert.equal(raydiumPnl(934.5, 0), null)
+})
+
+test('values a position and its claimable fees from per-token Jupiter prices', () => {
+  const value = raydiumUsdValue({
+    amounts: { amountA: 331.137752, amountB: 3019.846389 },
+    feeOwedA: 11_793_164n,
+    feeOwedB: 0n,
+    mintADecimals: 6,
+    mintBDecimals: 6,
+    usdPerA: 7.506202166142409,
+    usdPerB: 1,
+  })
+
+  assert.ok(Math.abs(value.valueUsd - (331.137752 * 7.506202166142409 + 3019.846389)) < 1e-9)
+  assert.ok(Math.abs(value.feeValueUsd - 11.793164 * 7.506202166142409) < 1e-9)
 })
 
 test('derives the human price from a Q64.64 sqrt price and decimals', () => {

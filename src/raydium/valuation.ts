@@ -86,6 +86,32 @@ export function raydiumPnl(valueUsd: number | null, basisUsd: number | null): Ra
   return { pnlUsd, pnlPercent: (pnlUsd / basisUsd) * 100 }
 }
 
+export interface RaydiumUsdValue {
+  valueUsd: number
+  feeValueUsd: number
+}
+
+/**
+ * USD value and claimable fees from per-token Jupiter prices, which are more
+ * precise than deriving one side from the pool spot price.
+ */
+export function raydiumUsdValue(input: {
+  amounts: RaydiumPositionAmounts
+  feeOwedA: bigint
+  feeOwedB: bigint
+  mintADecimals: number
+  mintBDecimals: number
+  usdPerA: number
+  usdPerB: number
+}): RaydiumUsdValue {
+  const feeA = Number(input.feeOwedA.toString()) / 10 ** input.mintADecimals
+  const feeB = Number(input.feeOwedB.toString()) / 10 ** input.mintBDecimals
+  return {
+    valueUsd: input.amounts.amountA * input.usdPerA + input.amounts.amountB * input.usdPerB,
+    feeValueUsd: feeA * input.usdPerA + feeB * input.usdPerB,
+  }
+}
+
 /** USD value of one quote token; null when no price feed is available. */
 export async function raydiumUsdPerQuote(mintB: string): Promise<number | null> {
   try {
