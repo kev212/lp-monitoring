@@ -29,6 +29,8 @@ function pool(
     mintB: { symbol: `${id}-B`, address: `${id}-mint-b` },
     hasDynamicFee: false,
     config: { tradeFeeRate, protocolFeeRate: 0, fundFeeRate: 0 },
+    day: { volumeFee: 0, volume: 0 },
+    week: { volume: 0 },
     ...overrides,
   }
 }
@@ -90,6 +92,7 @@ test('paginates Raydium CLMM pools, stops at the TVL boundary, and ranks by esti
     http,
     sleep: async () => undefined,
     dsRateLimitPerMinute: 1_000,
+    dexBatchSize: 1,
   })
   const result = await scanner.scan()
 
@@ -131,7 +134,7 @@ test('uses the configured LP share, rejects dynamic/invalid pools, and requires 
     }
     return response({ pairs: [dexPair('valid', 100_000)] })
   }
-  const scanner = createRaydiumPoolScanner({ http, sleep: async () => undefined, dsRateLimitPerMinute: 1_000 })
+  const scanner = createRaydiumPoolScanner({ http, sleep: async () => undefined, dsRateLimitPerMinute: 1_000, dexBatchSize: 1 })
   const result = await scanner.scan()
 
   assert.equal(result.stats.discovered, 5)
@@ -275,7 +278,7 @@ test('requires volume.h1 and treats an explicit zero hour as valid low volume', 
       ? response({ pairs: [{ ...dexPair(poolId, 0), volume: { h24: 1_000_000 } }] })
       : response({ pairs: [dexPair(poolId, 0)] })
   }
-  const scanner = createRaydiumPoolScanner({ http, sleep: async () => undefined, dsRateLimitPerMinute: 1_000 })
+  const scanner = createRaydiumPoolScanner({ http, sleep: async () => undefined, dsRateLimitPerMinute: 1_000, dexBatchSize: 1 })
   const result = await scanner.scan()
 
   assert.equal(result.stats.checked, 2)
@@ -303,7 +306,7 @@ test('continues past whitespace TVL and deduplicates candidates across pages', a
     checked.push(poolId)
     return response({ pairs: [dexPair(poolId, 20_000)] })
   }
-  const result = await createRaydiumPoolScanner({ http, dsRateLimitPerMinute: 1_000 }).scan()
+  const result = await createRaydiumPoolScanner({ http, dsRateLimitPerMinute: 1_000, dexBatchSize: 1 }).scan()
   assert.equal(listCalls, 2)
   assert.equal(result.partial, false)
   assert.equal(result.stats.invalid, 1)
@@ -336,6 +339,7 @@ test('limits DexScreener to four concurrent requests and 240 starts per minute',
     sleep: async milliseconds => { currentTime += milliseconds },
     dsConcurrency: 4,
     dsRateLimitPerMinute: 240,
+    dexBatchSize: 1,
   })
   const result = await scanner.scan()
 
@@ -356,7 +360,7 @@ test('uses deterministic pool-id ordering when the top-ten scores tie', async ()
     const poolId = decodeURIComponent(url.slice(url.lastIndexOf('/') + 1))
     return response({ pairs: [dexPair(poolId, 20_000)] })
   }
-  const scanner = createRaydiumPoolScanner({ http, sleep: async () => undefined, dsRateLimitPerMinute: 1_000 })
+  const scanner = createRaydiumPoolScanner({ http, sleep: async () => undefined, dsRateLimitPerMinute: 1_000, dexBatchSize: 1 })
   const result = await scanner.scan()
 
   assert.deepEqual(result.pools.map(item => item.poolId), poolIds.slice(0, 10))
@@ -381,4 +385,108 @@ test('does not infer static fees from missing flags or whitespace fee rates', as
   assert.equal(result.stats.eligible, 0)
   assert.equal(result.stats.invalid, 2)
   assert.equal(result.stats.checked, 0)
+})
+
+test('shortlists the top daily fee yields and skips the rest without DexScreener calls', async () => {
+  const pools = [
+    pool('high', 10_000, 10_000, { day: { volumeFee: 1_000, volume: 100_000 }, week: { volume: 700_000 } }),
+    pool('mid', 10_000, 10_000, { day: { volumeFee: 100, volume: 50_000 }, week: { volume: 350_000 } }),
+    pool('low', 10_000, 10_000, { day: { volumeFee: 1, volume: 1_000 }, week: { volume: 7_000 } }),
+  ]
+  const dexUrls: string[] = []
+  const http: RaydiumHttpClient = async url => {
+    if (url.includes('/pools/info/list-v2')) return response({ success: true, data: { data: pools } })
+    dexUrls.push(url)
+    const poolId = decodeURIComponent(url.slice(url.lastIndexOf('/') + 1))
+    return response({ pairs: [dexPair(poolId, 20_000)] })
+  }
+  const result = await createRaydiumPoolScanner({
+    http,
+    sleep: async () => undefined,
+    dsRateLimitPerMinute: 1_000,
+    dexBatchSize: 1,
+    prefilterTopN: 2,
+  }).scan()
+
+  assert.equal(result.stats.eligible, 3)
+  assert.equal(result.stats.shortlisted, 2)
+  assert.equal(result.stats.prefilterSkipped, 1)
+  assert.equal(result.stats.checked, 2)
+  assert.deepEqual(
+    dexUrls.map(url => decodeURIComponent(url.slice(url.lastIndexOf('/') + 1))).sort(),
+    ['high', 'mid'],
+  )
+  assert.deepEqual(result.pools.map(item => item.poolId).sort(), ['high', 'mid'])
+})
+
+test('adds a heating-up pool to the shortlist when day volume outpaces the weekly average', async () => {
+  const pools = [
+    pool('calm', 10_000, 10_000, { day: { volumeFee: 1_000, volume: 10_000 }, week: { volume: 70_000 } }),
+    pool('heating', 10_000, 10_000, { day: { volumeFee: 1, volume: 100_000 }, week: { volume: 70_000 } }),
+  ]
+  const checkedIds: string[] = []
+  const http: RaydiumHttpClient = async url => {
+    if (url.includes('/pools/info/list-v2')) return response({ success: true, data: { data: pools } })
+    const poolId = decodeURIComponent(url.slice(url.lastIndexOf('/') + 1))
+    checkedIds.push(poolId)
+    return response({ pairs: [dexPair(poolId, 20_000)] })
+  }
+  const result = await createRaydiumPoolScanner({
+    http,
+    sleep: async () => undefined,
+    dsRateLimitPerMinute: 1_000,
+    dexBatchSize: 1,
+    prefilterTopN: 1,
+    momentumRatioMin: 5,
+  }).scan()
+
+  assert.deepEqual(checkedIds.sort(), ['calm', 'heating'])
+  assert.equal(result.stats.shortlisted, 2)
+  assert.equal(result.stats.prefilterSkipped, 0)
+})
+
+test('batches DexScreener lookups and maps every pair address', async () => {
+  const poolIds = Array.from({ length: 31 }, (_, index) => `batch-${String(index + 1).padStart(2, '0')}`)
+  const dexRequests: string[] = []
+  const http: RaydiumHttpClient = async url => {
+    if (url.includes('/pools/info/list-v2')) {
+      return response({ success: true, data: { data: poolIds.map(id => pool(id, 10_000, 10_000)) } })
+    }
+    dexRequests.push(url)
+    const ids = decodeURIComponent(url.slice(url.lastIndexOf('/') + 1)).split(',')
+    return response({ pairs: ids.map(id => dexPair(id, 20_000)) })
+  }
+  const result = await createRaydiumPoolScanner({
+    http,
+    sleep: async () => undefined,
+    dsRateLimitPerMinute: 1_000,
+    dexBatchSize: 30,
+  }).scan()
+
+  assert.equal(dexRequests.length, 2)
+  assert.equal((dexRequests[0].match(/,/g) ?? []).length, 29)
+  assert.equal(result.stats.checked, 31)
+  assert.equal(result.stats.invalid, 0)
+  assert.equal(result.stats.belowVolume, 0)
+  assert.equal(result.pools.length, 10)
+})
+
+test('counts pools missing from a batch response as invalid', async () => {
+  const http: RaydiumHttpClient = async url => {
+    if (url.includes('/pools/info/list-v2')) {
+      return response({ success: true, data: { data: [pool('present', 10_000, 10_000), pool('absent', 10_000, 10_000)] } })
+    }
+    return response({ pairs: [dexPair('present', 20_000)] })
+  }
+  const result = await createRaydiumPoolScanner({
+    http,
+    sleep: async () => undefined,
+    dsRateLimitPerMinute: 1_000,
+    dexBatchSize: 30,
+  }).scan()
+
+  assert.equal(result.stats.checked, 2)
+  assert.equal(result.stats.invalid, 1)
+  assert.equal(result.pools.length, 1)
+  assert.equal(result.pools[0].poolId, 'present')
 })

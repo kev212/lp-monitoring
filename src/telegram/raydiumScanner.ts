@@ -13,11 +13,11 @@ const usd = (value: number): string => `$${value.toLocaleString('en-US', { minim
 export function formatRaydiumPoolScan(result: RaydiumPoolScanResult): string[] {
   const stats = result.stats
   const blocks = [
-    `<b>Raydium CLMM — Top ${result.pools.length} yield/jam</b>\n`
-    + `Filter: TVL ≥ US$5.000 · volume aktual 1h ≥ US$20.000\n`
-    + `${result.partial ? '<b>Scan parsial</b>' : 'Scan selesai'} · ${stats.checked}/${stats.eligible} kandidat diperiksa\n`
-    + `Pool ditemukan: ${stats.discovered} · gagal: ${stats.failed}\n`
-    + `Dilewati: volume rendah ${stats.belowVolume}, dynamic fee ${stats.dynamicFee}, data tidak valid ${stats.invalid}\n`
+        `<b>Raydium CLMM — Top ${result.pools.length} yield/jam</b>\n`
+        + `Filter: TVL ≥ US$5.000 · volume aktual 1h ≥ US$20.000\n`
+        + `${result.partial ? '<b>Scan parsial</b>' : 'Scan selesai'} · ${stats.checked}/${stats.shortlisted} kandidat shortlist diperiksa\n`
+        + `Pool ditemukan: ${stats.discovered} · eligible ${stats.eligible} · shortlist ${stats.shortlisted} (dilewati ${stats.prefilterSkipped})\n`
+        + `Dilewati: volume rendah ${stats.belowVolume}, dynamic fee ${stats.dynamicFee}, data tidak valid ${stats.invalid} · gagal ${stats.failed}\n`
     + `Pengambilan: ${new Date(result.startedAt).toISOString()} – ${new Date(result.completedAt).toISOString()}\n`
     + `Sumber: Raydium (TVL/config), DEX Screener (volume 1h)`,
   ]
@@ -74,7 +74,7 @@ export function registerRaydiumScanCommand(
         }).catch(() => undefined).finally(() => { updating = false })
       }, 60_000)
       const result = await scan(p => {
-        progress = `${p.discovered} pool ditemukan, ${p.checked} kandidat diperiksa.`
+          progress = `${p.discovered} pool ditemukan, ${p.checked}/${p.shortlisted} kandidat shortlist diperiksa.`
       })
       clearInterval(timer)
       for (const message of formatRaydiumPoolScan(result)) {

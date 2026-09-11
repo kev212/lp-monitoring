@@ -82,6 +82,8 @@ function result(overrides: Partial<ScanResult> = {}): ScanResult {
     stats: {
       discovered: 1,
       eligible: 1,
+      shortlisted: 1,
+      prefilterSkipped: 0,
       checked: 1,
       failed: 0,
       belowVolume: 0,
@@ -218,6 +220,8 @@ test('reports both filters and an empty partial scan', () => {
     stats: {
       discovered: 14,
       eligible: 8,
+      shortlisted: 5,
+      prefilterSkipped: 3,
       checked: 5,
       failed: 3,
       belowVolume: 6,
@@ -242,13 +246,15 @@ test('formats all ten ranked pools across any required Telegram chunks', () => {
   const formatted = formatRaydiumPoolScan(result({
     pools,
     stats: {
-      discovered: 10,
-      eligible: 10,
-      checked: 10,
-      failed: 0,
-      belowVolume: 0,
-      dynamicFee: 0,
-      invalid: 0,
+          discovered: 10,
+          eligible: 10,
+          shortlisted: 10,
+          prefilterSkipped: 0,
+          checked: 10,
+          failed: 0,
+          belowVolume: 0,
+          dynamicFee: 0,
+          invalid: 0,
     },
   }))
 

@@ -15,6 +15,12 @@ export const RAYDIUM_CACHE_TTL_MS = 60_000
 export const RAYDIUM_DS_RATE_LIMIT_PER_MINUTE = 240
 export const RAYDIUM_DS_CONCURRENCY = 4
 export const RAYDIUM_RATE_DENOMINATOR = 1_000_000
+/** Candidates shortlisted for the DexScreener volume check, ranked by daily fee yield. */
+export const RAYDIUM_PREFILTER_TOP_N = 500
+/** Pools per batched DexScreener request. */
+export const RAYDIUM_DS_BATCH_SIZE = 30
+/** Day volume must exceed this multiple of the weekly daily average to bypass the shortlist. */
+export const RAYDIUM_MOMENTUM_RATIO_MIN = 5
 
 const RAYDIUM_API_BASE_URL = 'https://api-v3.raydium.io'
 const DEXSCREENER_API_BASE_URL = 'https://api.dexscreener.com/latest/dex/pairs/solana'
@@ -45,6 +51,8 @@ export interface RaydiumScanPool {
 export interface RaydiumScanStats {
   discovered: number
   eligible: number
+  shortlisted: number
+  prefilterSkipped: number
   checked: number
   belowVolume: number
   dynamicFee: number
@@ -86,6 +94,12 @@ export interface RaydiumPoolScannerOptions {
   maxRetries?: number
   dsConcurrency?: number
   dsRateLimitPerMinute?: number
+  /** How many top daily-fee-yield candidates reach the DexScreener check. */
+  prefilterTopN?: number
+  /** Pools per batched DexScreener request. */
+  dexBatchSize?: number
+  /** Day-over-week volume multiple that adds a pool to the shortlist. */
+  momentumRatioMin?: number
   /** Optional shared limiter for callers that need to coordinate instances. */
   rateLimiter?: RaydiumRateLimiter
   cacheTtlMs?: number
@@ -103,16 +117,15 @@ interface ScanCandidate {
   tradeFeeRate: number
   protocolFeeRate: number
   fundFeeRate: number
+  dayFeeYield: number
+  dayVolumeUsd: number
+  weekDailyVolumeUsd: number
 }
 
 interface RaydiumPage {
   items: unknown[]
   hasNextPage: boolean
   nextPageId?: string
-}
-
-interface DexPairData {
-  volume1hUsd: number
 }
 
 class ScannerRequestError extends Error {
@@ -454,6 +467,14 @@ function parseCandidate(pool: unknown, minTvlUsd: number): {
     return { lowTvl: false, validTvl: tvl, invalid: true, dynamic: false }
   }
 
+  const day = asRecord(record.day)
+  const week = asRecord(record.week)
+  const dayFeeUsd = nonNegativeNumber(day?.volumeFee) ?? 0
+  const dayVolumeUsd = nonNegativeNumber(day?.volume) ?? 0
+  const weekVolumeUsd = nonNegativeNumber(week?.volume) ?? 0
+  const lpShare = 1 - ((protocolFeeRate + fundFeeRate) / RAYDIUM_RATE_DENOMINATOR)
+  const dayFeeYield = tvl > 0 ? (dayFeeUsd * lpShare) / tvl : 0
+
   return {
     lowTvl: false,
     validTvl: tvl,
@@ -467,34 +488,38 @@ function parseCandidate(pool: unknown, minTvlUsd: number): {
       tradeFeeRate,
       protocolFeeRate,
       fundFeeRate,
+      dayFeeYield,
+      dayVolumeUsd,
+      weekDailyVolumeUsd: weekVolumeUsd / 7,
     },
   }
 }
 
-function parseDexPair(payload: unknown, poolId: string): DexPairData | null {
+function parseDexPairs(payload: unknown): Map<string, number> {
+  const volumes = new Map<string, number>()
   const root = asRecord(payload)
-  if (!root) return null
+  if (!root) return volumes
   const nested = asRecord(root.data)
   const pairs = Array.isArray(root.pairs)
     ? root.pairs
     : nested && Array.isArray(nested.pairs)
       ? nested.pairs
       : null
-  if (!pairs) return null
+  if (!pairs) return volumes
 
-  const match = pairs.find(item => {
+  for (const item of pairs) {
     const pair = asRecord(item)
-    if (!pair) return false
+    if (!pair) continue
     const chainId = nonEmptyString(pair.chainId)?.toLowerCase()
     const dexId = nonEmptyString(pair.dexId)?.toLowerCase()
-    return pair.pairAddress === poolId && chainId === 'solana' && dexId === 'raydium'
-  })
-  const pair = asRecord(match)
-  if (!pair) return null
-  const volume = asRecord(pair.volume)
-  const volume1hUsd = nonNegativeNumber(volume?.h1)
-  if (volume1hUsd === null) return null
-  return { volume1hUsd }
+    const pairAddress = nonEmptyString(pair.pairAddress)
+    if (chainId !== 'solana' || dexId !== 'raydium' || !pairAddress) continue
+    const volume = asRecord(pair.volume)
+    const volume1hUsd = nonNegativeNumber(volume?.h1)
+    if (volume1hUsd === null) continue
+    volumes.set(pairAddress, volume1hUsd)
+  }
+  return volumes
 }
 
 function copyStats(stats: RaydiumScanStats): RaydiumScanStats {
@@ -505,6 +530,8 @@ function emptyStats(): RaydiumScanStats {
   return {
     discovered: 0,
     eligible: 0,
+    shortlisted: 0,
+    prefilterSkipped: 0,
     checked: 0,
     belowVolume: 0,
     dynamicFee: 0,
@@ -539,6 +566,13 @@ export function createRaydiumPoolScanner(options: RaydiumPoolScannerOptions = {}
   const dexScreenerBaseUrl = (options.dexScreenerBaseUrl ?? DEXSCREENER_API_BASE_URL).replace(/\/$/, '')
   const dsConcurrency = normaliseInteger(options.dsConcurrency, RAYDIUM_DS_CONCURRENCY, 1)
   const dsRateLimit = normaliseInteger(options.dsRateLimitPerMinute, RAYDIUM_DS_RATE_LIMIT_PER_MINUTE, 1)
+  const prefilterTopN = normaliseInteger(options.prefilterTopN, RAYDIUM_PREFILTER_TOP_N, 1)
+  const dexBatchSize = normaliseInteger(options.dexBatchSize, RAYDIUM_DS_BATCH_SIZE, 1)
+  const momentumRatioMin = options.momentumRatioMin !== undefined
+    && Number.isFinite(options.momentumRatioMin)
+    && options.momentumRatioMin > 0
+    ? options.momentumRatioMin
+    : RAYDIUM_MOMENTUM_RATIO_MIN
   const rateLimiter = options.rateLimiter
     ?? (options.dsConcurrency !== undefined || options.dsRateLimitPerMinute !== undefined
       ? new RequestRateLimiter(dsRateLimit, dsConcurrency, now, sleep)
@@ -638,65 +672,88 @@ export function createRaydiumPoolScanner(options: RaydiumPoolScannerOptions = {}
       if (pageHasLowTvl) break
     }
 
+    const prefiltered = [...candidates].sort((left, right) => {
+      const yieldDelta = right.dayFeeYield - left.dayFeeYield
+      return yieldDelta !== 0 ? yieldDelta : left.poolId.localeCompare(right.poolId)
+    })
+    const shortlist = prefiltered.slice(0, prefilterTopN)
+    const shortlistedIds = new Set(shortlist.map(candidate => candidate.poolId))
+    const momentumExtras = candidates
+      .filter(candidate => !shortlistedIds.has(candidate.poolId)
+        && candidate.dayVolumeUsd > 0
+        && candidate.weekDailyVolumeUsd > 0
+        && candidate.dayVolumeUsd / candidate.weekDailyVolumeUsd >= momentumRatioMin)
+      .sort((left, right) => left.poolId.localeCompare(right.poolId))
+    shortlist.push(...momentumExtras)
+    stats.shortlisted = shortlist.length
+    stats.prefilterSkipped = candidates.length - shortlist.length
+    emit('shortlisted', stats)
+
     const scored: RaydiumScanPool[] = []
-    let nextCandidate = 0
-    const workerCount = Math.min(dsConcurrency, candidates.length)
+    const batches: ScanCandidate[][] = []
+    for (let index = 0; index < shortlist.length; index += dexBatchSize) {
+      batches.push(shortlist.slice(index, index + dexBatchSize))
+    }
+    let nextBatch = 0
+    const workerCount = Math.min(dsConcurrency, batches.length)
     const worker = async (): Promise<void> => {
       while (true) {
-        const index = nextCandidate++
-        const candidate = candidates[index]
-        if (!candidate) return
-        stats.checked++
+        const batch = batches[nextBatch++]
+        if (!batch) return
+        stats.checked += batch.length
         emit('checking', stats)
-        const url = `${dexScreenerBaseUrl}/${encodeURIComponent(candidate.poolId)}`
-        let pair: DexPairData | null
+        const url = `${dexScreenerBaseUrl}/${batch.map(candidate => encodeURIComponent(candidate.poolId)).join(',')}`
+        let volumes: Map<string, number>
         try {
-          pair = parseDexPair(await requestJson(http, url, {
+          volumes = parseDexPairs(await requestJson(http, url, {
             timeoutMs,
             maxRetries,
             sleep,
             now,
             rateLimiter,
-          }), candidate.poolId)
+          }))
         } catch (error) {
           partial = true
-          stats.failed++
+          stats.failed += batch.length
           emit('dexscreener_error', stats)
-          console.log(`[raydium] DexScreener failed for ${candidate.poolId.slice(0, 8)}: ${error instanceof Error ? error.message : String(error)}`)
+          console.log(`[raydium] DexScreener batch failed (${batch.length} pools): ${error instanceof Error ? error.message : String(error)}`)
           continue
         }
-        if (!pair) {
-          stats.invalid++
-          emit('invalid_pair', stats)
-          continue
-        }
-        if (pair.volume1hUsd < minVolume1hUsd) {
-          stats.belowVolume++
-          emit('below_volume', stats)
-          continue
-        }
+        for (const candidate of batch) {
+          const volume1hUsd = volumes.get(candidate.poolId)
+          if (volume1hUsd === undefined) {
+            stats.invalid++
+            emit('invalid_pair', stats)
+            continue
+          }
+          if (volume1hUsd < minVolume1hUsd) {
+            stats.belowVolume++
+            emit('below_volume', stats)
+            continue
+          }
 
-        const lpShare = 1 - ((candidate.protocolFeeRate + candidate.fundFeeRate) / RAYDIUM_RATE_DENOMINATOR)
-        const estimatedLpFees1hUsd = pair.volume1hUsd
-          * (candidate.tradeFeeRate / RAYDIUM_RATE_DENOMINATOR)
-          * lpShare
-        const estimatedYieldPctPerHour = (estimatedLpFees1hUsd / candidate.tvlUsd) * 100
-        if (!Number.isFinite(estimatedLpFees1hUsd) || !Number.isFinite(estimatedYieldPctPerHour)) {
-          stats.invalid++
-          emit('invalid_calculation', stats)
-          continue
+          const lpShare = 1 - ((candidate.protocolFeeRate + candidate.fundFeeRate) / RAYDIUM_RATE_DENOMINATOR)
+          const estimatedLpFees1hUsd = volume1hUsd
+            * (candidate.tradeFeeRate / RAYDIUM_RATE_DENOMINATOR)
+            * lpShare
+          const estimatedYieldPctPerHour = (estimatedLpFees1hUsd / candidate.tvlUsd) * 100
+          if (!Number.isFinite(estimatedLpFees1hUsd) || !Number.isFinite(estimatedYieldPctPerHour)) {
+            stats.invalid++
+            emit('invalid_calculation', stats)
+            continue
+          }
+          scored.push({
+            poolId: candidate.poolId,
+            symbolA: candidate.symbolA,
+            symbolB: candidate.symbolB,
+            tvlUsd: candidate.tvlUsd,
+            volume1hUsd,
+            estimatedLpFees1hUsd,
+            estimatedYieldPctPerHour,
+            tradeFeeRate: candidate.tradeFeeRate,
+          })
+          emit('checked', stats)
         }
-        scored.push({
-          poolId: candidate.poolId,
-          symbolA: candidate.symbolA,
-          symbolB: candidate.symbolB,
-          tvlUsd: candidate.tvlUsd,
-          volume1hUsd: pair.volume1hUsd,
-          estimatedLpFees1hUsd,
-          estimatedYieldPctPerHour,
-          tradeFeeRate: candidate.tradeFeeRate,
-        })
-        emit('checked', stats)
       }
     }
     if (workerCount > 0) await Promise.all(Array.from({ length: workerCount }, () => worker()))
