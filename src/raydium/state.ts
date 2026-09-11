@@ -2,6 +2,7 @@ import { deleteSyncValue, getSyncValue, listSyncValues, setSyncValue } from '../
 import type { RebalanceDirection } from '../types.js'
 
 const STATE_PREFIX = 'raydium_position_state:'
+const SETTINGS_PREFIX = 'raydium_rebalance_settings:'
 
 export interface RaydiumPositionState {
   nftMint: string
@@ -44,4 +45,46 @@ export function deleteRaydiumPositionState(nftMint: string): void {
 
 export function listRaydiumPositionStates(): RaydiumPositionState[] {
   return listSyncValues(STATE_PREFIX).flatMap(row => getRaydiumPositionState(row.key.slice(STATE_PREFIX.length)) || [])
+}
+
+export interface RaydiumRebalanceSettings {
+  nftMint: string
+  enabled: boolean
+  updatedAt: number
+}
+
+function settingsKey(nftMint: string): string {
+  return `${SETTINGS_PREFIX}${nftMint}`
+}
+
+/**
+ * Per-position auto rebalance override, stored separately from the OOR state so
+ * a transient discovery gap never wipes the user's toggle. Missing or malformed
+ * values default to enabled.
+ */
+export function getRaydiumRebalanceSettings(nftMint: string): RaydiumRebalanceSettings | null {
+  const raw = getSyncValue(settingsKey(nftMint))
+  if (!raw) return null
+  try {
+    const parsed = JSON.parse(raw) as Partial<RaydiumRebalanceSettings>
+    return {
+      nftMint,
+      enabled: parsed.enabled !== false,
+      updatedAt: Number.isSafeInteger(parsed.updatedAt) ? parsed.updatedAt as number : Date.now(),
+    }
+  } catch {
+    return null
+  }
+}
+
+export function isRaydiumRebalanceEnabled(nftMint: string): boolean {
+  return getRaydiumRebalanceSettings(nftMint)?.enabled ?? true
+}
+
+export function setRaydiumRebalanceEnabled(nftMint: string, enabled: boolean): void {
+  setSyncValue(settingsKey(nftMint), JSON.stringify({ enabled, updatedAt: Date.now() }))
+}
+
+export function listRaydiumRebalanceSettings(): RaydiumRebalanceSettings[] {
+  return listSyncValues(SETTINGS_PREFIX).flatMap(row => getRaydiumRebalanceSettings(row.key.slice(SETTINGS_PREFIX.length)) || [])
 }

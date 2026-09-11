@@ -2,6 +2,10 @@ import TelegramBot from 'node-telegram-bot-api'
 import { config } from './config.js'
 import { loadActivePositions, updateAutoRebalanceEnabled, updateFlipModeEnabled, updatePrecisionCurveEnabled, updatePrecisionCurveThreshold } from './meteora/discovery.js'
 import { getRebalanceOorMinutes } from './meteora/rebalanceSettings.js'
+import { refreshRaydiumDashboardSnapshot, type RaydiumDashboardSnapshot } from './raydium/dashboard.js'
+import { setRaydiumRebalanceEnabled } from './raydium/state.js'
+import { getConnection } from './solana/connection.js'
+import { getWallet } from './solana/wallet.js'
 import type { ExitCompletionNotification, GlobalRiskSettings, PositionRow, QuoteCurrency, RebalanceMode } from './types.js'
 import { setupTelegramControl } from './telegram/control.js'
 
@@ -16,6 +20,7 @@ const TELEGRAM_COMMANDS = [
   { command: 'precision', description: 'Precision Curve settings menu' },
   { command: 'flip', description: 'Flip Mode settings menu' },
   { command: 'rebalance', description: 'Auto Rebalance settings menu' },
+  { command: 'raydium', description: 'Raydium CLMM auto rebalance per position' },
   { command: 'help', description: 'List all available commands' },
 ]
 
@@ -94,6 +99,11 @@ function setupCommandHandlers(bot: TelegramBot): void {
     sendAutoRebalanceMenu(bot, msg.chat.id)
   })
 
+  bot.onText(/^\/raydium(?:\s+(.+))?$/, msg => {
+    if (!msg.chat || !isAllowedChat(msg.chat.id, msg.from?.id)) return
+    void sendRaydiumMenu(bot, msg.chat.id)
+  })
+
   bot.onText(/^\/help$/, msg => {
     if (!msg.chat || !isAllowedChat(msg.chat.id, msg.from?.id)) return
     bot.sendMessage(msg.chat.id,
@@ -107,7 +117,11 @@ function setupCommandHandlers(bot: TelegramBot): void {
     const chatId = query.message?.chat.id
     if (!chatId || !isAllowedChat(chatId, query.from.id)) return
     const data = query.data || ''
-    if (!data.startsWith('pc:') && !data.startsWith('flip:') && !data.startsWith('rebal:')) return
+    if (!data.startsWith('pc:') && !data.startsWith('flip:') && !data.startsWith('rebal:') && !data.startsWith('rdn:')) return
+    if (data.startsWith('rdn:')) {
+      await handleRaydiumToggle(bot, chatId, query, data)
+      return
+    }
 
     const parts = data.split(':')
     const namespace = parts[0]
@@ -207,6 +221,7 @@ function setupCommandHandlers(bot: TelegramBot): void {
     showPrecision: chatId => sendPrecisionMenu(bot, chatId),
     showFlip: chatId => sendFlipMenu(bot, chatId),
     showAutoRebalance: chatId => sendAutoRebalanceMenu(bot, chatId),
+    showRaydium: chatId => { void sendRaydiumMenu(bot, chatId) },
   })
 }
 
@@ -335,6 +350,74 @@ function sendAutoRebalanceMenu(bot: TelegramBot, chatId: number | string): void 
   }).catch(err => {
     console.log(`[telegram] auto rebalance menu failed: ${err.message}`)
   })
+}
+
+const RAYDIUM_NFT_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/
+
+async function sendRaydiumMenu(bot: TelegramBot, chatId: number | string): Promise<void> {
+  let positions: RaydiumDashboardSnapshot['positions'] = []
+  try {
+    const snapshot = await refreshRaydiumDashboardSnapshot(getConnection(), getWallet())
+    positions = snapshot?.positions ?? []
+  } catch (err) {
+    console.log(`[telegram] raydium menu refresh failed: ${err instanceof Error ? err.message : 'unknown'}`)
+  }
+
+  const lines = [
+    '<b>Raydium CLMM</b>',
+    sep(),
+    `Auto: <b>${config.raydiumEnabled ? 'ON' : 'OFF (global)'}</b> · mode <b>${config.raydiumRebalanceMode}</b> · window <b>${config.raydiumRebalanceWindowMinutes} menit</b>`,
+    'Toggle per posisi menghentikan rebalance posisi itu tanpa mematikan global.',
+  ]
+  if (positions.length === 0) {
+    lines.push(sep(), 'Tidak ada posisi Raydium.')
+  } else {
+    lines.push(sep(), ...positions.map((position, index) => {
+      const status = position.direction ? `OOR ${position.direction.toUpperCase()}` : 'IN RANGE'
+      const cooldown = position.cooldownUntil && position.cooldownUntil > Date.now() ? ' · cooldown' : ''
+      return `${index + 1}. <b>${position.pair}</b> <code>${shortAddr(position.nftMint)}</code> — <b>${position.enabled ? 'ON' : 'OFF'}</b>\n` +
+        `   ${status}${cooldown} · ticks ${position.tickLower}..${position.tickUpper} · curr ${position.currentTick}`
+    }))
+  }
+
+  const keyboard: TelegramBot.InlineKeyboardButton[][] = positions.map(position => [{
+    text: position.enabled
+      ? `⏸ Disable ${position.pair} ${shortAddr(position.nftMint)}`
+      : `▶️ Enable ${position.pair} ${shortAddr(position.nftMint)}`,
+    callback_data: `rdn:${position.enabled ? 'off' : 'on'}:${position.nftMint}`,
+  }])
+
+  bot.sendMessage(chatId, lines.join('\n'), {
+    parse_mode: 'HTML',
+    disable_web_page_preview: true,
+    ...(keyboard.length > 0 ? { reply_markup: { inline_keyboard: keyboard } } : {}),
+  }).catch(err => {
+    console.log(`[telegram] raydium menu failed: ${err.message}`)
+  })
+}
+
+async function handleRaydiumToggle(
+  bot: TelegramBot,
+  chatId: number | string,
+  query: TelegramBot.CallbackQuery,
+  data: string,
+): Promise<void> {
+  const [, action, nftMint] = data.split(':')
+  if ((action !== 'on' && action !== 'off') || !nftMint || !RAYDIUM_NFT_RE.test(nftMint)) {
+    await bot.answerCallbackQuery(query.id, { text: 'Aksi tidak dikenal' }).catch(() => undefined)
+    return
+  }
+  const enabled = action === 'on'
+  setRaydiumRebalanceEnabled(nftMint, enabled)
+  await bot.answerCallbackQuery(query.id, {
+    text: enabled ? 'Raydium rebalance diaktifkan' : 'Raydium rebalance dimatikan',
+  }).catch(() => undefined)
+  try {
+    await refreshRaydiumDashboardSnapshot(getConnection(), getWallet(), { force: true })
+  } catch (err) {
+    console.log(`[telegram] raydium snapshot refresh failed: ${err instanceof Error ? err.message : 'unknown'}`)
+  }
+  await sendRaydiumMenu(bot, chatId)
 }
 
 function sendPrecisionMenu(bot: TelegramBot, chatId: number | string): void {

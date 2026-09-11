@@ -60,6 +60,7 @@ export type DashboardAction =
   | { type: 'flip' }
   | { type: 'rebalance' }
   | { type: 'rebalance_time' }
+  | { type: 'raydium' }
 
 type PendingOpenInput =
   | PendingBase & { kind: 'pool'; strategy: OpenLiquidityStrategy }
@@ -106,6 +107,7 @@ interface TelegramControlMenus {
   showPrecision: (chatId: number | string) => void
   showFlip: (chatId: number | string) => void
   showAutoRebalance: (chatId: number | string) => void
+  showRaydium: (chatId: number | string) => void
 }
 
 export function isTelegramAuthorized(
@@ -192,6 +194,7 @@ export function parseDashboardAction(data: string | undefined): DashboardAction 
   if (parts.length === 2 && parts[1] === 'flip') return { type: 'flip' }
   if (parts.length === 2 && parts[1] === 'rebal') return { type: 'rebalance' }
   if (parts.length === 2 && parts[1] === 'rebal_time') return { type: 'rebalance_time' }
+  if (parts.length === 2 && parts[1] === 'raydium') return { type: 'raydium' }
   return null
 }
 
@@ -446,6 +449,10 @@ class TelegramDashboardController {
       await this.startRebalanceTimeInput(chatId, query.from.id.toString(), message.message_id)
       return
     }
+    if (action.type === 'raydium') {
+      this.menus.showRaydium(message.chat.id)
+      return
+    }
     this.menus.showAutoRebalance(message.chat.id)
   }
 
@@ -526,7 +533,7 @@ class TelegramDashboardController {
         { text: '🎛️ Precision Curve', callback_data: 'lpd:precision' },
         { text: '🔁 Flip Mode', callback_data: 'lpd:flip' },
       ],
-      [{ text: '🔄 Auto Rebalance', callback_data: 'lpd:rebal' }],
+      [{ text: '🔄 Auto Rebalance', callback_data: 'lpd:rebal' }, { text: '🟣 Raydium', callback_data: 'lpd:raydium' }],
     ]
     if (pageCount > 1) {
       const nav: TelegramBot.InlineKeyboardButton[] = []

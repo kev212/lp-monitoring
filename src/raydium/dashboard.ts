@@ -4,7 +4,7 @@ import type { RebalanceDirection, RebalanceMode } from '../types.js'
 import { loadRaydiumPool, rayDiumPairLabel } from './pool.js'
 import { raydiumOorDirection } from './policy.js'
 import { listRaydiumWalletPositions } from './positions.js'
-import { getRaydiumPositionState } from './state.js'
+import { getRaydiumPositionState, isRaydiumRebalanceEnabled } from './state.js'
 
 const SNAPSHOT_KEY = 'raydium_dashboard'
 const REFRESH_INTERVAL_MS = 30_000
@@ -20,6 +20,7 @@ export interface RaydiumDashboardPosition {
   direction: RebalanceDirection | null
   since: number | null
   cooldownUntil: number | null
+  enabled: boolean
 }
 
 export interface RaydiumDashboardSnapshot {
@@ -61,6 +62,7 @@ export function readRaydiumDashboardSnapshot(): RaydiumDashboardSnapshot | null 
           direction: ['up', 'down'].includes(position.direction || '') ? position.direction as RebalanceDirection : null,
           since: Number.isSafeInteger(position.since) ? position.since as number : null,
           cooldownUntil: Number.isSafeInteger(position.cooldownUntil) ? position.cooldownUntil as number : null,
+          enabled: position.enabled !== false,
         }]
       }),
     }
@@ -105,6 +107,7 @@ export async function refreshRaydiumDashboardSnapshot(
         direction: raydiumOorDirection(loaded.state.currentTick, position.tickLower, position.tickUpper),
         since: state?.since ?? null,
         cooldownUntil: state?.cooldownUntil ?? null,
+        enabled: isRaydiumRebalanceEnabled(position.nftMint),
       })
     }
     const snapshot: RaydiumDashboardSnapshot = { version: 1, updatedAt: now, positions: entries }
@@ -143,7 +146,8 @@ export function formatRaydiumDashboardLines(
       ? ` · cooldown ${formatElapsed(position.cooldownUntil - now)}`
       : ''
     const timer = position.since === null ? '' : ` · ${formatElapsed(now - position.since)}`
-    lines.push(`   • ${position.pair} · ${status}${timer}${cooldown}`)
+    const rebal = position.enabled ? 'ON' : 'OFF (posisi)'
+    lines.push(`   • ${position.pair} · ${status}${timer}${cooldown} · rebal ${rebal}`)
     lines.push(`     ticks ${position.tickLower}..${position.tickUpper} · curr ${position.currentTick} · spacing ${position.tickSpacing}`)
   }
   if (snapshot.positions.length > maxLines) {

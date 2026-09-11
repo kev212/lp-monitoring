@@ -15,19 +15,31 @@ test('formats a Raydium dashboard section with range status and OOR timer', () =
     {
       nftMint: 'n1', poolId: 'p1', pair: 'DoGE/SOL',
       tickLower: 100, tickUpper: 160, tickSpacing: 60, currentTick: 130,
-      direction: null, since: null, cooldownUntil: null,
+      direction: null, since: null, cooldownUntil: null, enabled: true,
     },
     {
       nftMint: 'n2', poolId: 'p2', pair: 'AAA/SOL',
       tickLower: 200, tickUpper: 260, tickSpacing: 60, currentTick: 300,
-      direction: 'up', since: now - 120_000, cooldownUntil: now + 300_000,
+      direction: 'up', since: now - 120_000, cooldownUntil: now + 300_000, enabled: true,
     },
   ], now), { enabled: true, mode: 'both', windowMinutes: 5, now })
 
   assert.match(lines[0], /RAYDIUM CLMM · auto ON · mode both · window 5m · in-range 1 tick/)
-  assert.match(lines[1], /DoGE\/SOL · IN RANGE/)
+  assert.match(lines[1], /DoGE\/SOL · IN RANGE · rebal ON/)
   assert.match(lines[2], /ticks 100\.\.160 · curr 130 · spacing 60/)
-  assert.match(lines[3], /AAA\/SOL · OOR UP · 2m00s · cooldown 5m00s/)
+  assert.match(lines[3], /AAA\/SOL · OOR UP · 2m00s · cooldown 5m00s · rebal ON/)
+})
+
+test('marks a position whose per-position rebalance is disabled', () => {
+  const lines = formatRaydiumDashboardLines(snapshot([
+    {
+      nftMint: 'n1', poolId: 'p1', pair: 'DOGE/USDC',
+      tickLower: -70860, tickUpper: -70800, tickSpacing: 60, currentTick: -70830,
+      direction: null, since: null, cooldownUntil: null, enabled: false,
+    },
+  ], 1_000_000), { enabled: true, mode: 'both', windowMinutes: 5, now: 1_000_000 })
+
+  assert.match(lines[1], /DOGE\/USDC · IN RANGE · rebal OFF \(posisi\)/)
 })
 
 test('shows the disabled state and handles empty snapshots', () => {
@@ -51,6 +63,7 @@ test('caps the section and reports the remaining positions', () => {
     direction: null,
     since: null,
     cooldownUntil: null,
+    enabled: true,
   }))
   const lines = formatRaydiumDashboardLines(snapshot(positions), {
     enabled: true,

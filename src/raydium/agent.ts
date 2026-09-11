@@ -17,6 +17,7 @@ import {
   type RaydiumPositionState,
 } from './rebalance.js'
 import { defaultRaydiumServices } from './services.js'
+import { isRaydiumRebalanceEnabled } from './state.js'
 
 let lastTickAt = 0
 
@@ -61,6 +62,18 @@ export async function tickRaydiumAgent(connection: Connection, wallet: Keypair):
     const pair = rayDiumPairLabel(loaded.state)
     const direction = raydiumOorDirection(loaded.state.currentTick, position.tickLower, position.tickUpper)
     const existing = getRaydiumPositionState(position.nftMint)
+    if (!isRaydiumRebalanceEnabled(position.nftMint)) {
+      if (existing && (existing.since !== null || existing.direction !== null || existing.notified)) {
+        saveRaydiumPositionState({
+          nftMint: position.nftMint,
+          since: null,
+          direction: null,
+          notified: false,
+          cooldownUntil: existing.cooldownUntil,
+        })
+      }
+      continue
+    }
     if (existing?.cooldownUntil && Date.now() < existing.cooldownUntil) continue
 
     const timer = nextRaydiumTimer({
