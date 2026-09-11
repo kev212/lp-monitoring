@@ -8,15 +8,21 @@ const CACHE_TTL = 60_000
 const usdPriceCache = new Map<string, { price: number; at: number }>()
 
 /**
- * Jupiter Price API v3 returns { data: { [mint]: { usdPrice } | null } }.
- * Older payloads used `price`, so accept both and skip zero/missing entries.
+ * Jupiter Price API v3 returns a mint map either at the top level
+ * ({ [mint]: { usdPrice } }) or nested under `data`; older entries used
+ * `price`. Accept both shapes and skip zero/missing entries.
  */
 export function parseJupiterUsdPrices(payload: unknown, mints: string[]): Map<string, number> {
   const prices = new Map<string, number>()
-  const data = (payload as { data?: unknown } | null | undefined)?.data
-  if (!data || typeof data !== 'object') return prices
+  const root = payload as Record<string, unknown> | null | undefined
+  const nested = root && typeof root === 'object' ? root.data : undefined
+  const container = (nested && typeof nested === 'object' && !Array.isArray(nested) ? nested : root) as
+    | Record<string, { usdPrice?: unknown; price?: unknown } | null>
+    | null
+    | undefined
+  if (!container || typeof container !== 'object') return prices
   for (const mint of mints) {
-    const entry = (data as Record<string, { usdPrice?: unknown; price?: unknown } | null>)[mint]
+    const entry = container[mint]
     if (!entry || typeof entry !== 'object') continue
     const price = Number(entry.usdPrice ?? entry.price)
     if (Number.isFinite(price) && price > 0) prices.set(mint, price)
@@ -27,9 +33,8 @@ export function parseJupiterUsdPrices(payload: unknown, mints: string[]): Map<st
 /**
  * Fresh USD prices for the requested mints in a single batched request. Fresh
  * cache hits are reused for 60 seconds; failures are not cached so the next
- * refresh retries instead of pinning a zero price. Jupiter occasionally answers
- * a batch with an empty data object, so mints still missing after the batch are
- * retried one by one.
+ * refresh retries instead of pinning a zero price. Mints missing from a batch
+ * response (unknown tokens or partial answers) are retried one by one.
  */
 export async function getTokenPricesInUsd(mints: string[]): Promise<Map<string, number>> {
   const unique = [...new Set(mints.filter(Boolean))]
