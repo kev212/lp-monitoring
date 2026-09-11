@@ -240,8 +240,10 @@ export function buildRaydiumRangeBar(input: {
 function formatPrices(position: RaydiumDashboardPosition): string {
   if (position.priceLower === null || position.priceUpper === null || position.priceCurrent === null) return 'harga N/A'
   const symbolB = position.pair.split('/')[1] || ''
-  const unit = symbolB === 'USDC' ? '' : ` ${symbolB}`
-  return `${formatCompactPrice(position.priceLower)} – ${formatCompactPrice(position.priceUpper)}${unit} · now ${formatCompactPrice(position.priceCurrent)}${unit}`
+  const format = (value: number): string => symbolB === 'USDC'
+    ? `$${formatCompactPrice(value)}`
+    : `${formatCompactPrice(value)}${symbolB ? ` ${symbolB}` : ''}`
+  return `${format(position.priceLower)} – ${format(position.priceUpper)} · now ${format(position.priceCurrent)}`
 }
 
 export function formatRaydiumDashboardLines(
