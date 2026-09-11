@@ -8,6 +8,7 @@ import { getConnection } from './solana/connection.js'
 import { getWallet } from './solana/wallet.js'
 import type { ExitCompletionNotification, GlobalRiskSettings, PositionRow, QuoteCurrency, RebalanceMode } from './types.js'
 import { setupTelegramControl } from './telegram/control.js'
+import { registerRaydiumScanCommand } from './telegram/raydiumScanner.js'
 
 let _bot: TelegramBot | null = null
 
@@ -21,6 +22,7 @@ const TELEGRAM_COMMANDS = [
   { command: 'flip', description: 'Flip Mode settings menu' },
   { command: 'rebalance', description: 'Auto Rebalance settings menu' },
   { command: 'raydium', description: 'Raydium CLMM auto rebalance per position' },
+  { command: 'scan_pools_ray', description: 'Top CLMM yield/hour · TVL ≥ $5k · volume ≥ $20k/h' },
   { command: 'help', description: 'List all available commands' },
 ]
 
@@ -62,6 +64,7 @@ function isAllowedChat(chatId: number | string, userId: number | string | undefi
 }
 
 function setupCommandHandlers(bot: TelegramBot): void {
+  registerRaydiumScanCommand(bot, isAllowedChat)
   const scopes: Array<{ scope?: { type: string }; label: string }> = [
     { scope: { type: 'default' }, label: 'default' },
     { scope: { type: 'all_private_chats' }, label: 'all_private_chats' },

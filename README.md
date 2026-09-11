@@ -11,10 +11,19 @@ Bot untuk monitor posisi **Meteora DLMM** secara live, menghitung **historical c
 - Remove liquidity penuh + claim + close posisi
 - Swap hasil posisi ke SOL via Jupiter
 - Notifikasi Telegram
+- `/scan_pools_ray`: top 10 Raydium CLMM berdasarkan estimasi yield fee LP/jam, TVL minimal US$5.000 dan volume aktual 1h minimal US$20.000
 - Persistence SQLite (restart-safe)
 - systemd service untuk Ubuntu VPS
 
 ## Cara Kerja
+
+### Scanner Raydium
+
+`/scan_pools_ray` menelusuri seluruh kandidat CLMM dengan TVL ≥ US$5.000 dari Raydium dan mengambil volume 1 jam terakhir dari DEX Screener. Pool dengan volume < US$20.000/jam, dynamic fee, atau data wajib tidak valid dikecualikan. Hasil diurutkan berdasarkan estimasi fee LP selama satu jam dibagi TVL; fee dihitung dari volume aktual 1h × tarif fee konfigurasi pool × porsi LP setelah potongan protocol/fund. Volume harian tidak dibagi 24. Angka ini adalah estimasi tingkat pool, bukan hasil posisi dengan range tertentu.
+
+Scan bersifat baca-saja, tidak memerlukan API key tambahan, dan memakai otorisasi Telegram yang sama dengan command lain. Scan luas dapat berlangsung beberapa menit dengan progres setiap menit. Hasil mencantumkan sumber, rentang waktu pengambilan, pengecualian, dan status parsial jika ada kegagalan. Request bersamaan berbagi satu scan dan hasil di-cache 60 detik.
+
+### Monitoring posisi
 
 1. Load wallet + koneksi RPC
 2. Scan semua posisi DLMM milik wallet
