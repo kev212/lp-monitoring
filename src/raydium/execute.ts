@@ -2,8 +2,10 @@ import { BN } from '@coral-xyz/anchor'
 import {
   CLMM_PROGRAM_ID,
   LiquidityMathUtil,
+  TickArrayBitmapExtensionLayout,
   TickUtil,
   TxVersion,
+  getPdaExBitmapAccount,
   swapInternal,
   type SwapSimulationResult,
 } from '@raydium-io/raydium-sdk-v2'
@@ -217,12 +219,17 @@ function toNumber(value: bigint): number {
   return Number(value.toString())
 }
 
-/** Required MintA/MintB ratio of an in-range CLMM position at a given sqrt price. */
+/**
+ * Required MintA/MintB raw-amount ratio of an in-range CLMM position at a
+ * given sqrt price. Amounts are proportional to L*(1/sqrtP - 1/sqrtU) for A and
+ * L*(sqrtP - sqrtL) for B; the Q64.64 scale cancels only after multiplying the
+ * A term by 2^128.
+ */
 export function positionAmountRatio(sqrtPriceX64: bigint, tickLower: number, tickUpper: number): number {
   const sqrtP = toNumber(sqrtPriceX64)
   const sqrtL = toNumber(BigInt(TickUtil.getSqrtPriceAtTick(tickLower).toString()))
   const sqrtU = toNumber(BigInt(TickUtil.getSqrtPriceAtTick(tickUpper).toString()))
-  const amountA = 1 / sqrtP - 1 / sqrtU
+  const amountA = (1 / sqrtP - 1 / sqrtU) * 2 ** 128
   const amountB = sqrtP - sqrtL
   if (!(amountB > 0) || !(amountA >= 0)) return 0
   return amountA / amountB
@@ -237,6 +244,7 @@ export function solveSwapAmount(input: {
   amountA: bigint
   amountB: bigint
   tickSpacing: number
+  sellingA: boolean
   simulate: (amountIn: bigint) => { out: bigint; tickCurrent: number; sqrtPriceX64: bigint; accounts: PublicKey[] }
 }): {
   amountIn: bigint
@@ -246,32 +254,35 @@ export function solveSwapAmount(input: {
   accounts: PublicKey[]
   side: 'MintA' | 'MintB'
 } {
-  const sellingA = input.amountB <= 0n || (input.amountA > 0n && input.amountB > 0n && input.amountA >= input.amountB)
-  const maxIn = sellingA ? input.amountA : input.amountB
+  const maxIn = input.sellingA ? input.amountA : input.amountB
   if (maxIn <= 0n) throw new Error('Raydium rebalance has no funding to swap')
-  const side: 'MintA' | 'MintB' = sellingA ? 'MintA' : 'MintB'
+  const side: 'MintA' | 'MintB' = input.sellingA ? 'MintA' : 'MintB'
 
-  // f(amountIn) = required A/B ratio at the post-swap bucket minus the actual
-  // post-swap balance ratio.
-  const f = (amountIn: bigint): number => {
+  // gap(amountIn) = post-swap A/B ratio minus the required ratio of the bucket
+  // anchored at the post-swap price. Selling A shrinks the ratio (gap strictly
+  // decreasing); selling B grows it (gap strictly increasing).
+  const gap = (amountIn: bigint): number => {
     const sim = input.simulate(amountIn)
-    const postA = sellingA ? input.amountA - amountIn : input.amountA + sim.out
-    const postB = sellingA ? input.amountB + sim.out : input.amountB - amountIn
-    if (postA <= 0n || postB <= 0n) return Number.NaN
+    const postA = input.sellingA ? input.amountA - amountIn : input.amountA + sim.out
+    const postB = input.sellingA ? input.amountB + sim.out : input.amountB - amountIn
     const anchor = buildRaydiumInRangeRange(sim.tickCurrent, input.tickSpacing)
-    const ratio = positionAmountRatio(sim.sqrtPriceX64, anchor.tickLower, anchor.tickUpper)
-    const balanceRatio = toNumber(postA) / toNumber(postB)
-    return ratio - balanceRatio
+    const required = positionAmountRatio(sim.sqrtPriceX64, anchor.tickLower, anchor.tickUpper)
+    if (postA === 0n && postB === 0n) return Number.NaN
+    if (postB === 0n) return Number.POSITIVE_INFINITY
+    if (postA === 0n) return Number.NEGATIVE_INFINITY
+    return toNumber(postA) / toNumber(postB) - required
   }
 
-  const fLo = f(0n)
-  const fHi = f(maxIn)
-  if (Number.isNaN(fLo) || Number.isNaN(fHi)) throw new Error('Raydium swap solver could not evaluate the range')
-  if (fLo <= 0) {
+  const gapLo = gap(0n)
+  if (Number.isNaN(gapLo)) throw new Error('Raydium swap solver could not evaluate the range')
+  if (gapLo === 0) {
     const sim = input.simulate(0n)
     return { amountIn: 0n, ...sim, side }
   }
-  if (fHi >= 0) {
+  const gapHi = gap(maxIn)
+  if (Number.isNaN(gapHi)) throw new Error('Raydium swap solver could not evaluate the range')
+  const increasing = gapLo < 0
+  if (increasing ? gapHi <= 0 : gapHi >= 0) {
     const sim = input.simulate(maxIn)
     return { amountIn: maxIn, ...sim, side }
   }
@@ -281,10 +292,10 @@ export function solveSwapAmount(input: {
   for (let iteration = 0; iteration < SOLVE_ITERATIONS; iteration++) {
     const mid = (lo + hi) / 2n
     if (mid === lo || mid === hi) break
-    const fMid = f(mid)
-    if (Number.isNaN(fMid)) break
-    if (fMid > 0) lo = mid
-    else hi = mid
+    const gapMid = gap(mid)
+    if (Number.isNaN(gapMid)) break
+    if (increasing ? gapMid > 0 : gapMid < 0) hi = mid
+    else lo = mid
   }
   const amountIn = (lo + hi) / 2n
   const sim = input.simulate(amountIn)
@@ -313,18 +324,37 @@ export async function prepareRaydiumRebalance(
   const raydium = await getRaydium(connection, wallet)
   const { bundle, state } = await loadRaydiumPool(connection, wallet, params.poolId)
 
-  const sellingA = params.amountB <= 0n || (params.amountA > 0n && params.amountB > 0n && params.amountA >= params.amountB)
+  const anchorAtCurrent = buildRaydiumInRangeRange(state.currentTick, state.tickSpacing)
+  const requiredRatio = positionAmountRatio(
+    BigInt(bundle.rpcPoolInfo.sqrtPriceX64.toString()),
+    anchorAtCurrent.tickLower,
+    anchorAtCurrent.tickUpper,
+  )
+  const balanceRatio = params.amountB === 0n
+    ? Number.POSITIVE_INFINITY
+    : params.amountA === 0n
+      ? 0
+      : toNumber(params.amountA) / toNumber(params.amountB)
+  const sellingA = params.amountB === 0n ? true : params.amountA === 0n ? false : balanceRatio > requiredRatio
   const inputMint = sellingA ? state.mintA : state.mintB
   const swapPool = await raydium.clmm.getSwapPoolInfo(params.poolId, sellingA)
 
+  const programId = new PublicKey(state.programId)
+  const poolPk = new PublicKey(state.poolId)
+  const exBitmapAddress = getPdaExBitmapAccount(programId, poolPk).publicKey
+  const exBitmapAccount = await withRpcFallback(rpc => rpc.getAccountInfo(exBitmapAddress, 'confirmed'), connection)
+  const exBitmap = exBitmapAccount
+    ? TickArrayBitmapExtensionLayout.decode(exBitmapAccount.data)
+    : { poolId: poolPk, positiveTickArrayBitmap: Buffer.alloc(112), negativeTickArrayBitmap: Buffer.alloc(112) }
+
   const simulate = (amountIn: bigint): SwapSimulation => {
     const simulation: SwapSimulationResult = swapInternal({
-      programId: new PublicKey(state.programId),
-      poolId: new PublicKey(state.poolId),
+      programId,
+      poolId: poolPk,
       poolInfo: swapPool.rpcData,
       tickArrays: swapPool.tickArrays,
       configInfo: swapPool.configInfo,
-      tickarrayBitmapExtension: null as never,
+      tickarrayBitmapExtension: exBitmap,
       amountSpecified: new BN(amountIn.toString()),
       sqrtPriceLimitX64: new BN(0),
       zeroForOne: sellingA,
@@ -340,9 +370,10 @@ export async function prepareRaydiumRebalance(
     }
   }
 
-  const solved = solveSwapAmount({ amountA: params.amountA, amountB: params.amountB, tickSpacing: state.tickSpacing, simulate })
+  const solved = solveSwapAmount({ amountA: params.amountA, amountB: params.amountB, tickSpacing: state.tickSpacing, sellingA, simulate })
 
-  if (solved.amountIn > 0n && solved.out > 0n) {
+  const swapNeeded = solved.amountIn > 0n && solved.out > 0n
+  if (swapNeeded) {
     const jupiter = await getJupiterSwapQuote({
       inputMint,
       outputMint: sellingA ? state.mintB : state.mintA,
@@ -365,7 +396,7 @@ export async function prepareRaydiumRebalance(
   const usableA = postA * bufferPct / 100n
   const usableB = postB * bufferPct / 100n
   const liquidity = LiquidityMathUtil.getLiquidityFromAmounts(
-    solved.sqrtPriceX64,
+    new BN(solved.sqrtPriceX64.toString()),
     sqrtLower,
     sqrtUpper,
     new BN(usableA.toString()),
@@ -376,18 +407,20 @@ export async function prepareRaydiumRebalance(
   const maxA = new BN(postA.toString())
   const maxB = new BN(postB.toString())
 
-  const swapData = await raydium.clmm.swap<TxVersion.LEGACY>({
-    poolInfo: swapPool.poolInfo,
-    poolKeys: bundle.poolKeys,
-    inputMint,
-    amountIn: new BN(solved.amountIn.toString()),
-    amountOutMin: new BN((solved.out * BigInt(10_000 - config.raydiumSwapSlippageBps) / 10_000n).toString()),
-    observationId: swapPool.rpcData.observationId,
-    ownerInfo: { useSOLBalance: true },
-    remainingAccounts: solved.accounts,
-    txVersion: TxVersion.LEGACY,
-    computeBudgetConfig: atomicBudget(),
-  })
+  const swapData = swapNeeded
+    ? await raydium.clmm.swap<TxVersion.LEGACY>({
+        poolInfo: swapPool.poolInfo,
+        poolKeys: bundle.poolKeys,
+        inputMint,
+        amountIn: new BN(solved.amountIn.toString()),
+        amountOutMin: new BN((solved.out * BigInt(10_000 - config.raydiumSwapSlippageBps) / 10_000n).toString()),
+        observationId: swapPool.rpcData.observationId,
+        ownerInfo: { useSOLBalance: true },
+        remainingAccounts: solved.accounts,
+        txVersion: TxVersion.LEGACY,
+        computeBudgetConfig: atomicBudget(),
+      })
+    : null
   const openData = await raydium.clmm.openPositionFromLiquidity<TxVersion.LEGACY>({
     poolInfo: bundle.poolInfo,
     poolKeys: bundle.poolKeys,
@@ -409,9 +442,9 @@ export async function prepareRaydiumRebalance(
     connection,
     wallet,
     bundle,
-    swapData.transaction.instructions,
+    swapData?.transaction.instructions ?? [],
     openData.transaction.instructions,
-    [...swapData.signers, ...openData.signers],
+    [...(swapData?.signers ?? []), ...openData.signers],
     latest.blockhash,
   )
   if (atomic) {
@@ -429,6 +462,38 @@ export async function prepareRaydiumRebalance(
         depositB: usableB.toString(),
         nftMint,
         signedTransaction: atomic.signedTransaction,
+        blockhash: latest.blockhash,
+        lastValidBlockHeight: latest.lastValidBlockHeight,
+      },
+    }
+  }
+
+  // No swap needed: the balances already match the target composition. Open the
+  // bucket directly from the wallet (Raydium rejects zero-amount swaps).
+  if (!swapData) {
+    const openOnly = new Transaction().add(
+      ComputeBudgetProgram.setComputeUnitLimit({ units: config.raydiumAtomicComputeUnitLimit }),
+      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: config.raydiumComputeUnitPrice }),
+      ...stripComputeBudget(openData.transaction.instructions),
+    )
+    openOnly.feePayer = wallet.publicKey
+    openOnly.recentBlockhash = latest.blockhash
+    openOnly.lastValidBlockHeight = latest.lastValidBlockHeight
+    openOnly.sign(wallet, ...openData.signers)
+    return {
+      plan: {
+        mode: 'atomic',
+        anchor,
+        swapInputMint: inputMint,
+        swapInputSide: sellingA ? 'MintA' : 'MintB',
+        swapAmountIn: '0',
+        expectedSwapOut: '0',
+        postSwapTick: solved.tickCurrent,
+        liquidity: liquidity.toString(),
+        depositA: usableA.toString(),
+        depositB: usableB.toString(),
+        nftMint,
+        signedTransaction: signedTxPayload(openOnly),
         blockhash: latest.blockhash,
         lastValidBlockHeight: latest.lastValidBlockHeight,
       },
@@ -568,7 +633,8 @@ export async function simulateRaydiumSigned(
     result = await withRpcFallback(rpc => rpc.simulateTransaction(legacy), connection)
   }
   if (result.value.err) {
-    throw new Error(`Raydium rebalance simulation failed: ${JSON.stringify(result.value.err)}`)
+    const logs = (result.value.logs || []).filter(line => /Error|failed|insufficient|exceed/i.test(line)).slice(-4).join(' | ')
+    throw new Error(`Raydium rebalance simulation failed: ${JSON.stringify(result.value.err)}${logs ? ` :: ${logs}` : ''}`)
   }
 }
 
