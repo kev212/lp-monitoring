@@ -27,7 +27,9 @@ export function parseJupiterUsdPrices(payload: unknown, mints: string[]): Map<st
 /**
  * Fresh USD prices for the requested mints in a single batched request. Fresh
  * cache hits are reused for 60 seconds; failures are not cached so the next
- * refresh retries instead of pinning a zero price.
+ * refresh retries instead of pinning a zero price. Jupiter occasionally answers
+ * a batch with an empty data object, so mints still missing after the batch are
+ * retried one by one.
  */
 export async function getTokenPricesInUsd(mints: string[]): Promise<Map<string, number>> {
   const unique = [...new Set(mints.filter(Boolean))]
@@ -44,18 +46,39 @@ export async function getTokenPricesInUsd(mints: string[]): Promise<Map<string, 
   }
   if (missing.length === 0) return prices
 
-  try {
-    const headers: Record<string, string> = { Accept: 'application/json' }
-    if (config.jupiterApiKey) headers['x-api-key'] = config.jupiterApiKey
-    const res = await axios.get(`https://api.jup.ag/price/v3?ids=${missing.join(',')}`, { headers, timeout: 5_000 })
-    for (const [mint, price] of parseJupiterUsdPrices(res.data, missing)) {
-      usdPriceCache.set(mint, { price, at: now })
-      prices.set(mint, price)
-    }
-  } catch {
-    // Leave uncached mints out of the result so callers can fall back this round.
+  for (const [mint, price] of await fetchJupiterUsdPrices(missing)) {
+    usdPriceCache.set(mint, { price, at: now })
+    prices.set(mint, price)
   }
   return prices
+}
+
+async function fetchJupiterUsdPrices(mints: string[]): Promise<Map<string, number>> {
+  const found = new Map<string, number>()
+  const headers: Record<string, string> = { Accept: 'application/json' }
+  if (config.jupiterApiKey) headers['x-api-key'] = config.jupiterApiKey
+
+  try {
+    const res = await axios.get(`https://api.jup.ag/price/v3?ids=${mints.join(',')}`, { headers, timeout: 5_000 })
+    for (const [mint, price] of parseJupiterUsdPrices(res.data, mints)) found.set(mint, price)
+  } catch {
+    // Fall through to the per-mint requests below.
+  }
+
+  const remaining = mints.filter(mint => !found.has(mint))
+  if (remaining.length === 0) return found
+  const singles = await Promise.all(remaining.map(async mint => {
+    try {
+      const res = await axios.get(`https://api.jup.ag/price/v3?ids=${mint}`, { headers, timeout: 5_000 })
+      return [mint, parseJupiterUsdPrices(res.data, [mint]).get(mint)] as const
+    } catch {
+      return [mint, undefined] as const
+    }
+  }))
+  for (const [mint, price] of singles) {
+    if (price !== undefined) found.set(mint, price)
+  }
+  return found
 }
 
 export async function getTokenPriceInSol(mint: PublicKey): Promise<number> {
