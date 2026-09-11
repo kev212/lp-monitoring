@@ -1,6 +1,6 @@
 import { BN } from '@coral-xyz/anchor'
 import DLMM, { getPriceOfBinByBinId, MAX_BINS_PER_POSITION, StrategyType } from '@meteora-ag/dlmm'
-import { getAssociatedTokenAddressSync } from '@solana/spl-token'
+import { getAssociatedTokenAddressSync, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from '@solana/spl-token'
 import bs58 from 'bs58'
 import {
   Connection,
@@ -459,8 +459,29 @@ export function remainingPriceMoveBins(maxBins: number, observedMoveBins: number
   return remaining
 }
 
+/**
+ * Token-2022 mints live under a different token program, so their associated
+ * token account address differs from the legacy derivation. Resolve the program
+ * from the mint account owner instead of assuming the legacy program.
+ */
+export function tokenProgramIdFromMintOwner(owner: string | undefined | null): PublicKey {
+  return owner === TOKEN_2022_PROGRAM_ID.toBase58() ? TOKEN_2022_PROGRAM_ID : TOKEN_PROGRAM_ID
+}
+
+const mintTokenProgramCache = new Map<string, PublicKey>()
+
+async function tokenProgramIdForMint(connection: Connection, mint: string): Promise<PublicKey> {
+  const cached = mintTokenProgramCache.get(mint)
+  if (cached) return cached
+  const account = await withRpcFallback(rpc => rpc.getAccountInfo(new PublicKey(mint), 'confirmed'), connection)
+  const programId = tokenProgramIdFromMintOwner(account?.owner.toBase58())
+  mintTokenProgramCache.set(mint, programId)
+  return programId
+}
+
 async function rawAssociatedTokenBalance(connection: Connection, owner: PublicKey, mint: string): Promise<bigint> {
-  const ata = getAssociatedTokenAddressSync(new PublicKey(mint), owner)
+  const tokenProgramId = await tokenProgramIdForMint(connection, mint)
+  const ata = getAssociatedTokenAddressSync(new PublicKey(mint), owner, false, tokenProgramId)
   const account = await withRpcFallback(rpc => rpc.getAccountInfo(ata, 'confirmed'), connection)
   if (!account) return 0n
   if (account.data.byteLength < 72) throw new Error('Associated token account data is invalid')

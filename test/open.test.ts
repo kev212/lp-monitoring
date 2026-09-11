@@ -13,9 +13,11 @@ import {
   remainingPriceMoveBins,
   sdkSlippagePercentForBins,
   strategyType,
+  tokenProgramIdFromMintOwner,
   transactionRequiresInitializeBinArray,
 } from '../src/meteora/open.js'
 import { StrategyType } from '@meteora-ag/dlmm'
+import { TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from '@solana/spl-token'
 import { PublicKey, SystemProgram } from '@solana/web3.js'
 
 function binResolver(activeBinId: number, activePrice: number, step: number) {
@@ -151,4 +153,17 @@ test('decodes Meteora bin slippage errors for simulation and finalized failures'
   assert.equal(isBinSlippageError(new OpenSimulationError(details)), true)
   assert.equal(isBinSlippageError(new OpenTransactionFailedError('signature', 'position', details)), true)
   assert.equal(isBinSlippageError(new Error('RPC request failed')), false)
+})
+
+test('resolves the token program from the mint account owner', () => {
+  assert.equal(
+    tokenProgramIdFromMintOwner('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb').toBase58(),
+    TOKEN_2022_PROGRAM_ID.toBase58(),
+  )
+  assert.equal(
+    tokenProgramIdFromMintOwner('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA').toBase58(),
+    TOKEN_PROGRAM_ID.toBase58(),
+  )
+  assert.equal(tokenProgramIdFromMintOwner(undefined).toBase58(), TOKEN_PROGRAM_ID.toBase58())
+  assert.equal(tokenProgramIdFromMintOwner(null).toBase58(), TOKEN_PROGRAM_ID.toBase58())
 })
