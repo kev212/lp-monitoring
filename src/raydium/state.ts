@@ -4,12 +4,16 @@ import type { RebalanceDirection } from '../types.js'
 const STATE_PREFIX = 'raydium_position_state:'
 const SETTINGS_PREFIX = 'raydium_rebalance_settings:'
 
+export type RaydiumBasisSource = 'rebalance' | 'baseline'
+
 export interface RaydiumPositionState {
   nftMint: string
   since: number | null
   direction: RebalanceDirection | null
   notified: boolean
   cooldownUntil: number | null
+  basisUsd: number | null
+  basisSource: RaydiumBasisSource | null
   updatedAt: number
 }
 
@@ -28,6 +32,10 @@ export function getRaydiumPositionState(nftMint: string): RaydiumPositionState |
       direction: ['up', 'down'].includes(parsed.direction || '') ? parsed.direction as RebalanceDirection : null,
       notified: parsed.notified === true,
       cooldownUntil: Number.isSafeInteger(parsed.cooldownUntil) ? parsed.cooldownUntil as number : null,
+      basisUsd: typeof parsed.basisUsd === 'number' && Number.isFinite(parsed.basisUsd) && parsed.basisUsd > 0
+        ? parsed.basisUsd
+        : null,
+      basisSource: parsed.basisSource === 'rebalance' || parsed.basisSource === 'baseline' ? parsed.basisSource : null,
       updatedAt: Number.isSafeInteger(parsed.updatedAt) ? parsed.updatedAt as number : Date.now(),
     }
   } catch {

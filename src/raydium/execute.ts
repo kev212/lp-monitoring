@@ -25,6 +25,7 @@ import { getJupiterSwapQuote } from '../swap.js'
 import { buildRaydiumInRangeRange, pricePercentToTicks, type RaydiumTickRange } from './policy.js'
 import { loadRaydiumPool, type RaydiumPoolBundle, type RaydiumPoolState } from './pool.js'
 import { getRaydium } from './sdk.js'
+import { raydiumUsdPerQuote } from './valuation.js'
 
 const WSOL_MINT = 'So11111111111111111111111111111111111111112'
 const MAX_TX_BYTES = 1232
@@ -188,6 +189,7 @@ export interface RaydiumRebalancePlan {
   liquidity: string
   depositA: string
   depositB: string
+  depositValueUsd: number | null
   nftMint: string
   signedTransaction: string
   blockhash: string
@@ -404,6 +406,11 @@ export async function prepareRaydiumRebalance(
   )
   if (liquidity.lten(0)) throw new Error('Raydium plan produced zero liquidity')
 
+  const depositValueQuote =
+    toNumber(usableB) / 10 ** state.mintBDecimals + (toNumber(usableA) / 10 ** state.mintADecimals) * state.currentPrice
+  const usdPerQuote = await raydiumUsdPerQuote(state.mintB)
+  const depositValueUsd = usdPerQuote === null ? null : depositValueQuote * usdPerQuote
+
   const maxA = new BN(postA.toString())
   const maxB = new BN(postB.toString())
 
@@ -460,6 +467,7 @@ export async function prepareRaydiumRebalance(
         liquidity: liquidity.toString(),
         depositA: usableA.toString(),
         depositB: usableB.toString(),
+        depositValueUsd,
         nftMint,
         signedTransaction: atomic.signedTransaction,
         blockhash: latest.blockhash,
@@ -492,6 +500,7 @@ export async function prepareRaydiumRebalance(
         liquidity: liquidity.toString(),
         depositA: usableA.toString(),
         depositB: usableB.toString(),
+        depositValueUsd,
         nftMint,
         signedTransaction: signedTxPayload(openOnly),
         blockhash: latest.blockhash,
@@ -536,6 +545,7 @@ export async function prepareRaydiumRebalance(
       liquidity: liquidity.toString(),
       depositA: usableA.toString(),
       depositB: usableB.toString(),
+      depositValueUsd,
       nftMint,
       signedTransaction: swapPayload,
       blockhash: latest.blockhash,

@@ -10,6 +10,8 @@ export interface RaydiumWalletPosition {
   tickLower: number
   tickUpper: number
   liquidity: bigint
+  feeOwedA: bigint
+  feeOwedB: bigint
 }
 
 export async function listRaydiumWalletPositions(
@@ -26,6 +28,8 @@ export async function listRaydiumWalletPositions(
       tickLower: position.tickLower,
       tickUpper: position.tickUpper,
       liquidity: BigInt(position.liquidity.toString()),
+      feeOwedA: BigInt(position.tokenFeesOwedA.toString()),
+      feeOwedB: BigInt(position.tokenFeesOwedB.toString()),
     }))
 }
 

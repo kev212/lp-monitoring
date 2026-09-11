@@ -70,6 +70,8 @@ export async function tickRaydiumAgent(connection: Connection, wallet: Keypair):
           direction: null,
           notified: false,
           cooldownUntil: existing.cooldownUntil,
+          basisUsd: existing.basisUsd,
+          basisSource: existing.basisSource,
         })
       }
       continue
@@ -91,6 +93,8 @@ export async function tickRaydiumAgent(connection: Connection, wallet: Keypair):
       direction: timer.direction,
       notified: directionChanged ? false : (existing?.notified ?? false),
       cooldownUntil: existing?.cooldownUntil ?? null,
+      basisUsd: existing?.basisUsd ?? null,
+      basisSource: existing?.basisSource ?? null,
     }
     if (timer.since !== (existing?.since ?? null) || directionChanged) {
       saveRaydiumPositionState(nextState)

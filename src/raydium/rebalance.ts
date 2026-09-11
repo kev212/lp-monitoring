@@ -450,6 +450,8 @@ async function reconcileRaydiumIntent(
         direction: null,
         notified: false,
         cooldownUntil: Date.now() + config.raydiumRebalanceCooldownMs,
+        basisUsd: plan?.depositValueUsd ?? null,
+        basisSource: plan?.depositValueUsd != null ? 'rebalance' : null,
       })
       deleteRaydiumIntent(intent.owner)
       if (intent.leaseId) {
