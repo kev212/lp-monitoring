@@ -18,8 +18,8 @@ export interface RaydiumDashboardPosition {
   tickSpacing: number
   currentTick: number
   direction: RebalanceDirection | null
-  armedDirection: RebalanceDirection | null
   since: number | null
+  cooldownUntil: number | null
 }
 
 export interface RaydiumDashboardSnapshot {
@@ -59,8 +59,8 @@ export function readRaydiumDashboardSnapshot(): RaydiumDashboardSnapshot | null 
           tickSpacing: position.tickSpacing as number,
           currentTick: position.currentTick as number,
           direction: ['up', 'down'].includes(position.direction || '') ? position.direction as RebalanceDirection : null,
-          armedDirection: ['up', 'down'].includes(position.armedDirection || '') ? position.armedDirection as RebalanceDirection : null,
           since: Number.isSafeInteger(position.since) ? position.since as number : null,
+          cooldownUntil: Number.isSafeInteger(position.cooldownUntil) ? position.cooldownUntil as number : null,
         }]
       }),
     }
@@ -103,8 +103,8 @@ export async function refreshRaydiumDashboardSnapshot(
         tickSpacing: loaded.state.tickSpacing,
         currentTick: loaded.state.currentTick,
         direction: raydiumOorDirection(loaded.state.currentTick, position.tickLower, position.tickUpper),
-        armedDirection: state?.armedDirection ?? null,
         since: state?.since ?? null,
+        cooldownUntil: state?.cooldownUntil ?? null,
       })
     }
     const snapshot: RaydiumDashboardSnapshot = { version: 1, updatedAt: now, positions: entries }
@@ -124,11 +124,11 @@ function formatElapsed(ms: number): string {
 
 export function formatRaydiumDashboardLines(
   snapshot: RaydiumDashboardSnapshot | null,
-  options: { enabled: boolean; mode: RebalanceMode; windowMinutes: number; gapPercent: number; now?: number; maxLines?: number },
+  options: { enabled: boolean; mode: RebalanceMode; windowMinutes: number; now?: number; maxLines?: number },
 ): string[] {
   const now = options.now ?? Date.now()
   const maxLines = options.maxLines ?? 5
-  const lines = [`🟣 RAYDIUM CLMM · auto ${options.enabled ? 'ON' : 'OFF'} · mode ${options.mode} · window ${options.windowMinutes}m · gap ${options.gapPercent}%`]
+  const lines = [`🟣 RAYDIUM CLMM · auto ${options.enabled ? 'ON' : 'OFF'} · mode ${options.mode} · window ${options.windowMinutes}m · in-range 1 tick`]
   if (!snapshot) {
     lines.push('   Belum ada data posisi Raydium.')
     return lines
@@ -139,9 +139,11 @@ export function formatRaydiumDashboardLines(
   }
   for (const position of snapshot.positions.slice(0, maxLines)) {
     const status = position.direction ? `OOR ${position.direction.toUpperCase()}` : 'IN RANGE'
-    const armed = position.armedDirection ? ` · armed ${position.armedDirection.toUpperCase()}` : ''
+    const cooldown = position.cooldownUntil && position.cooldownUntil > now
+      ? ` · cooldown ${formatElapsed(position.cooldownUntil - now)}`
+      : ''
     const timer = position.since === null ? '' : ` · ${formatElapsed(now - position.since)}`
-    lines.push(`   • ${position.pair} · ${status}${armed}${timer}`)
+    lines.push(`   • ${position.pair} · ${status}${timer}${cooldown}`)
     lines.push(`     ticks ${position.tickLower}..${position.tickUpper} · curr ${position.currentTick} · spacing ${position.tickSpacing}`)
   }
   if (snapshot.positions.length > maxLines) {

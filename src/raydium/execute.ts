@@ -1,28 +1,45 @@
 import { BN } from '@coral-xyz/anchor'
-import { CLMM_PROGRAM_ID, LiquidityMathUtil, TickUtil, TxVersion } from '@raydium-io/raydium-sdk-v2'
+import {
+  CLMM_PROGRAM_ID,
+  LiquidityMathUtil,
+  TickUtil,
+  TxVersion,
+  swapInternal,
+  type SwapSimulationResult,
+} from '@raydium-io/raydium-sdk-v2'
 import { getAssociatedTokenAddressSync } from '@solana/spl-token'
 import type { Connection, Keypair } from '@solana/web3.js'
-import { PublicKey } from '@solana/web3.js'
+import {
+  ComputeBudgetProgram,
+  PublicKey,
+  Transaction,
+  TransactionMessage,
+  VersionedTransaction,
+} from '@solana/web3.js'
+import type { Signer } from '@solana/web3.js'
 import { config } from '../config.js'
 import { withRpcFallback } from '../solana/connection.js'
-import type { RebalanceDirection } from '../types.js'
-import { baseSideForDirection, type RaydiumBaseSide } from './policy.js'
-import { loadRaydiumPool, type RaydiumPoolBundle } from './pool.js'
+import { getJupiterSwapQuote } from '../swap.js'
+import { buildRaydiumInRangeRange, pricePercentToTicks, type RaydiumTickRange } from './policy.js'
+import { loadRaydiumPool, type RaydiumPoolBundle, type RaydiumPoolState } from './pool.js'
 import { getRaydium } from './sdk.js'
 
 const WSOL_MINT = 'So11111111111111111111111111111111111111112'
+const MAX_TX_BYTES = 1232
 const CLOSE_MEASURE_TIMEOUT_MS = 45_000
 const CLOSE_MEASURE_POLL_MS = 1_000
-
-function computeBudget() {
-  return {
-    units: config.raydiumComputeUnitLimit,
-    microLamports: config.raydiumComputeUnitPrice,
-  }
-}
+const SOLVE_ITERATIONS = 18
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+function atomicBudget() {
+  return { units: config.raydiumAtomicComputeUnitLimit, microLamports: config.raydiumComputeUnitPrice }
+}
+
+function closeBudget() {
+  return { units: config.raydiumCloseComputeUnitLimit, microLamports: config.raydiumComputeUnitPrice }
 }
 
 async function readWalletTokenAmount(
@@ -36,8 +53,7 @@ async function readWalletTokenAmount(
     const lamports = await withRpcFallback(rpc => rpc.getBalance(owner, commitment), connection)
     return BigInt(lamports)
   }
-  const mintAddress = new PublicKey(mint)
-  const ata = getAssociatedTokenAddressSync(mintAddress, owner, false, new PublicKey(tokenProgramId))
+  const ata = getAssociatedTokenAddressSync(new PublicKey(mint), owner, false, new PublicKey(tokenProgramId))
   try {
     const balance = await withRpcFallback(rpc => rpc.getTokenAccountBalance(ata, commitment), connection)
     return BigInt(balance.value.amount)
@@ -47,74 +63,70 @@ async function readWalletTokenAmount(
 }
 
 export interface RaydiumFundingBaseline {
-  baseSide: RaydiumBaseSide
-  fundingMint: string
-  fundingMintProgramId: string
-  fundingAmountRaw: bigint
+  mintA: string
+  mintB: string
+  mintAProgramId: string
+  mintBProgramId: string
+  amountA: bigint
+  amountB: bigint
 }
 
-/**
- * Reads the funding-side wallet balance before the close. Persisting this
- * baseline lets recovery attribute the proceeds even if the process restarts
- * in the middle of the close+reopen cycle.
- */
 export async function readRaydiumFundingBaseline(
   connection: Connection,
   wallet: Keypair,
-  params: { poolId: string; direction: RebalanceDirection },
+  params: { poolId: string },
 ): Promise<RaydiumFundingBaseline> {
   const { bundle } = await loadRaydiumPool(connection, wallet, params.poolId)
-  const baseSide = baseSideForDirection(params.direction)
-  const fundingMint = baseSide === 'MintA' ? bundle.poolInfo.mintA : bundle.poolInfo.mintB
-  const fundingAmountRaw = await readWalletTokenAmount(
-    connection,
-    wallet.publicKey,
-    fundingMint.address,
-    fundingMint.programId,
-    'finalized',
-  )
+  const [amountA, amountB] = await Promise.all([
+    readWalletTokenAmount(connection, wallet.publicKey, bundle.poolInfo.mintA.address, bundle.poolInfo.mintA.programId, 'finalized'),
+    readWalletTokenAmount(connection, wallet.publicKey, bundle.poolInfo.mintB.address, bundle.poolInfo.mintB.programId, 'finalized'),
+  ])
   return {
-    baseSide,
-    fundingMint: fundingMint.address,
-    fundingMintProgramId: fundingMint.programId,
-    fundingAmountRaw,
+    mintA: bundle.poolInfo.mintA.address,
+    mintB: bundle.poolInfo.mintB.address,
+    mintAProgramId: bundle.poolInfo.mintA.programId,
+    mintBProgramId: bundle.poolInfo.mintB.programId,
+    amountA,
+    amountB,
   }
 }
 
-export async function measureRaydiumFundingAmount(
+export async function measureRaydiumFundingDelta(
   connection: Connection,
   wallet: Keypair,
-  params: { fundingMint: string; fundingMintProgramId: string; preFundingAmountRaw: bigint },
-): Promise<bigint> {
-  const current = await readWalletTokenAmount(
-    connection,
-    wallet.publicKey,
-    params.fundingMint,
-    params.fundingMintProgramId,
-    'confirmed',
-  )
-  return current > params.preFundingAmountRaw ? current - params.preFundingAmountRaw : 0n
+  params: { mintA: string; mintB: string; mintAProgramId: string; mintBProgramId: string; baselineA: bigint; baselineB: bigint },
+): Promise<{ amountA: bigint; amountB: bigint }> {
+  const [currentA, currentB] = await Promise.all([
+    readWalletTokenAmount(connection, wallet.publicKey, params.mintA, params.mintAProgramId, 'confirmed'),
+    readWalletTokenAmount(connection, wallet.publicKey, params.mintB, params.mintBProgramId, 'confirmed'),
+  ])
+  return {
+    amountA: currentA > params.baselineA ? currentA - params.baselineA : 0n,
+    amountB: currentB > params.baselineB ? currentB - params.baselineB : 0n,
+  }
 }
 
 export interface RaydiumCloseParams {
   poolId: string
   nftMint: string
-  direction: RebalanceDirection
-  fundingMint: string
-  fundingMintProgramId: string
-  preFundingAmountRaw: bigint
+  mintA: string
+  mintB: string
+  mintAProgramId: string
+  mintBProgramId: string
+  baselineA: bigint
+  baselineB: bigint
 }
 
 export interface RaydiumCloseSubmission {
   signature: string
-  baseAmountRaw: bigint | null
+  amountA: bigint
+  amountB: bigint
 }
 
 /**
- * Closes the position (100% liquidity, claim fees, burn NFT) and then polls the
- * funding-side balance until the proceeds are visible. Returns a null amount
- * instead of failing when the balance has not caught up yet, so the durable
- * intent can re-measure without re-sending the close.
+ * Closes the position (100% liquidity, claim fees, burn NFT) and then polls
+ * both funding sides until the proceeds are visible. A missing measurement is
+ * returned as zero instead of failing, so the durable intent can re-measure.
  */
 export async function submitRaydiumClose(
   connection: Connection,
@@ -138,8 +150,6 @@ export async function submitRaydiumClose(
     false,
   )
   const keepRatio = (amount: BN) => amount.muln(10_000 - config.raydiumSlippageBps).divn(10_000)
-  const amountMinA = keepRatio(amountA)
-  const amountMinB = keepRatio(amountB)
 
   const { execute } = await raydium.clmm.decreaseLiquidity({
     poolInfo: bundle.poolInfo,
@@ -147,66 +157,419 @@ export async function submitRaydiumClose(
     ownerPosition,
     ownerInfo: { useSOLBalance: true, closePosition: true },
     liquidity: ownerPosition.liquidity,
-    amountMinA,
-    amountMinB,
+    amountMinA: keepRatio(amountA),
+    amountMinB: keepRatio(amountB),
     txVersion: TxVersion.LEGACY,
-    computeBudgetConfig: computeBudget(),
+    computeBudgetConfig: closeBudget(),
   })
   const { txId } = await execute({ sendAndConfirm: true })
 
   const deadline = Date.now() + CLOSE_MEASURE_TIMEOUT_MS
   for (;;) {
-    const amount = await measureRaydiumFundingAmount(connection, wallet, params)
-    if (amount > 0n) return { signature: txId, baseAmountRaw: amount }
-    if (Date.now() >= deadline) return { signature: txId, baseAmountRaw: null }
+    const measured = await measureRaydiumFundingDelta(connection, wallet, params)
+    if (measured.amountA > 0n || measured.amountB > 0n) {
+      return { signature: txId, amountA: measured.amountA, amountB: measured.amountB }
+    }
+    if (Date.now() >= deadline) return { signature: txId, amountA: 0n, amountB: 0n }
     await sleep(CLOSE_MEASURE_POLL_MS)
   }
 }
 
-export interface RaydiumOpenParams {
-  poolId: string
-  tickLower: number
-  tickUpper: number
-  baseSide: RaydiumBaseSide
-  baseAmountRaw: bigint
-}
-
-export interface RaydiumPreparedOpen {
+export interface RaydiumRebalancePlan {
+  mode: 'atomic' | 'split'
+  anchor: RaydiumTickRange
+  swapInputMint: string
+  swapInputSide: 'MintA' | 'MintB'
+  swapAmountIn: string
+  expectedSwapOut: string
+  postSwapTick: number
+  liquidity: string
+  depositA: string
+  depositB: string
   nftMint: string
-  submit: () => Promise<string>
-}
-
-/**
- * Builds the replacement position without submitting it. The generated NFT
- * mint is available before submission so callers can persist it first and
- * recover without risking a duplicate open.
- */
-export async function prepareRaydiumOpen(
-  connection: Connection,
-  wallet: Keypair,
-  params: RaydiumOpenParams,
-): Promise<RaydiumPreparedOpen> {
-  const raydium = await getRaydium(connection, wallet)
-  const { bundle } = await loadRaydiumPool(connection, wallet, params.poolId)
-  const { execute, extInfo } = await raydium.clmm.openPositionFromBase({
-    poolInfo: bundle.poolInfo,
-    poolKeys: bundle.poolKeys,
-    tickLower: Math.min(params.tickLower, params.tickUpper),
-    tickUpper: Math.max(params.tickLower, params.tickUpper),
-    base: params.baseSide,
-    baseAmount: new BN(params.baseAmountRaw.toString()),
-    otherAmountMax: new BN(0),
-    liquidity: new BN(0),
-    nft2022: true,
-    ownerInfo: { useSOLBalance: true },
-    txVersion: TxVersion.LEGACY,
-    computeBudgetConfig: computeBudget(),
-  })
-  const nftMint = extInfo.nftMint.toBase58()
-  return {
-    nftMint,
-    submit: async () => (await execute({ sendAndConfirm: true })).txId,
+  signedTransaction: string
+  blockhash: string
+  lastValidBlockHeight: number
+  /** Split mode only: the follow-up open transaction prepared after the swap lands. */
+  followUp?: {
+    nftMint: string
+    signedTransaction: string
+    blockhash: string
+    lastValidBlockHeight: number
   }
 }
 
-export type { RaydiumPoolBundle }
+export class RaydiumSwapRouteWorseError extends Error {
+  constructor(readonly directWorsePct: number) {
+    super(`Raydium direct swap is ${directWorsePct.toFixed(2)}% worse than the Jupiter quote; rebalance skipped`)
+    this.name = 'RaydiumSwapRouteWorseError'
+  }
+}
+
+interface SwapSimulation {
+  out: bigint
+  tickCurrent: number
+  sqrtPriceX64: bigint
+  accounts: PublicKey[]
+}
+
+function toNumber(value: bigint): number {
+  return Number(value.toString())
+}
+
+/** Required MintA/MintB ratio of an in-range CLMM position at a given sqrt price. */
+export function positionAmountRatio(sqrtPriceX64: bigint, tickLower: number, tickUpper: number): number {
+  const sqrtP = toNumber(sqrtPriceX64)
+  const sqrtL = toNumber(BigInt(TickUtil.getSqrtPriceAtTick(tickLower).toString()))
+  const sqrtU = toNumber(BigInt(TickUtil.getSqrtPriceAtTick(tickUpper).toString()))
+  const amountA = 1 / sqrtP - 1 / sqrtU
+  const amountB = sqrtP - sqrtL
+  if (!(amountB > 0) || !(amountA >= 0)) return 0
+  return amountA / amountB
+}
+
+/**
+ * Solves the swap size so that post-swap balances match the composition of the
+ * one-tick bucket anchored at the post-swap price. Bisection relies on the
+ * ratio being monotonic as the swap moves the price and the balances.
+ */
+export function solveSwapAmount(input: {
+  amountA: bigint
+  amountB: bigint
+  tickSpacing: number
+  simulate: (amountIn: bigint) => { out: bigint; tickCurrent: number; sqrtPriceX64: bigint; accounts: PublicKey[] }
+}): {
+  amountIn: bigint
+  out: bigint
+  tickCurrent: number
+  sqrtPriceX64: bigint
+  accounts: PublicKey[]
+  side: 'MintA' | 'MintB'
+} {
+  const sellingA = input.amountB <= 0n || (input.amountA > 0n && input.amountB > 0n && input.amountA >= input.amountB)
+  const maxIn = sellingA ? input.amountA : input.amountB
+  if (maxIn <= 0n) throw new Error('Raydium rebalance has no funding to swap')
+  const side: 'MintA' | 'MintB' = sellingA ? 'MintA' : 'MintB'
+
+  // f(amountIn) = required A/B ratio at the post-swap bucket minus the actual
+  // post-swap balance ratio.
+  const f = (amountIn: bigint): number => {
+    const sim = input.simulate(amountIn)
+    const postA = sellingA ? input.amountA - amountIn : input.amountA + sim.out
+    const postB = sellingA ? input.amountB + sim.out : input.amountB - amountIn
+    if (postA <= 0n || postB <= 0n) return Number.NaN
+    const anchor = buildRaydiumInRangeRange(sim.tickCurrent, input.tickSpacing)
+    const ratio = positionAmountRatio(sim.sqrtPriceX64, anchor.tickLower, anchor.tickUpper)
+    const balanceRatio = toNumber(postA) / toNumber(postB)
+    return ratio - balanceRatio
+  }
+
+  const fLo = f(0n)
+  const fHi = f(maxIn)
+  if (Number.isNaN(fLo) || Number.isNaN(fHi)) throw new Error('Raydium swap solver could not evaluate the range')
+  if (fLo <= 0) {
+    const sim = input.simulate(0n)
+    return { amountIn: 0n, ...sim, side }
+  }
+  if (fHi >= 0) {
+    const sim = input.simulate(maxIn)
+    return { amountIn: maxIn, ...sim, side }
+  }
+
+  let lo = 0n
+  let hi = maxIn
+  for (let iteration = 0; iteration < SOLVE_ITERATIONS; iteration++) {
+    const mid = (lo + hi) / 2n
+    if (mid === lo || mid === hi) break
+    const fMid = f(mid)
+    if (Number.isNaN(fMid)) break
+    if (fMid > 0) lo = mid
+    else hi = mid
+  }
+  const amountIn = (lo + hi) / 2n
+  const sim = input.simulate(amountIn)
+  return { amountIn, ...sim, side }
+}
+
+export interface RaydiumPreparedRebalance {
+  plan: RaydiumRebalancePlan
+}
+
+function signedTxPayload(transaction: Transaction | VersionedTransaction): string {
+  return Buffer.from(transaction.serialize()).toString('base64')
+}
+
+/**
+ * Plans one in-range replacement: closes loop already done, swaps the excess
+ * side and opens a one-tick bucket around the post-swap price. The swap and
+ * open are merged into a single transaction when it fits; otherwise the plan
+ * falls back to a swap transaction plus a follow-up open transaction.
+ */
+export async function prepareRaydiumRebalance(
+  connection: Connection,
+  wallet: Keypair,
+  params: { poolId: string; amountA: bigint; amountB: bigint },
+): Promise<RaydiumPreparedRebalance> {
+  const raydium = await getRaydium(connection, wallet)
+  const { bundle, state } = await loadRaydiumPool(connection, wallet, params.poolId)
+
+  const sellingA = params.amountB <= 0n || (params.amountA > 0n && params.amountB > 0n && params.amountA >= params.amountB)
+  const inputMint = sellingA ? state.mintA : state.mintB
+  const swapPool = await raydium.clmm.getSwapPoolInfo(params.poolId, sellingA)
+
+  const simulate = (amountIn: bigint): SwapSimulation => {
+    const simulation: SwapSimulationResult = swapInternal({
+      programId: new PublicKey(state.programId),
+      poolId: new PublicKey(state.poolId),
+      poolInfo: swapPool.rpcData,
+      tickArrays: swapPool.tickArrays,
+      configInfo: swapPool.configInfo,
+      tickarrayBitmapExtension: null as never,
+      amountSpecified: new BN(amountIn.toString()),
+      sqrtPriceLimitX64: new BN(0),
+      zeroForOne: sellingA,
+      isBaseInput: true,
+      blockTimestamp: Math.floor(Date.now() / 1000),
+      includeExtraTickArrays: true,
+    })
+    return {
+      out: BigInt(simulation.amountCalculated.toString()),
+      tickCurrent: simulation.tickCurrent,
+      sqrtPriceX64: BigInt(simulation.sqrtPriceX64.toString()),
+      accounts: simulation.accounts,
+    }
+  }
+
+  const solved = solveSwapAmount({ amountA: params.amountA, amountB: params.amountB, tickSpacing: state.tickSpacing, simulate })
+
+  if (solved.amountIn > 0n && solved.out > 0n) {
+    const jupiter = await getJupiterSwapQuote({
+      inputMint,
+      outputMint: sellingA ? state.mintB : state.mintA,
+      rawAmount: solved.amountIn.toString(),
+      slippageBps: config.raydiumSwapSlippageBps,
+    })
+    if (jupiter && jupiter.outAmount > 0n) {
+      const directWorsePct = (Number(jupiter.outAmount) - Number(solved.out)) / Number(jupiter.outAmount) * 100
+      if (directWorsePct > config.raydiumSwapMaxImpactPct) {
+        throw new RaydiumSwapRouteWorseError(directWorsePct)
+      }
+    }
+  }
+  const postA = sellingA ? params.amountA - solved.amountIn : params.amountA + solved.out
+  const postB = sellingA ? params.amountB + solved.out : params.amountB - solved.amountIn
+  const anchor = buildRaydiumInRangeRange(solved.tickCurrent, state.tickSpacing)
+  const sqrtLower = TickUtil.getSqrtPriceAtTick(anchor.tickLower)
+  const sqrtUpper = TickUtil.getSqrtPriceAtTick(anchor.tickUpper)
+  const bufferPct = BigInt(Math.round(config.raydiumLiquidityBufferPct))
+  const usableA = postA * bufferPct / 100n
+  const usableB = postB * bufferPct / 100n
+  const liquidity = LiquidityMathUtil.getLiquidityFromAmounts(
+    solved.sqrtPriceX64,
+    sqrtLower,
+    sqrtUpper,
+    new BN(usableA.toString()),
+    new BN(usableB.toString()),
+  )
+  if (liquidity.lten(0)) throw new Error('Raydium plan produced zero liquidity')
+
+  const maxA = new BN(postA.toString())
+  const maxB = new BN(postB.toString())
+
+  const swapData = await raydium.clmm.swap<TxVersion.LEGACY>({
+    poolInfo: swapPool.poolInfo,
+    poolKeys: bundle.poolKeys,
+    inputMint,
+    amountIn: new BN(solved.amountIn.toString()),
+    amountOutMin: new BN((solved.out * BigInt(10_000 - config.raydiumSwapSlippageBps) / 10_000n).toString()),
+    observationId: swapPool.rpcData.observationId,
+    ownerInfo: { useSOLBalance: true },
+    remainingAccounts: solved.accounts,
+    txVersion: TxVersion.LEGACY,
+    computeBudgetConfig: atomicBudget(),
+  })
+  const openData = await raydium.clmm.openPositionFromLiquidity<TxVersion.LEGACY>({
+    poolInfo: bundle.poolInfo,
+    poolKeys: bundle.poolKeys,
+    tickLower: anchor.tickLower,
+    tickUpper: anchor.tickUpper,
+    liquidity,
+    amountMaxA: maxA,
+    amountMaxB: maxB,
+    ownerInfo: { useSOLBalance: true },
+    nft2022: true,
+    txVersion: TxVersion.LEGACY,
+    computeBudgetConfig: atomicBudget(),
+  } as never)
+
+  const nftMint = openData.extInfo.address.nftMint.toBase58()
+  const latest = await withRpcFallback(rpc => rpc.getLatestBlockhash('confirmed'), connection)
+
+  const atomic = await tryBuildAtomic(
+    connection,
+    wallet,
+    bundle,
+    swapData.transaction.instructions,
+    openData.transaction.instructions,
+    [...swapData.signers, ...openData.signers],
+    latest.blockhash,
+  )
+  if (atomic) {
+    return {
+      plan: {
+        mode: 'atomic',
+        anchor,
+        swapInputMint: inputMint,
+        swapInputSide: sellingA ? 'MintA' : 'MintB',
+        swapAmountIn: solved.amountIn.toString(),
+        expectedSwapOut: solved.out.toString(),
+        postSwapTick: solved.tickCurrent,
+        liquidity: liquidity.toString(),
+        depositA: usableA.toString(),
+        depositB: usableB.toString(),
+        nftMint,
+        signedTransaction: atomic.signedTransaction,
+        blockhash: latest.blockhash,
+        lastValidBlockHeight: latest.lastValidBlockHeight,
+      },
+    }
+  }
+
+  // Fallback: the merged transaction does not fit. Submit the swap first, then
+  // the open transaction. Both are signed and persisted before broadcast.
+  const swapTx = new Transaction().add(
+    ComputeBudgetProgram.setComputeUnitLimit({ units: config.raydiumAtomicComputeUnitLimit }),
+    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: config.raydiumComputeUnitPrice }),
+    ...stripComputeBudget(swapData.transaction.instructions),
+  )
+  swapTx.feePayer = wallet.publicKey
+  swapTx.recentBlockhash = latest.blockhash
+  swapTx.lastValidBlockHeight = latest.lastValidBlockHeight
+  swapTx.sign(wallet, ...swapData.signers)
+
+  const openTx = new Transaction().add(
+    ComputeBudgetProgram.setComputeUnitLimit({ units: config.raydiumAtomicComputeUnitLimit }),
+    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: config.raydiumComputeUnitPrice }),
+    ...stripComputeBudget(openData.transaction.instructions),
+  )
+  openTx.feePayer = wallet.publicKey
+  openTx.recentBlockhash = latest.blockhash
+  openTx.lastValidBlockHeight = latest.lastValidBlockHeight
+  openTx.sign(wallet, ...openData.signers)
+
+  const swapPayload = signedTxPayload(swapTx)
+  const openPayload = signedTxPayload(openTx)
+  return {
+    plan: {
+      mode: 'split',
+      anchor,
+      swapInputMint: inputMint,
+      swapInputSide: sellingA ? 'MintA' : 'MintB',
+      swapAmountIn: solved.amountIn.toString(),
+      expectedSwapOut: solved.out.toString(),
+      postSwapTick: solved.tickCurrent,
+      liquidity: liquidity.toString(),
+      depositA: usableA.toString(),
+      depositB: usableB.toString(),
+      nftMint,
+      signedTransaction: swapPayload,
+      blockhash: latest.blockhash,
+      lastValidBlockHeight: latest.lastValidBlockHeight,
+      followUp: {
+        nftMint,
+        signedTransaction: openPayload,
+        blockhash: latest.blockhash,
+        lastValidBlockHeight: latest.lastValidBlockHeight,
+      },
+    },
+  }
+}
+
+function stripComputeBudget(instructions: Transaction['instructions']): Transaction['instructions'] {
+  return instructions.filter(instruction => !instruction.programId.equals(ComputeBudgetProgram.programId))
+}
+
+async function tryBuildAtomic(
+  connection: Connection,
+  wallet: Keypair,
+  bundle: RaydiumPoolBundle,
+  swapInstructions: Transaction['instructions'],
+  openInstructions: Transaction['instructions'],
+  extraSigners: Signer[],
+  blockhash: string,
+): Promise<{ signedTransaction: string } | null> {
+  const instructions = [
+    ComputeBudgetProgram.setComputeUnitLimit({ units: config.raydiumAtomicComputeUnitLimit }),
+    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: config.raydiumComputeUnitPrice }),
+    ...stripComputeBudget(swapInstructions),
+    ...stripComputeBudget(openInstructions),
+  ]
+
+  const legacy = new Transaction().add(...instructions)
+  legacy.feePayer = wallet.publicKey
+  legacy.recentBlockhash = blockhash
+  const legacyBytes = legacy.serialize({ requireAllSignatures: false, verifySignatures: false }).length
+  if (legacyBytes <= MAX_TX_BYTES) {
+    legacy.sign(wallet, ...extraSigners)
+    return { signedTransaction: signedTxPayload(legacy) }
+  }
+
+  const lookupTableKey = (bundle.poolKeys as { lookupTableAccount?: string } | undefined)?.lookupTableAccount
+  if (!lookupTableKey) return null
+  const lookupTable = (await connection.getAddressLookupTable(new PublicKey(lookupTableKey))).value
+  if (!lookupTable) return null
+
+  const message = new TransactionMessage({
+    payerKey: wallet.publicKey,
+    recentBlockhash: blockhash,
+    instructions,
+  }).compileToV0Message([lookupTable])
+  const versioned = new VersionedTransaction(message)
+  versioned.sign([wallet, ...extraSigners])
+  if (versioned.serialize().length > MAX_TX_BYTES) return null
+  return { signedTransaction: Buffer.from(versioned.serialize()).toString('base64') }
+}
+
+export async function sendRaydiumSigned(
+  connection: Connection,
+  base64Transaction: string,
+  blockhash: string,
+  lastValidBlockHeight: number,
+): Promise<{ signature: string }> {
+  const raw = Buffer.from(base64Transaction, 'base64')
+  const signature = await withRpcFallback(rpc => rpc.sendRawTransaction(raw, {
+    skipPreflight: false,
+    preflightCommitment: 'confirmed',
+    maxRetries: 3,
+  }), connection)
+  await withRpcFallback(rpc => rpc.confirmTransaction(
+    { signature, blockhash, lastValidBlockHeight },
+    'confirmed',
+  ), connection)
+  return { signature }
+}
+
+export async function simulateRaydiumSigned(
+  connection: Connection,
+  signedTransaction: string,
+): Promise<void> {
+  const raw = Buffer.from(signedTransaction, 'base64')
+  let result: Awaited<ReturnType<Connection['simulateTransaction']>>
+  let versioned: VersionedTransaction | null = null
+  try {
+    versioned = VersionedTransaction.deserialize(raw)
+  } catch {
+    versioned = null
+  }
+  if (versioned) {
+    result = await withRpcFallback(rpc => rpc.simulateTransaction(versioned as VersionedTransaction), connection)
+  } else {
+    const legacy = Transaction.from(raw)
+    result = await withRpcFallback(rpc => rpc.simulateTransaction(legacy), connection)
+  }
+  if (result.value.err) {
+    throw new Error(`Raydium rebalance simulation failed: ${JSON.stringify(result.value.err)}`)
+  }
+}
+
+export { WSOL_MINT }

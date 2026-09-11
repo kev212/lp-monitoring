@@ -544,7 +544,6 @@ class TelegramDashboardController {
         enabled: config.raydiumEnabled,
         mode: config.raydiumRebalanceMode,
         windowMinutes: config.raydiumRebalanceWindowMinutes,
-        gapPercent: config.raydiumRebalanceGapPct,
       })
     } catch (err) {
       console.log(`[telegram] raydium dashboard section failed: ${err instanceof Error ? err.message : 'unknown'}`)

@@ -15,27 +15,27 @@ test('formats a Raydium dashboard section with range status and OOR timer', () =
     {
       nftMint: 'n1', poolId: 'p1', pair: 'DoGE/SOL',
       tickLower: 100, tickUpper: 160, tickSpacing: 60, currentTick: 130,
-      direction: null, armedDirection: null, since: null,
+      direction: null, since: null, cooldownUntil: null,
     },
     {
       nftMint: 'n2', poolId: 'p2', pair: 'AAA/SOL',
       tickLower: 200, tickUpper: 260, tickSpacing: 60, currentTick: 300,
-      direction: 'up', armedDirection: 'down', since: now - 120_000,
+      direction: 'up', since: now - 120_000, cooldownUntil: now + 300_000,
     },
-  ], now), { enabled: true, mode: 'both', windowMinutes: 5, gapPercent: 0.5, now })
+  ], now), { enabled: true, mode: 'both', windowMinutes: 5, now })
 
-  assert.match(lines[0], /RAYDIUM CLMM · auto ON · mode both · window 5m · gap 0\.5%/)
+  assert.match(lines[0], /RAYDIUM CLMM · auto ON · mode both · window 5m · in-range 1 tick/)
   assert.match(lines[1], /DoGE\/SOL · IN RANGE/)
   assert.match(lines[2], /ticks 100\.\.160 · curr 130 · spacing 60/)
-  assert.match(lines[3], /AAA\/SOL · OOR UP · armed DOWN · 2m00s/)
+  assert.match(lines[3], /AAA\/SOL · OOR UP · 2m00s · cooldown 5m00s/)
 })
 
 test('shows the disabled state and handles empty snapshots', () => {
-  const missing = formatRaydiumDashboardLines(null, { enabled: false, mode: 'up', windowMinutes: 5, gapPercent: 0.5 })
+  const missing = formatRaydiumDashboardLines(null, { enabled: false, mode: 'up', windowMinutes: 5 })
   assert.match(missing[0], /auto OFF · mode up/)
   assert.match(missing[1], /Belum ada data posisi Raydium/)
 
-  const empty = formatRaydiumDashboardLines(snapshot([]), { enabled: true, mode: 'both', windowMinutes: 5, gapPercent: 0.5 })
+  const empty = formatRaydiumDashboardLines(snapshot([]), { enabled: true, mode: 'both', windowMinutes: 5 })
   assert.match(empty[1], /Tidak ada posisi Raydium/)
 })
 
@@ -49,14 +49,13 @@ test('caps the section and reports the remaining positions', () => {
     tickSpacing: 1,
     currentTick: 0,
     direction: null,
-    armedDirection: null,
     since: null,
+    cooldownUntil: null,
   }))
   const lines = formatRaydiumDashboardLines(snapshot(positions), {
     enabled: true,
     mode: 'both',
     windowMinutes: 5,
-    gapPercent: 0.5,
     maxLines: 5,
   })
   assert.match(lines.at(-1) ?? '', /\+2 posisi lagi/)

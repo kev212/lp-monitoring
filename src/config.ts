@@ -70,21 +70,37 @@ const raydiumPollMs = envNum('RAYDIUM_POLL_MS', 15_000)
 if (!Number.isInteger(raydiumPollMs) || raydiumPollMs < 5_000) {
   throw new Error('RAYDIUM_POLL_MS must be an integer >= 5000')
 }
-const raydiumComputeUnitLimit = envNum('RAYDIUM_COMPUTE_UNIT_LIMIT', 600_000)
-if (!Number.isInteger(raydiumComputeUnitLimit) || raydiumComputeUnitLimit < 200_000) {
-  throw new Error('RAYDIUM_COMPUTE_UNIT_LIMIT must be an integer >= 200000')
-}
 const raydiumComputeUnitPrice = envNum('RAYDIUM_COMPUTE_UNIT_PRICE', 100_000)
 if (!Number.isInteger(raydiumComputeUnitPrice) || raydiumComputeUnitPrice < 0) {
   throw new Error('RAYDIUM_COMPUTE_UNIT_PRICE must be an integer >= 0')
 }
-const raydiumRebalanceGapPct = envNum('RAYDIUM_REBALANCE_GAP_PCT', 0.5)
-if (!(raydiumRebalanceGapPct > 0) || raydiumRebalanceGapPct > 5) {
-  throw new Error('RAYDIUM_REBALANCE_GAP_PCT must be greater than 0 and at most 5')
-}
 const raydiumRebalanceWindowMinutes = envNum('RAYDIUM_REBALANCE_WINDOW_MINUTES', 5)
 if (!Number.isInteger(raydiumRebalanceWindowMinutes) || raydiumRebalanceWindowMinutes < 1 || raydiumRebalanceWindowMinutes > 1440) {
   throw new Error('RAYDIUM_REBALANCE_WINDOW_MINUTES must be an integer between 1 and 1440')
+}
+const raydiumSwapSlippageBps = envNum('RAYDIUM_SWAP_SLIPPAGE_BPS', 50)
+if (!Number.isInteger(raydiumSwapSlippageBps) || raydiumSwapSlippageBps < 1 || raydiumSwapSlippageBps > 500) {
+  throw new Error('RAYDIUM_SWAP_SLIPPAGE_BPS must be an integer between 1 and 500')
+}
+const raydiumSwapMaxImpactPct = envNum('RAYDIUM_SWAP_MAX_IMPACT_PCT', 1)
+if (!(raydiumSwapMaxImpactPct > 0) || raydiumSwapMaxImpactPct > 10) {
+  throw new Error('RAYDIUM_SWAP_MAX_IMPACT_PCT must be greater than 0 and at most 10')
+}
+const raydiumLiquidityBufferPct = envNum('RAYDIUM_LIQUIDITY_BUFFER_PCT', 98)
+if (!(raydiumLiquidityBufferPct > 50) || raydiumLiquidityBufferPct > 100) {
+  throw new Error('RAYDIUM_LIQUIDITY_BUFFER_PCT must be greater than 50 and at most 100')
+}
+const raydiumRebalanceCooldownMs = envNum('RAYDIUM_REBALANCE_COOLDOWN_MS', 600_000)
+if (!Number.isInteger(raydiumRebalanceCooldownMs) || raydiumRebalanceCooldownMs < 0) {
+  throw new Error('RAYDIUM_REBALANCE_COOLDOWN_MS must be an integer >= 0')
+}
+const raydiumCloseComputeUnitLimit = envNum('RAYDIUM_CLOSE_COMPUTE_UNIT_LIMIT', 80_000)
+if (!Number.isInteger(raydiumCloseComputeUnitLimit) || raydiumCloseComputeUnitLimit < 20_000) {
+  throw new Error('RAYDIUM_CLOSE_COMPUTE_UNIT_LIMIT must be an integer >= 20000')
+}
+const raydiumAtomicComputeUnitLimit = envNum('RAYDIUM_ATOMIC_COMPUTE_UNIT_LIMIT', 400_000)
+if (!Number.isInteger(raydiumAtomicComputeUnitLimit) || raydiumAtomicComputeUnitLimit < 100_000 || raydiumAtomicComputeUnitLimit > 1_400_000) {
+  throw new Error('RAYDIUM_ATOMIC_COMPUTE_UNIT_LIMIT must be an integer between 100000 and 1400000')
 }
 
 const runnerSafetyValues: Array<[string, number, (value: number) => boolean]> = [
@@ -148,10 +164,14 @@ export const config: Config = {
   raydiumRebalanceMode,
   raydiumSlippageBps,
   raydiumPollMs,
-  raydiumComputeUnitLimit,
   raydiumComputeUnitPrice,
-  raydiumRebalanceGapPct,
   raydiumRebalanceWindowMinutes,
+  raydiumSwapSlippageBps,
+  raydiumSwapMaxImpactPct,
+  raydiumLiquidityBufferPct,
+  raydiumRebalanceCooldownMs,
+  raydiumCloseComputeUnitLimit,
+  raydiumAtomicComputeUnitLimit,
   openMaxPriceMoveBins,
   openSolFeeReserve: envNum('OPEN_SOL_FEE_RESERVE', 0.02),
   runnerAgentEnabled,

@@ -5,7 +5,7 @@ export interface RaydiumTickRange {
   tickUpper: number
 }
 
-export type RaydiumBaseSide = 'MintA' | 'MintB'
+export type RaydiumSide = 'MintA' | 'MintB'
 
 /**
  * Raydium CLMM positions are half-open [tickLower, tickUpper): a position is
@@ -35,68 +35,26 @@ export function raydiumDirectionEnabled(mode: RebalanceMode, direction: Rebalanc
  * decimals. 0.5% resolves to about 50 ticks.
  */
 export function pricePercentToTicks(percent: number): number {
-  if (!Number.isFinite(percent) || percent <= 0) throw new Error('Raydium gap percent is invalid')
+  if (!Number.isFinite(percent) || percent <= 0) throw new Error('Raydium percent must be greater than zero')
   return Math.round(Math.log(1 + percent / 100) / Math.log(1.0001))
 }
 
-export function snapTicksToSpacing(ticks: number, tickSpacing: number): number {
+/**
+ * Builds the one-tick-wide replacement range that always contains the current
+ * tick, so the position opens in range and holds both sides from the start.
+ */
+export function buildRaydiumInRangeRange(currentTick: number, tickSpacing: number): RaydiumTickRange {
+  if (!Number.isInteger(currentTick)) throw new Error('Raydium current tick is invalid')
   if (!Number.isInteger(tickSpacing) || tickSpacing < 1) throw new Error('Raydium tick spacing is invalid')
-  const steps = Math.max(1, Math.round(ticks / tickSpacing))
-  return steps * tickSpacing
+  const aligned = Math.floor(currentTick / tickSpacing) * tickSpacing
+  return { tickLower: aligned, tickUpper: aligned + tickSpacing }
 }
 
-export interface RaydiumRangeInput {
-  currentTick: number
-  tickSpacing: number
-  direction: RebalanceDirection
-  gapPercent: number
-}
-
-/**
- * Builds the one-tick-wide replacement range with a price gap from the current
- * tick. The gap is snapped to whole tick-spacing steps with a one-step minimum,
- * so the position always sits strictly outside the current price.
- * Up: the range sits below the current tick and holds 100% MintB.
- * Down: the range sits above the current tick and holds 100% MintA.
- */
-export function buildRaydiumRebalanceRange(input: RaydiumRangeInput): RaydiumTickRange {
-  if (!Number.isInteger(input.currentTick)) throw new Error('Raydium current tick is invalid')
-  if (!Number.isInteger(input.tickSpacing) || input.tickSpacing < 1) throw new Error('Raydium tick spacing is invalid')
-  if (input.direction !== 'up' && input.direction !== 'down') throw new Error('Raydium rebalance direction is invalid')
-  const aligned = Math.floor(input.currentTick / input.tickSpacing) * input.tickSpacing
-  const gap = snapTicksToSpacing(pricePercentToTicks(input.gapPercent), input.tickSpacing)
-  if (input.direction === 'up') {
-    const tickUpper = aligned - gap
-    return { tickUpper, tickLower: tickUpper - input.tickSpacing }
-  }
-  const tickLower = aligned + gap
-  return { tickLower, tickUpper: tickLower + input.tickSpacing }
-}
-
-export function baseSideForDirection(direction: RebalanceDirection): RaydiumBaseSide {
-  return direction === 'up' ? 'MintB' : 'MintA'
-}
-
-/**
- * A freshly rebalanced one-tick position is placed just outside the current
- * price, so it is immediately "out of range" on the side that just triggered.
- * The next trigger must therefore come from the opposite side after price
- * crossed the new range; otherwise the bot would churn every window.
- */
-export function armedDirectionAfterRebalance(trigger: RebalanceDirection): RebalanceDirection {
-  return trigger === 'up' ? 'down' : 'up'
-}
-
-export interface RaydiumTriggerInput {
+export function shouldTriggerRaydium(input: {
   direction: RebalanceDirection | null
-  armedDirection: RebalanceDirection | null
   mode: RebalanceMode
-}
-
-export function shouldTriggerRaydium(input: RaydiumTriggerInput): boolean {
-  if (!raydiumDirectionEnabled(input.mode, input.direction)) return false
-  if (input.armedDirection && input.direction !== input.armedDirection) return false
-  return true
+}): boolean {
+  return raydiumDirectionEnabled(input.mode, input.direction)
 }
 
 export interface RaydiumTimerState {
@@ -106,20 +64,18 @@ export interface RaydiumTimerState {
 }
 
 /**
- * Sustained-window timer for a single Raydium position. Uses the same global
- * window as Meteora auto rebalance. Resets whenever the direction changes or
- * the stored timestamp is missing/invalid.
+ * Sustained-window timer for a single Raydium position. Resets whenever the
+ * direction changes or the stored timestamp is missing/invalid.
  */
 export function nextRaydiumTimer(input: {
   direction: RebalanceDirection | null
   mode: RebalanceMode
-  armedDirection: RebalanceDirection | null
   since: number | null
   previousDirection: RebalanceDirection | null
   now: number
   minutes: number
 }): RaydiumTimerState {
-  if (!shouldTriggerRaydium({ direction: input.direction, armedDirection: input.armedDirection, mode: input.mode })) {
+  if (!shouldTriggerRaydium({ direction: input.direction, mode: input.mode })) {
     return { since: null, direction: null, ready: false }
   }
   const elapsedValid = input.since !== null && Number.isFinite(input.since) && input.now - input.since >= 0

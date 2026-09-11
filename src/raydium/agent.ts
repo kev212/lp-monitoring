@@ -61,10 +61,11 @@ export async function tickRaydiumAgent(connection: Connection, wallet: Keypair):
     const pair = rayDiumPairLabel(loaded.state)
     const direction = raydiumOorDirection(loaded.state.currentTick, position.tickLower, position.tickUpper)
     const existing = getRaydiumPositionState(position.nftMint)
+    if (existing?.cooldownUntil && Date.now() < existing.cooldownUntil) continue
+
     const timer = nextRaydiumTimer({
       direction,
       mode: config.raydiumRebalanceMode,
-      armedDirection: existing?.armedDirection ?? null,
       since: existing?.since ?? null,
       previousDirection: existing?.direction ?? null,
       now: Date.now(),
@@ -75,8 +76,8 @@ export async function tickRaydiumAgent(connection: Connection, wallet: Keypair):
       nftMint: position.nftMint,
       since: timer.since,
       direction: timer.direction,
-      armedDirection: existing?.armedDirection ?? null,
       notified: directionChanged ? false : (existing?.notified ?? false),
+      cooldownUntil: existing?.cooldownUntil ?? null,
     }
     if (timer.since !== (existing?.since ?? null) || directionChanged) {
       saveRaydiumPositionState(nextState)
@@ -87,7 +88,7 @@ export async function tickRaydiumAgent(connection: Connection, wallet: Keypair):
         `⏳ <b>Raydium OOR ${timer.direction.toUpperCase()}</b>\n\n` +
         `<b>${pair}</b>\n` +
         `Ticks: <b>${position.tickLower}-${position.tickUpper}</b> | current: <b>${loaded.state.currentTick}</b>\n` +
-        `Menunggu window global <b>${minutes} menit</b> sebelum rebalance.`
+        `Menunggu window <b>${minutes} menit</b> sebelum rebalance in-range.`
       )
     }
 
@@ -97,10 +98,7 @@ export async function tickRaydiumAgent(connection: Connection, wallet: Keypair):
       nftMint: position.nftMint,
       poolId: position.poolId,
       pairLabel: pair,
-      currentTick: loaded.state.currentTick,
-      tickSpacing: loaded.state.tickSpacing,
       direction,
-      gapPercent: config.raydiumRebalanceGapPct,
     }, services)
     if (started) return
   }

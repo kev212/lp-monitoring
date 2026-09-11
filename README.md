@@ -303,38 +303,48 @@ reopen Down.
 ### Raydium CLMM auto rebalance
 
 Bot juga memonitor posisi **Raydium CLMM** milik wallet yang sama (posisi dibuat
-manual di UI Raydium; bot tidak membuka posisi pertama). Semua posisi baru
-otomatis muncul di `/dashboard` (read-only: pair, status in-range/OOR, ticks,
-current tick) walau auto rebalance sedang OFF. Saat posisi keluar dari range
-melewati window OOR global yang sama, bot menutup posisi (100% liquidity, klaim
-fee, burn NFT) lalu membuka posisi pengganti **1 tick wide** dengan **gap ±0.5%
-dari current price** (dibulatkan ke step `tickSpacing` terdekat, minimal 1 step):
+manual di UI Raydium; bot tidak membuka posisi pertama). Semua posisi otomatis
+muncul di `/dashboard` (read-only: pair, status in-range/OOR, ticks, current
+tick, cooldown) walau auto rebalance sedang OFF.
 
-- **Up**: range tepat di bawah current price sejauh gap, seluruh dana di sisi MintB.
-- **Down**: range tepat di atas current price sejauh gap, seluruh dana di sisi MintA.
+Saat posisi OOR melewati window, bot menggantinya dengan posisi **double-sided
+in-range**: range `[floor(currentTick/tickSpacing)*tickSpacing, +1 tickSpacing)`
+sehingga current tick selalu di dalam range (1 tick wide). Karena hasil close
+selalu single-sided, bot menyelesaikan kekurangan sisi lain dengan **swap**:
 
-Posisi hasil rebalance "diarm" untuk sisi berlawanan, sehingga rebalance
-berikutnya baru terjadi setelah harga benar-benar melewati range baru tersebut —
-mencegah churn tiap window. Arah mengikuti `RAYDIUM_REBALANCE_MODE`
-(`up`, `down`, `both`). Semua transaksi memakai wallet lease yang sama dengan
-operasi Meteora sehingga tidak pernah saling bentrok. Notifikasi Telegram dikirim
-untuk OOR, close, sukses reopen, dan kegagalan. Kill switch: `RAYDIUM_ENABLED`.
+- Swap memakai **Raydium CLMM direct** di pool yang sama (satu hop, tanpa API
+  eksternal), dengan solver rasio: ukuran swap dipilih agar saldo pasca-swap
+  cocok dengan komposisi range, lalu range di-anchor ke tick pasca-swap.
+- **Swap + open digabung dalam satu transaksi (atomic)** bila ukurannya ≤1232 B.
+  Jika tidak muat, fallback otomatis: swap tx dulu, lalu open tx — keduanya
+  durable (signed tx disimpan sebelum broadcast) dan bisa dilanjutkan setelah
+  restart.
+- **Sanity check Jupiter** (read-only): jika harga eksekusi Raydium direct >1%
+  lebih buruk dari quote Jupiter, rebalance dibatalkan + notifikasi (dana aman di
+  wallet).
+- Buffer likuiditas 98% dan `amountMax` ber-slippage agar open tidak gagal saat
+  harga bergerak; sisa kecil tetap di wallet.
+- Cooldown per posisi (`RAYDIUM_REBALANCE_COOLDOWN_MS`) untuk meredam churn.
+- Arah up/down hanya menentukan pemicu; range target sama untuk keduanya.
 
 Env:
 
 | Env | Default | Fungsi |
 |---|---|---|
 | `RAYDIUM_ENABLED` | `false` | Kill switch monitor + rebalance |
-| `RAYDIUM_REBALANCE_MODE` | `both` | Arah rebalance: `up`, `down`, `both` |
-| `RAYDIUM_REBALANCE_GAP_PCT` | `0.5` | Jarak harga dari current price sebelum range baru |
-| `RAYDIUM_REBALANCE_WINDOW_MINUTES` | `5` | Window OOR khusus Raydium (terpisah dari global Telegram) |
+| `RAYDIUM_REBALANCE_MODE` | `both` | Arah trigger: `up`, `down`, `both` |
+| `RAYDIUM_REBALANCE_WINDOW_MINUTES` | `5` | Window OOR khusus Raydium |
 | `RAYDIUM_SLIPPAGE_BPS` | `100` | Toleransi `amountMin` saat close |
+| `RAYDIUM_SWAP_SLIPPAGE_BPS` | `50` | Slippage maks swap (0.5%) |
+| `RAYDIUM_SWAP_MAX_IMPACT_PCT` | `1` | Batas direct lebih buruk dari Jupiter (%) |
+| `RAYDIUM_LIQUIDITY_BUFFER_PCT` | `98` | Buffer likuiditas saat open |
+| `RAYDIUM_REBALANCE_COOLDOWN_MS` | `600000` | Cooldown per posisi setelah rebalance |
 | `RAYDIUM_POLL_MS` | `15000` | Interval polling posisi/pool |
-| `RAYDIUM_COMPUTE_UNIT_LIMIT` | `600000` | Compute unit per transaksi |
 | `RAYDIUM_COMPUTE_UNIT_PRICE` | `100000` | Priority fee (microLamports/CU) |
+| `RAYDIUM_CLOSE_COMPUTE_UNIT_LIMIT` | `80000` | CU limit tx close |
+| `RAYDIUM_ATOMIC_COMPUTE_UNIT_LIMIT` | `400000` | CU limit tx swap+open |
 
 Window OOR Raydium memakai `RAYDIUM_REBALANCE_WINDOW_MINUTES` (default **5
 menit**), terpisah dari setting global Telegram yang dipakai Meteora. Jika close
 berhasil tetapi saldo hasil belum terlihat, bot menyimpan baseline saldo sebelum
-close dan mengukur ulang sampai 5 menit sebelum menyerah, sehingga tidak lagi
-membatalkan reopen karena pembacaan saldo yang telat.
+close dan mengukur ulang sampai 5 menit sebelum menyerah.

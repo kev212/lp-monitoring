@@ -332,3 +332,35 @@ export async function swapTokensToSol(
 ): Promise<SwapResult | null> {
   return attemptSwap(connection, wallet, inputMint, amount, outputMint, 0, minimumRemainingBalance, onSigned, onSettled)
 }
+
+/**
+ * Read-only Jupiter quote used as a sanity check before swapping through a
+ * single Raydium pool. Returns null when the aggregator is unavailable, in
+ * which case callers proceed with the direct route.
+ */
+export async function getJupiterSwapQuote(input: {
+  inputMint: string
+  outputMint: string
+  rawAmount: string
+  slippageBps: number
+}): Promise<{ outAmount: bigint; priceImpactPct: number | null } | null> {
+  try {
+    const baseUrl = config.jupiterSwapBaseUrl.replace(/\/$/, '')
+    const headers: Record<string, string> = { Accept: 'application/json' }
+    if (config.jupiterApiKey) headers['x-api-key'] = config.jupiterApiKey
+    const url = new URL(`${baseUrl}/quote`)
+    url.searchParams.set('inputMint', input.inputMint)
+    url.searchParams.set('outputMint', input.outputMint)
+    url.searchParams.set('amount', normalizeRawSwapAmount(input.rawAmount))
+    url.searchParams.set('slippageBps', String(input.slippageBps))
+    url.searchParams.set('onlyDirectRoutes', 'false')
+    const res = await axios.get(url.toString(), { headers, timeout: 10_000 })
+    const quote = res.data as { outAmount?: string; priceImpactPct?: string | number } | undefined
+    if (!quote?.outAmount) return null
+    const outAmount = BigInt(String(quote.outAmount))
+    const impact = quote.priceImpactPct === undefined ? null : Number(quote.priceImpactPct)
+    return { outAmount, priceImpactPct: impact !== null && Number.isFinite(impact) ? impact : null }
+  } catch {
+    return null
+  }
+}

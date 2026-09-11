@@ -1,8 +1,14 @@
-import { deleteSyncValue, listSyncValues, setSyncValue, getSyncValue } from '../db/client.js'
+import { config } from '../config.js'
+import { deleteSyncValue, getSyncValue, listSyncValues, setSyncValue } from '../db/client.js'
 import { getWalletOperation, releaseWalletOperation, tryAcquireWalletOperation, withWalletExecutionLock } from '../executionLock.js'
 import { sendNotification } from '../telegram.js'
 import type { RebalanceDirection } from '../types.js'
-import { armedDirectionAfterRebalance, baseSideForDirection, buildRaydiumRebalanceRange, type RaydiumBaseSide } from './policy.js'
+import type {
+  RaydiumFundingBaseline,
+  RaydiumPreparedRebalance,
+  RaydiumRebalancePlan,
+} from './execute.js'
+import { RaydiumSwapRouteWorseError } from './execute.js'
 import {
   deleteRaydiumPositionState,
   getRaydiumPositionState,
@@ -16,11 +22,21 @@ export { deleteRaydiumPositionState, getRaydiumPositionState, listRaydiumPositio
 const INTENT_PREFIX = 'raydium_rebalance:'
 const MEASURE_RETRY_MS = 10_000
 const CLOSE_MEASURE_GRACE_MS = 300_000
+const REBALANCE_NOTIFY_COOLDOWN_MS = 15 * 60_000
 
-export type RaydiumIntentStage = 'close_requested' | 'close_submitted' | 'open_prepared' | 'open_submitted' | 'done'
+export type RaydiumIntentStage = 'close_requested' | 'close_submitted' | 'swap_pending' | 'open_pending' | 'done'
+
+interface StoredBaseline {
+  mintA: string
+  mintB: string
+  mintAProgramId: string
+  mintBProgramId: string
+  amountA: string
+  amountB: string
+}
 
 export interface RaydiumRebalanceIntent {
-  version: 1
+  version: 2
   owner: string
   leaseId: string | null
   oldNftMint: string
@@ -28,51 +44,33 @@ export interface RaydiumRebalanceIntent {
   pairLabel: string
   direction: RebalanceDirection
   stage: RaydiumIntentStage
-  tickLower: number
-  tickUpper: number
-  baseSide: RaydiumBaseSide
-  preFundingBalanceRaw: string | null
-  fundingMint: string | null
-  fundingMintProgramId: string | null
-  baseAmountRaw: string | null
-  newNftMint: string | null
+  baseline: StoredBaseline | null
+  amountA: string | null
+  amountB: string | null
+  plan: RaydiumRebalancePlan | null
   closeSignature: string | null
-  closeSubmittedAt: number | null
+  swapSignature: string | null
   openSignature: string | null
+  closeSubmittedAt: number | null
   attempts: number
   nextRetryAt: number
   lastError: string | null
+  lastNotifyKey: string | null
+  lastNotifyAt: number | null
   createdAt: number
   updatedAt: number
 }
 
 export interface RaydiumRebalanceServices {
-  readFundingBaseline: (params: { poolId: string; direction: RebalanceDirection }) => Promise<{
-    baseSide: RaydiumBaseSide
-    fundingMint: string
-    fundingMintProgramId: string
-    fundingAmountRaw: bigint
+  readFundingBaseline: (params: { poolId: string }) => Promise<RaydiumFundingBaseline>
+  submitClose: (params: { poolId: string; nftMint: string; baseline: RaydiumFundingBaseline }) => Promise<{
+    signature: string
+    amountA: bigint
+    amountB: bigint
   }>
-  submitClose: (params: {
-    poolId: string
-    nftMint: string
-    direction: RebalanceDirection
-    fundingMint: string
-    fundingMintProgramId: string
-    preFundingAmountRaw: bigint
-  }) => Promise<{ signature: string; baseAmountRaw: bigint | null }>
-  measureFunding: (params: {
-    fundingMint: string
-    fundingMintProgramId: string
-    preFundingAmountRaw: bigint
-  }) => Promise<bigint>
-  prepareOpen: (params: {
-    poolId: string
-    tickLower: number
-    tickUpper: number
-    baseSide: RaydiumBaseSide
-    baseAmountRaw: bigint
-  }) => Promise<{ nftMint: string; submit: () => Promise<string> }>
+  measureFunding: (baseline: RaydiumFundingBaseline) => Promise<{ amountA: bigint; amountB: bigint }>
+  prepareRebalance: (params: { poolId: string; amountA: bigint; amountB: bigint }) => Promise<RaydiumPreparedRebalance>
+  submitSigned: (plan: RaydiumRebalancePlan, signedTransaction: string) => Promise<{ signature: string }>
   positionExists: (nftMint: string) => Promise<boolean>
   notify: (message: string) => void
 }
@@ -82,14 +80,33 @@ export interface RaydiumRebalanceTrigger {
   nftMint: string
   poolId: string
   pairLabel: string
-  currentTick: number
-  tickSpacing: number
   direction: RebalanceDirection
-  gapPercent: number
 }
 
 export function raydiumRetryDelayMs(attempts: number): number {
   return Math.min(300_000, 5_000 * Math.max(1, attempts))
+}
+
+function toStoredBaseline(baseline: RaydiumFundingBaseline): StoredBaseline {
+  return {
+    mintA: baseline.mintA,
+    mintB: baseline.mintB,
+    mintAProgramId: baseline.mintAProgramId,
+    mintBProgramId: baseline.mintBProgramId,
+    amountA: baseline.amountA.toString(),
+    amountB: baseline.amountB.toString(),
+  }
+}
+
+function toBigintBaseline(stored: StoredBaseline): RaydiumFundingBaseline {
+  return {
+    mintA: stored.mintA,
+    mintB: stored.mintB,
+    mintAProgramId: stored.mintAProgramId,
+    mintBProgramId: stored.mintBProgramId,
+    amountA: BigInt(stored.amountA),
+    amountB: BigInt(stored.amountB),
+  }
 }
 
 function intentKey(owner: string): string {
@@ -106,43 +123,37 @@ export function getRaydiumIntent(owner: string): RaydiumRebalanceIntent | null {
   try {
     const parsed = JSON.parse(raw) as Partial<RaydiumRebalanceIntent>
     if (
-      parsed.version !== 1
+      parsed.version !== 2
       || !parsed.owner
       || !parsed.oldNftMint
       || !parsed.poolId
       || !['up', 'down'].includes(parsed.direction || '')
-      || !['close_requested', 'close_submitted', 'open_prepared', 'open_submitted', 'done'].includes(parsed.stage || '')
-      || !Number.isInteger(parsed.tickLower)
-      || !Number.isInteger(parsed.tickUpper)
+      || !['close_requested', 'close_submitted', 'swap_pending', 'open_pending', 'done'].includes(parsed.stage || '')
     ) {
       return null
     }
-    const direction = parsed.direction as RebalanceDirection
     return {
-      version: 1,
+      version: 2,
       owner: parsed.owner,
       leaseId: parsed.leaseId || null,
       oldNftMint: parsed.oldNftMint,
       poolId: parsed.poolId,
       pairLabel: parsed.pairLabel || parsed.poolId.slice(0, 6),
-      direction,
+      direction: parsed.direction as RebalanceDirection,
       stage: parsed.stage as RaydiumIntentStage,
-      tickLower: parsed.tickLower as number,
-      tickUpper: parsed.tickUpper as number,
-      baseSide: ['MintA', 'MintB'].includes(parsed.baseSide || '')
-        ? parsed.baseSide as RaydiumBaseSide
-        : baseSideForDirection(direction),
-      preFundingBalanceRaw: parsed.preFundingBalanceRaw || null,
-      fundingMint: parsed.fundingMint || null,
-      fundingMintProgramId: parsed.fundingMintProgramId || null,
-      baseAmountRaw: parsed.baseAmountRaw || null,
-      newNftMint: parsed.newNftMint || null,
+      baseline: parsed.baseline || null,
+      amountA: parsed.amountA || null,
+      amountB: parsed.amountB || null,
+      plan: parsed.plan || null,
       closeSignature: parsed.closeSignature || null,
-      closeSubmittedAt: Number.isSafeInteger(parsed.closeSubmittedAt) ? parsed.closeSubmittedAt as number : null,
+      swapSignature: parsed.swapSignature || null,
       openSignature: parsed.openSignature || null,
+      closeSubmittedAt: Number.isSafeInteger(parsed.closeSubmittedAt) ? parsed.closeSubmittedAt as number : null,
       attempts: Number.isSafeInteger(parsed.attempts) ? parsed.attempts as number : 0,
       nextRetryAt: Number.isSafeInteger(parsed.nextRetryAt) ? parsed.nextRetryAt as number : 0,
       lastError: parsed.lastError || null,
+      lastNotifyKey: typeof parsed.lastNotifyKey === 'string' ? parsed.lastNotifyKey : null,
+      lastNotifyAt: Number.isSafeInteger(parsed.lastNotifyAt) ? parsed.lastNotifyAt as number : null,
       createdAt: Number.isSafeInteger(parsed.createdAt) ? parsed.createdAt as number : Date.now(),
       updatedAt: Number.isSafeInteger(parsed.updatedAt) ? parsed.updatedAt as number : Date.now(),
     }
@@ -164,9 +175,9 @@ export function listRaydiumIntents(): RaydiumRebalanceIntent[] {
 }
 
 /**
- * Claims the wallet for one close+reopen cycle: durable lease, durable intent,
- * then reconcile. The freshly reopened position is armed for the opposite side
- * so the bot does not churn every window while price has not crossed it.
+ * Claims the wallet for one close+swap+open cycle: durable lease, durable
+ * intent, then reconcile. Every step is persisted so a restart can resume
+ * without a duplicate swap or open.
  */
 export async function startRaydiumRebalance(
   trigger: RaydiumRebalanceTrigger,
@@ -174,12 +185,6 @@ export async function startRaydiumRebalance(
 ): Promise<boolean> {
   const owner = trigger.owner
   if (getRaydiumIntent(owner) || getWalletOperation(owner)) return false
-  const range = buildRaydiumRebalanceRange({
-    currentTick: trigger.currentTick,
-    tickSpacing: trigger.tickSpacing,
-    direction: trigger.direction,
-    gapPercent: trigger.gapPercent,
-  })
 
   const started = await withWalletExecutionLock(async () => {
     if (getRaydiumIntent(owner) || getWalletOperation(owner)) return false
@@ -187,7 +192,7 @@ export async function startRaydiumRebalance(
     if (!lease) return false
     const now = Date.now()
     const intent: RaydiumRebalanceIntent = {
-      version: 1,
+      version: 2,
       owner,
       leaseId: lease.leaseId || null,
       oldNftMint: trigger.nftMint,
@@ -195,20 +200,19 @@ export async function startRaydiumRebalance(
       pairLabel: trigger.pairLabel,
       direction: trigger.direction,
       stage: 'close_requested',
-      tickLower: range.tickLower,
-      tickUpper: range.tickUpper,
-      baseSide: baseSideForDirection(trigger.direction),
-      preFundingBalanceRaw: null,
-      fundingMint: null,
-      fundingMintProgramId: null,
-      baseAmountRaw: null,
-      newNftMint: null,
+      baseline: null,
+      amountA: null,
+      amountB: null,
+      plan: null,
       closeSignature: null,
-      closeSubmittedAt: null,
+      swapSignature: null,
       openSignature: null,
+      closeSubmittedAt: null,
       attempts: 0,
       nextRetryAt: 0,
       lastError: null,
+      lastNotifyKey: null,
+      lastNotifyAt: null,
       createdAt: now,
       updatedAt: now,
     }
@@ -218,12 +222,11 @@ export async function startRaydiumRebalance(
   })
   if (!started) return false
 
-  console.log(`[raydium] ${trigger.pairLabel} | rebalance ${trigger.direction.toUpperCase()} started; target ticks ${range.tickLower}-${range.tickUpper}`)
+  console.log(`[raydium] ${trigger.pairLabel} | rebalance ${trigger.direction.toUpperCase()} started (in-range, double-sided)`)
   services.notify(
     `🔄 <b>Raydium Rebalance ${trigger.direction.toUpperCase()}</b>\n\n` +
     `<b>${trigger.pairLabel}</b>\n` +
-    `Close + reopen <b>1 tick wide</b> ${trigger.direction === 'up' ? 'di bawah' : 'di atas'} current price, gap <b>${trigger.gapPercent}%</b>.\n` +
-    `Target ticks: <b>${range.tickLower}-${range.tickUpper}</b>`
+    `Close, swap, lalu buka posisi <b>1 tick wide in-range</b> (double-sided).`
   )
   await reconcilePendingRaydiumRebalances(owner, services)
   return true
@@ -249,6 +252,37 @@ export async function reconcilePendingRaydiumRebalances(
   })
 }
 
+function notifyRaydiumIntent(
+  intent: RaydiumRebalanceIntent,
+  key: string,
+  message: string,
+  notify: (message: string) => void,
+): boolean {
+  const now = Date.now()
+  if (
+    intent.lastNotifyKey === key
+    && intent.lastNotifyAt !== null
+    && now - intent.lastNotifyAt < REBALANCE_NOTIFY_COOLDOWN_MS
+  ) {
+    return false
+  }
+  intent.lastNotifyKey = key
+  intent.lastNotifyAt = now
+  saveRaydiumIntent(intent)
+  notify(message)
+  return true
+}
+
+function clearPlan(intent: RaydiumRebalanceIntent): void {
+  intent.plan = null
+  intent.swapSignature = null
+  intent.openSignature = null
+  intent.amountA = null
+  intent.amountB = null
+  intent.stage = 'close_submitted'
+  intent.nextRetryAt = 0
+}
+
 async function reconcileRaydiumIntent(
   intent: RaydiumRebalanceIntent,
   services: RaydiumRebalanceServices,
@@ -256,203 +290,208 @@ async function reconcileRaydiumIntent(
   try {
     if (intent.stage === 'close_requested') {
       if (await services.positionExists(intent.oldNftMint)) {
-        if (!intent.preFundingBalanceRaw) {
-          const baseline = await services.readFundingBaseline({ poolId: intent.poolId, direction: intent.direction })
-          intent.baseSide = baseline.baseSide
-          intent.fundingMint = baseline.fundingMint
-          intent.fundingMintProgramId = baseline.fundingMintProgramId
-          intent.preFundingBalanceRaw = baseline.fundingAmountRaw.toString()
+        if (!intent.baseline) {
+          const baseline = await services.readFundingBaseline({ poolId: intent.poolId })
+          intent.baseline = toStoredBaseline(baseline)
           intent.updatedAt = Date.now()
           saveRaydiumIntent(intent)
-          console.log(`[raydium] ${intent.pairLabel} | funding baseline recorded (${intent.fundingMint.slice(0, 6)})`)
+          console.log(`[raydium] ${intent.pairLabel} | funding baseline recorded`)
         }
-        const submitted = await services.submitClose({
+        const closed = await services.submitClose({
           poolId: intent.poolId,
           nftMint: intent.oldNftMint,
-          direction: intent.direction,
-          fundingMint: intent.fundingMint as string,
-          fundingMintProgramId: intent.fundingMintProgramId as string,
-          preFundingAmountRaw: BigInt(intent.preFundingBalanceRaw),
+          baseline: toBigintBaseline(intent.baseline),
         })
-        intent.closeSignature = submitted.signature
+        intent.closeSignature = closed.signature
         intent.closeSubmittedAt = Date.now()
-        const measured = submitted.baseAmountRaw !== null && submitted.baseAmountRaw > 0n
+        const measured = closed.amountA > 0n || closed.amountB > 0n
         services.notify(
           `✅ <b>Raydium Close ${intent.direction.toUpperCase()}</b>\n\n` +
           `<b>${intent.pairLabel}</b>\n` +
-          `Funding: <b>${intent.baseSide}</b>\n` +
-          `Close: <a href="https://solscan.io/tx/${submitted.signature}">${submitted.signature.slice(0, 6)}..${submitted.signature.slice(-4)}</a>` +
+          `Close: <a href="https://solscan.io/tx/${closed.signature}">${closed.signature.slice(0, 6)}..${closed.signature.slice(-4)}</a>` +
           (measured ? '' : '\nStatus: menunggu saldo hasil close terlihat.')
         )
-        if (measured) {
-          intent.baseAmountRaw = (submitted.baseAmountRaw as bigint).toString()
-          intent.stage = 'open_prepared'
-          intent.attempts = 0
-          intent.lastError = null
-          intent.updatedAt = Date.now()
-          saveRaydiumIntent(intent)
-          console.log(`[raydium] ${intent.pairLabel} | close ${submitted.signature.slice(0, 8)} measured ${intent.baseAmountRaw}`)
-        } else {
+        if (!measured) {
           intent.stage = 'close_submitted'
           intent.attempts = 0
           intent.lastError = 'menunggu saldo hasil close terlihat'
           intent.nextRetryAt = Date.now() + MEASURE_RETRY_MS
           intent.updatedAt = Date.now()
           saveRaydiumIntent(intent)
-          console.log(`[raydium] ${intent.pairLabel} | close ${submitted.signature.slice(0, 8)} submitted; funding not visible yet`)
           return
         }
-      } else if (intent.preFundingBalanceRaw && intent.fundingMint && intent.fundingMintProgramId) {
-        const amount = await services.measureFunding({
-          fundingMint: intent.fundingMint,
-          fundingMintProgramId: intent.fundingMintProgramId,
-          preFundingAmountRaw: BigInt(intent.preFundingBalanceRaw),
-        })
-        if (amount > 0n) {
-          intent.baseAmountRaw = amount.toString()
-          intent.stage = 'open_prepared'
-          intent.attempts = 0
-          intent.lastError = null
-        } else {
+        intent.amountA = closed.amountA.toString()
+        intent.amountB = closed.amountB.toString()
+        intent.stage = 'close_submitted'
+        intent.attempts = 0
+        intent.lastError = null
+        intent.updatedAt = Date.now()
+        saveRaydiumIntent(intent)
+        console.log(`[raydium] ${intent.pairLabel} | close ${closed.signature.slice(0, 8)} proceeds A=${intent.amountA} B=${intent.amountB}`)
+      } else if (intent.baseline) {
+        const measured = await services.measureFunding(toBigintBaseline(intent.baseline))
+        if (measured.amountA > 0n || measured.amountB > 0n) {
+          intent.amountA = measured.amountA.toString()
+          intent.amountB = measured.amountB.toString()
+          intent.closeSubmittedAt = intent.closeSubmittedAt ?? Date.now()
           intent.stage = 'close_submitted'
+          intent.updatedAt = Date.now()
+          saveRaydiumIntent(intent)
+        } else {
           intent.closeSubmittedAt = intent.closeSubmittedAt ?? Date.now()
           intent.nextRetryAt = Date.now() + MEASURE_RETRY_MS
           intent.lastError = 'posisi hilang sebelum close terkirim; menunggu saldo terlihat'
+          intent.updatedAt = Date.now()
+          saveRaydiumIntent(intent)
+          notifyRaydiumIntent(intent, `wait-funding:${intent.poolId}`, `⏳ <b>Raydium Menunggu Saldo</b>\n\n<b>${intent.pairLabel}</b>`, services.notify)
+          return
         }
-        intent.updatedAt = Date.now()
-        saveRaydiumIntent(intent)
-        console.log(`[raydium] ${intent.pairLabel} | position gone before submit; measured ${amount.toString()}`)
-        if (amount <= 0n) return
       } else {
-        abortRaydiumIntent(intent, services, 'posisi lama sudah tertutup tanpa receipt; reopen dilewati')
+        abortRaydiumIntent(intent, services, 'posisi lama sudah tertutup tanpa baseline; reopen dilewati')
         return
       }
     }
 
     if (intent.stage === 'close_submitted') {
-      if (!intent.preFundingBalanceRaw || !intent.fundingMint || !intent.fundingMintProgramId) {
-        abortRaydiumIntent(intent, services, 'baseline saldo tidak tercatat; reopen dilewati')
-        return
-      }
-      const amount = await services.measureFunding({
-        fundingMint: intent.fundingMint,
-        fundingMintProgramId: intent.fundingMintProgramId,
-        preFundingAmountRaw: BigInt(intent.preFundingBalanceRaw),
-      })
-      if (amount > 0n) {
-        intent.baseAmountRaw = amount.toString()
-        intent.stage = 'open_prepared'
-        intent.attempts = 0
-        intent.lastError = null
-        intent.updatedAt = Date.now()
-        saveRaydiumIntent(intent)
-        console.log(`[raydium] ${intent.pairLabel} | funding visible after close: ${intent.baseAmountRaw}`)
-      } else {
-        const since = intent.closeSubmittedAt ?? intent.updatedAt
-        if (Date.now() - since >= CLOSE_MEASURE_GRACE_MS) {
-          abortRaydiumIntent(intent, services, 'dana hasil close ada di wallet; reopen dilewati setelah menunggu pengukuran')
+      if (intent.amountA === null || intent.amountB === null) {
+        if (!intent.baseline) {
+          abortRaydiumIntent(intent, services, 'baseline saldo tidak tercatat; reopen dilewati')
           return
         }
-        intent.attempts += 1
-        intent.lastError = 'menunggu saldo hasil close terlihat'
-        intent.nextRetryAt = Date.now() + MEASURE_RETRY_MS
+        const measured = await services.measureFunding(toBigintBaseline(intent.baseline))
+        if (measured.amountA <= 0n && measured.amountB <= 0n) {
+          const since = intent.closeSubmittedAt ?? intent.updatedAt
+          if (Date.now() - since >= CLOSE_MEASURE_GRACE_MS) {
+            abortRaydiumIntent(intent, services, 'dana hasil close ada di wallet; reopen dilewati setelah menunggu pengukuran')
+            return
+          }
+          intent.nextRetryAt = Date.now() + MEASURE_RETRY_MS
+          intent.lastError = 'menunggu saldo hasil close terlihat'
+          intent.updatedAt = Date.now()
+          saveRaydiumIntent(intent)
+          return
+        }
+        intent.amountA = measured.amountA.toString()
+        intent.amountB = measured.amountB.toString()
         intent.updatedAt = Date.now()
         saveRaydiumIntent(intent)
-        console.log(`[raydium] ${intent.pairLabel} | funding still not visible (attempt ${intent.attempts})`)
-        return
       }
-    }
-
-    if (intent.stage === 'open_prepared') {
-      if (!intent.baseAmountRaw || BigInt(intent.baseAmountRaw) <= 0n) {
-        throw new Error('recorded funding amount is missing')
-      }
-      const prepared = await services.prepareOpen({
+      const prepared = await services.prepareRebalance({
         poolId: intent.poolId,
-        tickLower: intent.tickLower,
-        tickUpper: intent.tickUpper,
-        baseSide: intent.baseSide,
-        baseAmountRaw: BigInt(intent.baseAmountRaw),
+        amountA: BigInt(intent.amountA),
+        amountB: BigInt(intent.amountB),
       })
-      // Persist the generated NFT mint before submitting. Recovery can then
-      // verify this exact position instead of risking a duplicate open.
-      intent.newNftMint = prepared.nftMint
-      intent.stage = 'open_submitted'
-      intent.updatedAt = Date.now()
-      saveRaydiumIntent(intent)
-      const signature = await prepared.submit()
-      intent.openSignature = signature
-      intent.stage = 'done'
+      intent.plan = prepared.plan
+      intent.stage = prepared.plan.mode === 'atomic' ? 'open_pending' : 'swap_pending'
+      intent.attempts = 0
       intent.lastError = null
       intent.updatedAt = Date.now()
       saveRaydiumIntent(intent)
-      console.log(`[raydium] ${intent.pairLabel} | reopen submitted ${signature.slice(0, 8)} nft ${prepared.nftMint.slice(0, 8)}`)
-    } else if (intent.stage === 'open_submitted') {
-      if (!intent.newNftMint) throw new Error('submitted open is missing its NFT mint')
-      if (!await services.positionExists(intent.newNftMint)) {
-        if (!intent.baseAmountRaw) throw new Error('recorded funding amount is missing')
-        const prepared = await services.prepareOpen({
-          poolId: intent.poolId,
-          tickLower: intent.tickLower,
-          tickUpper: intent.tickUpper,
-          baseSide: intent.baseSide,
-          baseAmountRaw: BigInt(intent.baseAmountRaw),
-        })
-        intent.newNftMint = prepared.nftMint
-        intent.updatedAt = Date.now()
-        saveRaydiumIntent(intent)
-        const signature = await prepared.submit()
-        intent.openSignature = signature
+      console.log(`[raydium] ${intent.pairLabel} | plan ${prepared.plan.mode} anchor ${prepared.plan.anchor.tickLower}-${prepared.plan.anchor.tickUpper} swap ${prepared.plan.swapAmountIn}`)
+      const swapNote = BigInt(prepared.plan.swapAmountIn) > 0n
+        ? `Swap via Raydium direct: <b>${prepared.plan.swapInputSide}</b> → sisi lain.\n`
+        : 'Tanpa swap (saldo sudah seimbang).\n'
+      services.notify(
+        `🧭 <b>Raydium Plan</b>\n\n` +
+        `<b>${intent.pairLabel}</b>\n` +
+        swapNote +
+        `Range: <b>${prepared.plan.anchor.tickLower}-${prepared.plan.anchor.tickUpper}</b> (1 tick wide, in-range)\n` +
+        `Mode: <b>${prepared.plan.mode === 'atomic' ? 'atomic swap+open' : 'swap + open (fallback)'}</b>`
+      )
+    }
+
+    if (intent.stage === 'swap_pending') {
+      const plan = intent.plan
+      if (!plan?.followUp) throw new Error('plan split tidak lengkap')
+      if (await services.positionExists(plan.followUp.nftMint)) {
         intent.stage = 'done'
-        intent.lastError = null
         intent.updatedAt = Date.now()
         saveRaydiumIntent(intent)
-        console.log(`[raydium] ${intent.pairLabel} | reopen rebuilt ${signature.slice(0, 8)} nft ${prepared.nftMint.slice(0, 8)}`)
+      } else if (!intent.swapSignature) {
+        const result = await services.submitSigned(plan, plan.signedTransaction)
+        intent.swapSignature = result.signature
+        intent.updatedAt = Date.now()
+        saveRaydiumIntent(intent)
+        console.log(`[raydium] ${intent.pairLabel} | swap submitted ${result.signature.slice(0, 8)}`)
+        return
       } else {
+        const result = await services.submitSigned(plan, plan.followUp.signedTransaction)
+        intent.openSignature = result.signature
         intent.stage = 'done'
         intent.updatedAt = Date.now()
         saveRaydiumIntent(intent)
-        console.log(`[raydium] ${intent.pairLabel} | reopen verified ${intent.newNftMint.slice(0, 8)}`)
+        console.log(`[raydium] ${intent.pairLabel} | open submitted ${result.signature.slice(0, 8)} nft ${plan.followUp.nftMint.slice(0, 8)}`)
+      }
+    }
+
+    if (intent.stage === 'open_pending') {
+      const plan = intent.plan
+      if (!plan) throw new Error('plan tidak ditemukan')
+      if (await services.positionExists(plan.nftMint)) {
+        intent.stage = 'done'
+        intent.updatedAt = Date.now()
+        saveRaydiumIntent(intent)
+        console.log(`[raydium] ${intent.pairLabel} | atomic position verified ${plan.nftMint.slice(0, 8)}`)
+      } else {
+        const result = await services.submitSigned(plan, plan.signedTransaction)
+        intent.openSignature = result.signature
+        intent.stage = 'done'
+        intent.updatedAt = Date.now()
+        saveRaydiumIntent(intent)
+        console.log(`[raydium] ${intent.pairLabel} | atomic tx submitted ${result.signature.slice(0, 8)} nft ${plan.nftMint.slice(0, 8)}`)
       }
     }
 
     if (intent.stage === 'done') {
+      const plan = intent.plan
       saveRaydiumPositionState({
-        nftMint: intent.newNftMint || intent.oldNftMint,
+        nftMint: plan?.nftMint || intent.oldNftMint,
         since: null,
         direction: null,
-        armedDirection: armedDirectionAfterRebalance(intent.direction),
         notified: false,
+        cooldownUntil: Date.now() + config.raydiumRebalanceCooldownMs,
       })
       deleteRaydiumIntent(intent.owner)
       if (intent.leaseId) {
         releaseWalletOperation(intent.owner, 'raydium', intent.oldNftMint, intent.leaseId)
       }
-      console.log(`[raydium] ${intent.pairLabel} | rebalance ${intent.direction.toUpperCase()} complete`)
+      console.log(`[raydium] ${intent.pairLabel} | rebalance ${intent.direction.toUpperCase()} complete (${plan?.mode || 'unknown'})`)
       services.notify(
         `🎯 <b>Raydium Rebalance ${intent.direction.toUpperCase()} Selesai</b>\n\n` +
         `<b>${intent.pairLabel}</b>\n` +
-        `New position: <code>${intent.newNftMint || '-'}</code>\n` +
-        `Ticks: <b>${intent.tickLower}-${intent.tickUpper}</b> (1 tick wide)\n` +
+        `New position: <code>${plan?.nftMint || '-'}</code>\n` +
+        `Range: <b>${plan ? `${plan.anchor.tickLower}-${plan.anchor.tickUpper}` : '-'}</b> (1 tick wide, in-range)\n` +
+        `Mode: <b>${plan?.mode === 'atomic' ? 'atomic' : 'split'}</b>\n` +
         `Close: ${intent.closeSignature ? `<a href="https://solscan.io/tx/${intent.closeSignature}">${intent.closeSignature.slice(0, 6)}..${intent.closeSignature.slice(-4)}</a>` : '-'}\n` +
+        `Swap: ${intent.swapSignature ? `<a href="https://solscan.io/tx/${intent.swapSignature}">${intent.swapSignature.slice(0, 6)}..${intent.swapSignature.slice(-4)}</a>` : '-'}\n` +
         `Open: ${intent.openSignature ? `<a href="https://solscan.io/tx/${intent.openSignature}">${intent.openSignature.slice(0, 6)}..${intent.openSignature.slice(-4)}</a>` : '-'}`
       )
     }
   } catch (err) {
+    if (err instanceof RaydiumSwapRouteWorseError) {
+      abortRaydiumIntent(intent, services, err.message)
+      return
+    }
+    const message = err instanceof Error ? err.message : 'unknown error'
+    if (/blockhash|expired|not found/i.test(message) && intent.plan) {
+      clearPlan(intent)
+      console.log(`[raydium] ${intent.pairLabel} | plan expired, rebuilding from current balances`)
+    }
     intent.attempts += 1
-    intent.lastError = err instanceof Error ? err.message : 'unknown error'
+    intent.lastError = message
     intent.nextRetryAt = Date.now() + raydiumRetryDelayMs(intent.attempts)
     intent.updatedAt = Date.now()
     saveRaydiumIntent(intent)
-    console.log(`[raydium] ${intent.pairLabel} | retry ${intent.attempts} at stage ${intent.stage}: ${intent.lastError}`)
-    if (intent.attempts === 1) {
-      services.notify(
-        `⚠️ <b>Raydium Rebalance Retry</b>\n\n` +
-        `<b>${intent.pairLabel}</b>\n` +
-        `Stage: <code>${intent.stage}</code>\n` +
-        `Reason: <code>${intent.lastError}</code>`
-      )
-    }
+    const notified = notifyRaydiumIntent(
+      intent,
+      `retry:${message}`,
+      `⚠️ <b>Raydium Rebalance Retry</b>\n\n` +
+      `<b>${intent.pairLabel}</b>\n` +
+      `Stage: <code>${intent.stage}</code>\n` +
+      `Reason: <code>${message}</code>`,
+      services.notify,
+    )
+    if (notified) console.log(`[raydium] ${intent.pairLabel} | retry ${intent.attempts} at ${intent.stage}: ${message}`)
   }
 }
 

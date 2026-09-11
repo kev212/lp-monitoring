@@ -7,8 +7,8 @@ export interface RaydiumPositionState {
   nftMint: string
   since: number | null
   direction: RebalanceDirection | null
-  armedDirection: RebalanceDirection | null
   notified: boolean
+  cooldownUntil: number | null
   updatedAt: number
 }
 
@@ -25,8 +25,8 @@ export function getRaydiumPositionState(nftMint: string): RaydiumPositionState |
       nftMint,
       since: Number.isSafeInteger(parsed.since) ? parsed.since as number : null,
       direction: ['up', 'down'].includes(parsed.direction || '') ? parsed.direction as RebalanceDirection : null,
-      armedDirection: ['up', 'down'].includes(parsed.armedDirection || '') ? parsed.armedDirection as RebalanceDirection : null,
       notified: parsed.notified === true,
+      cooldownUntil: Number.isSafeInteger(parsed.cooldownUntil) ? parsed.cooldownUntil as number : null,
       updatedAt: Number.isSafeInteger(parsed.updatedAt) ? parsed.updatedAt as number : Date.now(),
     }
   } catch {

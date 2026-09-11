@@ -168,10 +168,14 @@ export interface Config {
   raydiumRebalanceMode: RebalanceMode
   raydiumSlippageBps: number
   raydiumPollMs: number
-  raydiumComputeUnitLimit: number
   raydiumComputeUnitPrice: number
-  raydiumRebalanceGapPct: number
   raydiumRebalanceWindowMinutes: number
+  raydiumSwapSlippageBps: number
+  raydiumSwapMaxImpactPct: number
+  raydiumLiquidityBufferPct: number
+  raydiumRebalanceCooldownMs: number
+  raydiumCloseComputeUnitLimit: number
+  raydiumAtomicComputeUnitLimit: number
   openMaxPriceMoveBins: number
   openSolFeeReserve: number
   runnerAgentEnabled: boolean
