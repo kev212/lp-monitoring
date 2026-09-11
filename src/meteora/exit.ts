@@ -53,7 +53,7 @@ interface FinalizingExitAttempt {
   confirmedAt: number
 }
 
-interface ExitPendingState {
+export interface ExitPendingState {
   version: 5
   revision: number
   leaseId: string
@@ -253,10 +253,13 @@ export function attributedTokenReceipt(
   return total.toString()
 }
 
-function requiredCloseTokenReceiptMints(state: ExitPendingState): string[] {
-  // Rebalance-down is the close-only flow that needs a token amount for its
-  // next open. Other skip-swap exits retain their existing completion path and
-  // should not be held up by an optional transaction-metadata probe.
+export function requiredCloseTokenReceiptMints(
+  state: Pick<ExitPendingState, 'owner' | 'positionPubkey' | 'tokenXMint' | 'quoteCurrency' | 'triggerType'>,
+): string[] {
+  // Close-only rebalance exits need the actual funding token amount for the
+  // next open: token X for a down rebalance, the quote token for an up one.
+  // Other skip-swap exits retain their existing completion path and should not
+  // be held up by an optional transaction-metadata probe.
   if (state.triggerType !== 'MANUAL') return []
   const row = getDb().prepare('SELECT value FROM sync_state WHERE key = ?').get(`${REBALANCE_REOPEN_PREFIX}${state.owner}`) as { value?: string } | undefined
   if (!row?.value) return []
@@ -267,15 +270,17 @@ function requiredCloseTokenReceiptMints(state: ExitPendingState): string[] {
       closeRequested?: boolean
       tokenMint?: string | null
     }
-    if (
-      intent.positionPubkey !== state.positionPubkey
-      || intent.direction !== 'down'
-      || intent.closeRequested !== true
-      || intent.tokenMint !== state.tokenXMint
-      || !intent.tokenMint
-      || SOL_MINTS.has(intent.tokenMint)
-    ) return []
-    return [intent.tokenMint]
+    if (intent.positionPubkey !== state.positionPubkey || intent.closeRequested !== true) return []
+    if (intent.direction === 'down') {
+      if (!intent.tokenMint || intent.tokenMint !== state.tokenXMint || SOL_MINTS.has(intent.tokenMint)) return []
+      return [intent.tokenMint]
+    }
+    if (intent.direction === 'up') {
+      // SOL quotes are funded from the native balance, which has no ATA receipt.
+      if (state.quoteCurrency !== 'USDC') return []
+      return [USDC_MINT]
+    }
+    return []
   } catch {
     return []
   }

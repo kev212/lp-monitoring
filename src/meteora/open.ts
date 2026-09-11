@@ -413,10 +413,12 @@ export function resolveRebalanceFunding(input: {
     }
   }
 
-  const amountRaw = parseUiAmountToRaw(
-    formatRawAmount(BigInt(Math.round(input.amountQuote * 10 ** input.quoteDecimals)), input.quoteDecimals),
-    input.quoteDecimals,
-  )
+  const amountRaw = input.tokenAmountRaw !== undefined
+    ? parseRawAmount(input.tokenAmountRaw)
+    : parseUiAmountToRaw(
+        formatRawAmount(BigInt(Math.round(input.amountQuote * 10 ** input.quoteDecimals)), input.quoteDecimals),
+        input.quoteDecimals,
+      )
   const amountInput = formatRawAmount(amountRaw, input.quoteDecimals)
   const amountQuote = Number(amountRaw) / 10 ** input.quoteDecimals
   if (!Number.isFinite(amountQuote) || amountQuote <= 0) throw new Error('Rebalance amount must be greater than zero')

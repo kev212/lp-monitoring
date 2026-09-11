@@ -65,6 +65,7 @@ export function buildRebalanceRange(activeBinId: number, width: number, directio
 }
 
 const REBALANCE_REOPEN_PREFIX = 'rebalance_reopen:'
+const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
 
 export interface RebalanceReopenIntent {
   version: 1 | 2
@@ -345,8 +346,13 @@ export async function reconcilePendingRebalanceOpens(
           continue
         }
 
-        if (intent.direction === 'down' && intent.tokenAmountRaw === null) {
-          const raw = readCloseTokenReceipt(intent.positionPubkey, intent.tokenMint!)
+        const receiptMint = intent.direction === 'down'
+          ? intent.tokenMint
+          : intent.direction === 'up' && intent.quoteCurrency === 'USDC'
+            ? USDC_MINT
+            : null
+        if (receiptMint && intent.tokenAmountRaw === null) {
+          const raw = readCloseTokenReceipt(intent.positionPubkey, receiptMint)
           if (raw === null) throw new Error('Waiting for confirmed close token receipt')
           if (!/^[1-9]\d*$/.test(raw)) throw new Error('Rebalance close returned no deposit token')
           intent.tokenAmountRaw = raw

@@ -8,7 +8,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { isAmbiguousDurableSendError } from '../src/executionLock.js'
-import { attributedTokenReceipt, collectExitBaselines, exitRetryDelayMs, finalizedSettlementSlot, getTokenBalance, positiveBalanceDelta, readCloseTokenReceipt, sendTrackedTransaction, shouldResolveClosedExitWithoutFinalSignature, swapObligation } from '../src/meteora/exit.js'
+import { attributedTokenReceipt, collectExitBaselines, exitRetryDelayMs, finalizedSettlementSlot, getTokenBalance, positiveBalanceDelta, readCloseTokenReceipt, requiredCloseTokenReceiptMints, sendTrackedTransaction, shouldResolveClosedExitWithoutFinalSignature, swapObligation } from '../src/meteora/exit.js'
 import { formatExitReconciled } from '../src/telegram.js'
 
 const CLOSE_RECEIPT_PREFIX = 'exit_close_token_receipt:'
@@ -74,6 +74,46 @@ test('reads a durable close token receipt by position and mint', () => {
     db.prepare('INSERT INTO sync_state (key, value, updated_at) VALUES (?, ?, ?)').run(key, '123456', Date.now())
     assert.equal(readCloseTokenReceipt(positionPubkey, mint), '123456')
     assert.equal(readCloseTokenReceipt(positionPubkey, 'other-mint'), null)
+  } finally {
+    closeDb()
+    config.dbPath = originalPath
+    rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test('requires a token-X receipt for down and a USDC receipt for up rebalances', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'exit-receipt-mints-'))
+  const originalPath = config.dbPath
+  closeDb()
+  config.dbPath = join(directory, 'test.sqlite')
+  const state = {
+    owner: 'receipt-mint-owner',
+    positionPubkey: 'receipt-mint-position',
+    tokenXMint: 'TokenX',
+    quoteCurrency: 'USDC' as const,
+    triggerType: 'MANUAL' as const,
+  }
+  try {
+    const db = getDb()
+    const writeIntent = (value: Record<string, unknown>): void => {
+      db.prepare('INSERT OR REPLACE INTO sync_state (key, value, updated_at) VALUES (?, ?, ?)')
+        .run(`rebalance_reopen:${state.owner}`, JSON.stringify(value), Date.now())
+    }
+
+    assert.deepEqual(requiredCloseTokenReceiptMints(state), [])
+
+    writeIntent({ positionPubkey: 'receipt-mint-position', direction: 'down', closeRequested: true, tokenMint: 'TokenX' })
+    assert.deepEqual(requiredCloseTokenReceiptMints(state), ['TokenX'])
+
+    writeIntent({ positionPubkey: 'receipt-mint-position', direction: 'up', closeRequested: true, tokenMint: null })
+    assert.deepEqual(requiredCloseTokenReceiptMints(state), ['EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'])
+    assert.deepEqual(requiredCloseTokenReceiptMints({ ...state, quoteCurrency: 'SOL' }), [])
+
+    writeIntent({ positionPubkey: 'another-position', direction: 'up', closeRequested: true, tokenMint: null })
+    assert.deepEqual(requiredCloseTokenReceiptMints(state), [])
+
+    writeIntent({ positionPubkey: 'receipt-mint-position', direction: 'down', closeRequested: false, tokenMint: 'TokenX' })
+    assert.deepEqual(requiredCloseTokenReceiptMints(state), [])
   } finally {
     closeDb()
     config.dbPath = originalPath

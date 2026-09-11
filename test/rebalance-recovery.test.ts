@@ -160,6 +160,40 @@ test('Down waits for a position-specific receipt and persists its exact raw amou
   assert.equal(listRebalanceReopenIntents().length, 0)
 }))
 
+test('Up waits for the USDC close receipt and funds the reopen with its exact raw amount', async () => database(async () => {
+  upsertPosition({ ...row, status: 'closed' })
+  persistRebalanceReopenIntent(owner, {
+    ...intent,
+    direction: 'up',
+    quoteCurrency: 'USDC',
+    tokenMint: null,
+    tokenAmountRaw: null,
+    amountQuote: 980.35,
+  })
+  let calls = 0
+  const services: RebalanceReconcileServices = {
+    notify: () => undefined,
+    close: async () => { assert.fail('closed position must not be closed again') },
+    open: async (_connection, _wallet, params) => {
+      calls++
+      assert.equal(params.tokenAmountRaw, '849175236')
+      assert.equal(listRebalanceReopenIntents()[0].tokenAmountRaw, params.tokenAmountRaw)
+      params.onPrepared!('new', 'signature')
+      return { positionPubkey: 'new', signature: 'signature', preview: { minBinId: 90, maxBinId: 92, amountQuote: 849.175236, amountInput: '849.175236', baseSymbol: 'USDC' } as OpenPositionPreview }
+    },
+  }
+  setSyncValue('exit_close_token_receipt:another-position:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', '999999999')
+  await reconcilePendingRebalanceOpens(connection, wallet, services)
+  assert.equal(calls, 0)
+  assert.equal(listRebalanceReopenIntents()[0].tokenAmountRaw, null)
+
+  setSyncValue('exit_close_token_receipt:old:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', '849175236')
+  closeDb()
+  await reconcilePendingRebalanceOpens(connection, wallet, services)
+  assert.equal(calls, 1)
+  assert.equal(listRebalanceReopenIntents().length, 0)
+}))
+
 test('throttles repeated reopen retry notifications for the same failure', async () => database(async () => {
   upsertPosition({ ...row, status: 'closed' })
   persistRebalanceReopenIntent(owner, intent)

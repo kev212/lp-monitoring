@@ -11,6 +11,7 @@ import {
   OpenSubmissionPendingError,
   parseUiAmountToRaw,
   remainingPriceMoveBins,
+  resolveRebalanceFunding,
   sdkSlippagePercentForBins,
   strategyType,
   tokenProgramIdFromMintOwner,
@@ -153,6 +154,35 @@ test('decodes Meteora bin slippage errors for simulation and finalized failures'
   assert.equal(isBinSlippageError(new OpenSimulationError(details)), true)
   assert.equal(isBinSlippageError(new OpenTransactionFailedError('signature', 'position', details)), true)
   assert.equal(isBinSlippageError(new Error('RPC request failed')), false)
+})
+
+test('funds an up rebalance from the exact USDC close receipt when present', () => {
+  const funding = resolveRebalanceFunding({
+    quoteSide: 'Y',
+    quoteMint: 'USDC',
+    tokenXMint: 'X',
+    quoteDecimals: 6,
+    tokenXDecimals: 6,
+    amountQuote: 980.35,
+    direction: 'up',
+    tokenAmountRaw: '849175236',
+  })
+  assert.equal(funding.amountRaw, 849175236n)
+  assert.equal(funding.amountInput, '849.175236')
+  assert.equal(funding.amountQuote, 849.175236)
+  assert.equal(funding.fundingSide, 'Y')
+  assert.equal(funding.fundingMint, 'USDC')
+
+  const fallback = resolveRebalanceFunding({
+    quoteSide: 'Y',
+    quoteMint: 'USDC',
+    tokenXMint: 'X',
+    quoteDecimals: 6,
+    tokenXDecimals: 6,
+    amountQuote: 980.35,
+    direction: 'up',
+  })
+  assert.equal(fallback.amountRaw, 980350000n)
 })
 
 test('resolves the token program from the mint account owner', () => {
